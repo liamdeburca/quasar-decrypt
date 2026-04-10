@@ -1,0 +1,14 @@
+# Compiled python
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+
+# AI
+*.md
+
+# VSCode Counter
+.VSCodeCounter
+
+tests/
+

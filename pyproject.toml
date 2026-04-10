@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quasar-decrypt"
+version = "0.1.0"
+requires-python= ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.16",
+    "astropy>=7.0",
+    "pydantic>=2.12",
+    "numba",
+    "quasar-typing",
+    "quasar-models",
+    "quasar-utils",
+]
+
+[project.urls]
+Homepage = "https://github.com/liamdeburca/quasar-decrypt"
+Repository = "https://github.com/liamdeburca/quasar-decrypt.git"
+"Bug Tracker" = "https://github.com/liamdeburca/quasar-decrypt/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
