@@ -2,7 +2,6 @@ from logging import getLogger
 from typing import Self
 
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 class Graph(dict[int, set[int]]):
     def __init__(self, n: int = 0):

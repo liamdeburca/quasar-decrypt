@@ -1,15 +1,9 @@
 __all__ = ['_SpecData']
 
 from logging import getLogger
-from typing import Self, Optional, Union, Callable
+from typing import Self, Callable
 from dataclasses import dataclass
-from numpy import (
-    zeros_like, invert, full_like, nan, isfinite, ones_like, 
-    where, quantile, maximum, minimum, arange, float64, bool_
-)
-
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
+from numpy import zeros_like, invert, isfinite, ones_like, float64, bool_, ascontiguousarray
 
 from quasar_models.continuum import PowerLawModel
 from quasar_models.iron import IronModel
@@ -18,22 +12,19 @@ from quasar_models.line import GaussianModel
 from quasar_models.host import HostGalaxyModel
 
 from quasar_utils.setup import Info
-from quasar_utils.wrappers import apply_info_to_method
 
 from pydantic import validate_call
 from pydantic_core import PydanticCustomError
 from pydantic_core.core_schema import no_info_plain_validator_function
 
-from quasar_typing.numpy import FloatVector, BoolVector
+from quasar_typing.numpy import FloatVector, BoolVector, CoordsTuple
 from quasar_typing.astropy import CompoundModel_
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc.literals import BGFlux
-from quasar_typing.misc.coords_tuple import CoordsTuple
+from quasar_typing.misc import BackgroundFlux
 
 from .utils import create_cached_get_mask, get_log
 
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass
 class _SpecData:
@@ -70,9 +61,9 @@ class _SpecData:
 
     x_bounds: CoordBounds
     info: Info
-    get_mask: Callable[[float, float], BoolVector]
+    get_mask: Callable[[float, float], BoolVector] | None
 
-    @validate_call(validate_return=False)
+    @validate_call
     def __init__(
         self,
         coords: CoordsTuple,
@@ -95,76 +86,82 @@ class _SpecData:
         x_log: FloatVector | None = None,
         y_log: FloatVector | None = None,
         dy_log: FloatVector | None = None,
-        get_mask: Callable[[float, float], BoolVector] | None = None,
+        get_mask: Callable[[float, float], BoolVector] = None,
     ):
         """
         ** PYDANTIC VALIDATED METHOD **
+
+        This method assigns the basic properties of _SpecData-like classes, such
+        as the coordinate arrays, the Info object, and the 'get_mask' method.
+
+        Input arrays are converted to C-contiguous format if they aren't 
+        already.
         """
         self.info = info
-        self.get_mask = create_cached_get_mask(coords[0], maxsize=1)
         
-        self._coords = coords
-        self._x = coords[0]
-        self._dx = coords[0] * info.loading['sigma_res']
-        self._y = coords[1]
-        self._dy = coords[2]
+        # Ensures coordinate arrays are C-contiguous
+        self._coords = tuple(ascontiguousarray(arr) for arr in coords)
+        self._x = self._coords[0]
+        self._dx = self._coords[0] * info.loading['sigma_res']
+        self._y = self._coords[1]
+        self._dy = self._coords[2]
 
         self._y_smooth = (
-            self._y.copy()
+            self._y.copy(order='C')
             if y_smooth is None else 
-            y_smooth
+            ascontiguousarray(y_smooth)
         )
         self._y_pl = (
-            zeros_like(self._x, dtype=float64)
+            zeros_like(self._x, dtype=float64, order='C')
             if y_pl is None else 
-            y_pl
+            ascontiguousarray(y_pl)
         )
         self._y_fe = (
-            zeros_like(self._x, dtype=float64)
+            zeros_like(self._x, dtype=float64, order='C')
             if y_fe is None else 
-            y_fe
+            ascontiguousarray(y_fe)
         )
         self._y_ba = (
-            zeros_like(self._x, dtype=float64)
+            zeros_like(self._x, dtype=float64, order='C')
             if y_ba is None else 
-            y_ba
+            ascontiguousarray(y_ba)
         )
         self._y_hg = (
-            zeros_like(self._x, dtype=float64)
+            zeros_like(self._x, dtype=float64, order='C')
             if y_hg is None else 
-            y_hg
+            ascontiguousarray(y_hg)
         )
         self._y_em = (
-            zeros_like(self._x, dtype=float64)
+            zeros_like(self._x, dtype=float64, order='C')
             if y_em is None else 
-            y_em
+            ascontiguousarray(y_em)
         )
 
         self._rejected_pixels = (
-            zeros_like(self._x, dtype=bool_)
+            zeros_like(self._x, dtype=bool_, order='C')
             if rejected_pixels is None else 
-            rejected_pixels
+            ascontiguousarray(rejected_pixels)
         )
         self._absorbed_pixels = (
-            zeros_like(self._x, dtype=bool_)
+            zeros_like(self._x, dtype=bool_, order='C')
             if absorbed_pixels is None else 
-            absorbed_pixels
+            ascontiguousarray(absorbed_pixels)
         )
-        self._valid_pixels = (
+        self._valid_pixels = ascontiguousarray(
             isfinite(coords).all(axis=0) & (self._dy > 0)
             if valid_pixels is None else 
             valid_pixels
         )
-        self._log_valid_pixels = (
+        self._log_valid_pixels = ascontiguousarray(
             self._valid_pixels & (self._y > 0)
             if log_valid_pixels is None else 
             log_valid_pixels
         )
         
         self._p_absorbed = (
-            ones_like(self._x, dtype=float64)
+            ones_like(self._x, dtype=float64, order='C')
             if p_absorbed is None else 
-            p_absorbed
+            ascontiguousarray(p_absorbed)
         )
 
         if x_bounds is None:
@@ -177,20 +174,26 @@ class _SpecData:
         self.x0 = x0 or info.continuum['x0']
         self.y0 = y0 or info.continuum['y0']
 
-        self._x_log = (
+        self._x_log = ascontiguousarray(
             get_log(self._x, self.x0, self._log_valid_pixels)
             if x_log is None else 
             x_log
         )
-        self._y_log = (
+        self._y_log = ascontiguousarray(
             get_log(self._y, self.y0, self._log_valid_pixels)
             if y_log is None else 
             y_log
         )
-        self._dy_log = (
+        self._dy_log = ascontiguousarray(
             get_log(self._dy, self._y, self._log_valid_pixels)
             if dy_log is None else 
             dy_log
+        )
+
+        self.get_mask = (
+            create_cached_get_mask(self._x, maxsize=1)
+            if get_mask is None else
+            get_mask
         )
 
         if get_mask is None:
@@ -237,6 +240,15 @@ class _SpecData:
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type, handler):
         return no_info_plain_validator_function(cls._validate)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('get_mask', None)
+        return state
+
+    def __setstate__(self, state):
+        state['get_mask'] = create_cached_get_mask(state['_x'], maxsize=1)
+        self.__dict__.update(state)
 
     @property
     def mask(self) -> BoolVector:
@@ -338,7 +350,7 @@ class _SpecData:
     def n_logval(self) -> int: 
         return self.log_valid_pixels.sum()
     
-    @validate_call(validate_return=False)
+    @validate_call
     def getMask(
         self,
         *,
@@ -351,7 +363,7 @@ class _SpecData:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
-        mask = self.mask.copy()
+        mask = self.mask.copy(order='C')
 
         if not covered:
             mask[:] = True
@@ -361,13 +373,13 @@ class _SpecData:
             mask &= invert(self._absorbed_pixels)
 
         if log_valid:
-            mask &=  self._log_valid_pixels
+            mask &= self._log_valid_pixels
         elif valid:
-            mask &=  self._valid_pixels
+            mask &= self._valid_pixels
 
         return mask
     
-    @validate_call(validate_return=False)
+    @validate_call
     def getMaskedCoords(
         self, 
         *,
@@ -377,7 +389,7 @@ class _SpecData:
         without_absorption: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
     ) -> CoordsTuple:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -421,7 +433,7 @@ class _SpecData:
         )
         self._absorbed_pixels[:] = False
 
-    @validate_call(validate_return=False)
+    @validate_call
     def applyRejections(
         self, 
         rejected_pixels: BoolVector,
@@ -468,7 +480,7 @@ class _SpecData:
 
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def applyAbsorption(
         self, 
         absorbed_pixels: BoolVector,
@@ -514,10 +526,10 @@ class _SpecData:
 
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def updateContinuumEmission(
         self,
-        model: Optional[PowerLawModel] = None,
+        model: PowerLawModel | None = None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -528,10 +540,10 @@ class _SpecData:
             self._y_pl[mask] = model(self._x[mask])
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def updateIronEmission(
         self,
-        model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        model: IronModel | CompoundModel_[IronModel] | None = None,
     ) -> Self:
         self._y_fe[:] = 0
         if model is not None:
@@ -539,10 +551,10 @@ class _SpecData:
             self._y_fe[mask] = model(self._x[mask])
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def updateBalmerEmission(
         self,
-        model: Optional[BalmerModel] = None,
+        model: BalmerModel | None = None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -553,10 +565,10 @@ class _SpecData:
             self._y_ba[mask] = model(self._x[mask])
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def updateHostGalaxyEmission(
         self,
-        model: Optional[HostGalaxyModel] = None,
+        model: HostGalaxyModel | None = None,
     ) -> Self:
         self._y_hg[:] = 0
         if model is not None:
@@ -564,274 +576,13 @@ class _SpecData:
             self._y_hg[mask] = model(self._x[mask])
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def updateLinesEmission(
         self,
-        model: Union[GaussianModel, CompoundModel_[GaussianModel], None] = None,
+        model: GaussianModel | CompoundModel_[GaussianModel] | None = None,
     ) -> Self:
         self._y_em[:] = 0
         if model is not None:
             mask = isfinite(self._x)
             self._y_em[mask] = model(self._x[mask])
         return self
-
-    ### Plotting routines
-
-    def _quickplot(
-        self,
-        fig: tuple[Figure, Axes] | None = None,
-        *,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-
-        x_major: float = 500.0,
-        x_minor: float = 20.0,
-        y_major: float = 50.0,
-        y_minor: float = 5.0,
-
-        pl_color: str = 'dodgerblue',
-        fe_color: str = 'firebrick',
-        ba_color: str = 'orchid',
-        hg_color: str = 'forestgreen',
-        em_color: str = 'gold',
-        
-        sm_color: str = 'darkorange',
-        ab_color: str = 'darkviolet',
-
-        logx: bool = True,
-        logy: bool = True,
-    ) -> tuple[Figure, Axes]:
-        """
-        Basic plotting routine for '_SpecData' and inheriting classes. 
-        """
-        from matplotlib.pyplot import subplots
-        from matplotlib.ticker import MultipleLocator, ScalarFormatter, \
-            NullFormatter
-        from astropy.units.format import LatexInline
-
-        if fig is None:
-            fig, ax = subplots(figsize=figsize, dpi=dpi)
-        else:
-            fig, ax = fig
-    
-        title = title or self.__str__(simple=True).removesuffix('.')
-        ax.set_title(title, loc='left')
-
-        ax.step(self._x, self._y, where='mid', color='k', zorder=1)
-        ax.fill_between(
-            self._x, 
-            self._y - 2*self._dy, self._y + 2*self._dy,
-            step='mid', color='grey', zorder=0,
-        )
-        ax.step(self._x, self._y_smooth, where='mid', color=sm_color, zorder=2)
-        ax.step(
-            where(self._absorbed_pixels, self._x, nan),
-            where(self._absorbed_pixels, self._y, nan),
-            where='mid', color=ab_color, zorder=1,
-        )
-
-        if not (self._y_pl == 0).all(): 
-            ax.plot(
-                self._x, 
-                self._y_pl, 
-                color=pl_color, zorder=6,
-            )
-        if not (self._y_fe == 0).all(): 
-            ax.plot(
-                self._x, 
-                self._y_pl + self._y_fe, 
-                color=fe_color, zorder=5,
-            )
-        if not (self._y_ba == 0).all(): 
-            ax.plot(
-                self._x, 
-                self._y_pl + self._y_fe + self._y_ba, 
-                color=ba_color, zorder=4,
-            )
-        if not (self._y_hg == 0).all():
-            ax.plot(
-                self._x,
-                self._y_pl + self._y_fe + self._y_ba + self._y_hg,
-                color=hg_color, zorder=3,
-            )
-        if not (self._y_em == 0).all(): 
-            ax.plot(
-                self._x, 
-                self._y_pl + self._y_fe + self._y_ba + self._y_em, 
-                color=em_color, zorder=2,
-            )
-
-        if ylim is None: 
-            ylim = (
-                quantile(self._y[self._valid_pixels], 0.01),
-            )
-        ax.set_ylim(*ylim)
-
-        if xlim is None: 
-            xlim = self.x_bounds
-        ax.set_xlim(*xlim)
-
-        if xlabel is None: 
-            xlabel = "Rest-frame wavelength ({})".format(
-                LatexInline.to_string(self.info.units['wavelength_unit']),
-            )
-        ax.set_xlabel(xlabel, loc='right')
-
-        if ylabel is None: 
-            ylabel = "Flux density ({})".format(
-                LatexInline.to_string(self.info.units.getFluxUnit()),
-            )
-        ax.set_ylabel(ylabel, loc='top')
-
-        if logx:
-            ax.set_xscale('log')
-        if logy:
-            ax.set_yscale('log')
-
-        ax.xaxis.set_major_locator(MultipleLocator(x_major))
-        ax.xaxis.set_major_formatter(ScalarFormatter())
-        
-        ax.xaxis.set_minor_locator(MultipleLocator(x_minor))
-        ax.xaxis.set_minor_formatter(NullFormatter())
-
-        ax.yaxis.set_major_locator(MultipleLocator(y_major))
-        ax.yaxis.set_major_formatter(ScalarFormatter())
-        
-        ax.yaxis.set_minor_locator(MultipleLocator(y_minor))
-        ax.yaxis.set_minor_formatter(NullFormatter())
-
-        return fig, ax
-    
-    @apply_info_to_method('absorption', specific_kwargs={'z_crit', 'p_crit'})
-    def _absorptionplot(
-        self,
-        fig: tuple[Figure, Axes] | None = None,
-        *,
-        figsize: tuple[float, float] = (8, 8),
-        dpi: int = 300,
-        title: str | None = None,
-        height_ratio: float = 3.0,
-
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        zlim: tuple[float, float] = (-5.0, 5.0),
-        plim: tuple[float, float] = (1e-5, 1e0),
-
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-
-        x_major: float = 500.0,
-        x_minor: float = 20.0,
-        y_major: float = 50.0,
-        y_minor: float = 5.0,
-        z_major: float = 2.0,
-        z_minor: float = 1.0,
-        p_major: float = 10.0,
-        p_minor: float = 1.0,
-
-        pl_color: str = 'dodgerblue',
-        fe_color: str = 'firebrick',
-        ba_color: str = 'orchid',
-        hg_color: str = 'forestgreen',
-        em_color: str = 'gold',
-        sm_color: str = 'darkorange',
-        ab_color: str = 'darkviolet',
-
-        cr_color: str = 'crimson',
-
-        z_crit: float | None = None,
-        p_crit: float | None = None,
-    ) -> tuple[Figure, Axes]:
-        """
-        Basic absorption-removal plotting routine for '_SpecData' and inheriting 
-        classes. 
-        """
-        from matplotlib.pyplot import subplots
-        from matplotlib.ticker import MultipleLocator, ScalarFormatter, \
-            NullFormatter, LogLocator, LogFormatterSciNotation
-
-        if fig is None:
-            fig, axes = subplots(
-                3, 1,
-                figsize = figsize, 
-                dpi = dpi,
-                sharex = True,
-                height_ratios = [height_ratio, 1, 1],
-            )
-        else:
-            fig, axes = fig
-
-        _ = _SpecData._quickplot(
-            self,
-            (fig, axes[0]),
-            title = title or self.__str__(simple=True).removesuffix('.'),
-            xlim = xlim,
-            ylim = ylim,
-            xlabel = xlabel,
-            ylabel = ylabel,
-            x_major = x_major,
-            x_minor = x_minor,
-            y_major = y_major,
-            y_minor = y_minor,
-            pl_color = pl_color,
-            fe_color = fe_color,
-            ba_color = ba_color,
-            hg_color = hg_color,
-            em_color = em_color,
-            ab_color = ab_color,
-            sm_color = sm_color,
-        )
-        xlabel = axes[0].get_xlabel()
-        axes[0].set_xlabel(None)
-
-        ###
-
-        v = self._valid_pixels
-        _z = full_like(self._x, fill_value=nan)
-        _z[v] = (self._y[v] - self._y_smooth[v]) / self._dy[v]
-        _z = maximum(minimum(_z, zlim[1]), zlim[0])
-
-        ax = axes[1]
-        ax.step(self._x, _z, where='mid', color='k', zorder=0)
-        ax.hlines(z_crit, *ax.set_xlim(), color=cr_color, zorder=1, ls='dotted')
-        
-        ax.set_ylim(*zlim)
-        ax.set_ylabel('Residual')
-
-        ###
-
-        _p = maximum(minimum(self._p_absorbed, plim[1]), plim[0])
-
-        ax = axes[2]
-        ax.step(self._x, _p, where='mid', color='k', zorder=0)
-        ax.hlines(p_crit, *ax.set_xlim(), color=cr_color, zorder=1, ls='dotted')
-
-        ax.set_yscale('log')
-        ax.set_ylim(*plim)
-        ax.set_xlabel(xlabel, loc='right')
-        ax.set_ylabel('Significance')
-
-        ###
-
-        axes[1].yaxis.set_major_locator(MultipleLocator(z_major))
-        axes[1].yaxis.set_major_formatter(ScalarFormatter())
-
-        axes[1].yaxis.set_minor_locator(MultipleLocator(z_minor))
-        axes[1].yaxis.set_minor_formatter(NullFormatter())
-
-        axes[2].yaxis.set_major_locator(LogLocator(base=p_major))
-        axes[2].yaxis.set_major_formatter(LogFormatterSciNotation(base=p_major))
-
-        axes[2].yaxis.set_minor_locator(
-            LogLocator(base=p_major, subs=arange(p_minor, 1, p_minor), numticks=100)
-        )
-        axes[2].yaxis.set_minor_formatter(NullFormatter())
-
-        return fig, axes

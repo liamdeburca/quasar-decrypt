@@ -1,24 +1,25 @@
 from logging import getLogger
-from typing import Iterable, Self, Callable
+from abc import abstractmethod
+from typing import Iterable, Self, Callable, TypeVar
 from numpy import zeros_like, bool_
 from dataclasses import dataclass
 from pydantic import validate_call
 
-from quasar_typing.numpy import FloatVector, BoolVector
+from quasar_typing.numpy import FloatVector, BoolVector, CoordsTuple
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc.coords_tuple import CoordsTuple
 
 from quasar_utils.setup import Info
 
 from .specdata import SpecData
 from ._specdata import _SpecData
 
+T = TypeVar('T', bound='SpecData')
+
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass
-class SpecList(SpecData, list[SpecData]):
-    @validate_call(validate_return=False)
+class SpecList(SpecData, list[T]):
+    @validate_call
     def __init__(
         self,
         coords_or_spectrum: CoordsTuple | _SpecData,
@@ -69,7 +70,7 @@ class SpecList(SpecData, list[SpecData]):
         )
         self.populate.__wrapped__(self, windows=windows)
 
-    @validate_call(validate_return=False)
+    @validate_call
     def populate(
         self,
         *,
@@ -123,3 +124,7 @@ class SpecList(SpecData, list[SpecData]):
     def window_sizes(self) -> list[int]:
         return [window.size for window in self]
 
+    @property
+    @abstractmethod
+    def sample(self):
+        pass

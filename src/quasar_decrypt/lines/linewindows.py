@@ -1,7 +1,7 @@
 __all__ = ['LineWindows']
 
 from logging import getLogger
-from typing import Self, Union, ClassVar
+from typing import Self, ClassVar
 from numpy import zeros_like
 from pathlib import Path
 from itertools import product
@@ -10,35 +10,39 @@ from dataclasses import dataclass, field
 
 
 from .lwindow import LWindow
-from .utils import read_linelist
 from .graph_utils import Graph
 from ..utils.general import stopwatch
 from ..utils import SpecList, get_log
-
-from pydantic import validate_call
-
-from quasar_utils.wrappers import apply_info_to_method
 
 from quasar_typing.numpy import FloatVector, BoolVector
 from quasar_typing.pathlib import AbsoluteFilePath
 from quasar_typing.pandas import LineList
 from quasar_typing.astropy import FitterInstance, CompoundModel_, FitInfo
-from quasar_typing.misc.literals import BGFlux
+from quasar_typing.misc import BackgroundFlux
+
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
+from quasar_utils.pipeline.linelist import read_linelist
 
 from quasar_models.line import GaussianModel
 from quasar_models.utils.astropy import get_free_params
 
+from quasar_errors.model_samples import GaussianSampleList
+
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass(init=False)
-class LineWindows(SpecList):
+class LineWindows(SpecList[LWindow]):
     graph: Graph | None = field(default=None, init=False)
     
-    default_bg: ClassVar[BGFlux] = {'pl', 'fe', 'ba', 'hg'}
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'em'})
+
+    @property
+    def sample(self) -> GaussianSampleList | None:
+        if (model := self.getModel()) is None:
+            return None
+        return GaussianSampleList.fromGaussianModels(model)
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def getMask(
         self,
         *,
@@ -48,6 +52,7 @@ class LineWindows(SpecList):
         with_neighbours: bool = False,
         valid: bool = False,
         log_valid: bool = False,
+        bg_flux: BackgroundFlux | None = None,
 
         line: float | None = None,
         limited: bool = True,
@@ -59,43 +64,39 @@ class LineWindows(SpecList):
         if line is None:
             mask = zeros_like(self._x, dtype=bool)
             for lwindow in self:
-                mask |= lwindow.getMask.__wrapped__.raw(
+                mask |= lwindow.getMask.__wrapped__(
                     lwindow,
-                    covered = covered,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    with_neighbours = with_neighbours,
-                    valid = valid,
-                    log_valid = log_valid,
+                    covered=covered,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
+                    valid=valid,
+                    log_valid=log_valid,
                 )
         else:
-            for lwindow in self:
-                if line not in lwindow.lines:
-                    continue
-
-                mask = lwindow.getMask.__wrapped__.raw(
+            for lwindow in filter(lambda window: line in window.lines, self):
+                mask = lwindow.getMask.__wrapped__(
                     lwindow,
-                    covered = covered,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    with_neighbours = with_neighbours,
-                    valid = valid,
-                    log_valid = log_valid,
-                    line = line,
-                    limited = limited,
-                    v_sep = v_sep,
+                    covered=covered,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
+                    valid=valid,
+                    log_valid=log_valid,
+                    line=line,
+                    limited=limited,
+                    v_sep=v_sep,
                 )
                 break
 
         return mask
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('loading', 'lines', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('loading', 'lines', 'nonlinear'))
     def __call__(
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -130,7 +131,7 @@ class LineWindows(SpecList):
 
         with stopwatch() as watch:
             logger.debug(f">>> [1/{_n}] Applying line list.")
-            success = self.applyLineList.__wrapped__.raw(
+            success = self.applyLineList.__wrapped__(
                 self,
                 linelist,
                 sigma_res = sigma_res,
@@ -176,14 +177,14 @@ class LineWindows(SpecList):
                 logger.debug(f">>> [{count}/{_n}] Fitting 'LWindow' no. {idx}.")
 
                 lwindow = self[idx]
-                success = lwindow.makeInitialFit.__wrapped__.raw(
+                success = lwindow.makeInitialFit.__wrapped__(
                     lwindow,
-                    bg_flux = bg_flux,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    with_neighbours = with_neighbours,
-                    evaluate_initial = evaluate_initial,
-                    fitter = fitter,
+                    bg_flux=bg_flux,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
+                    evaluate_initial=evaluate_initial,
+                    fitter=fitter,
                 )
                 if not success:
                     logger.warning(
@@ -192,21 +193,21 @@ class LineWindows(SpecList):
                     )
                     return False
 
-                success = lwindow.makeFinalFit.__wrapped__.raw(
+                success = lwindow.makeFinalFit.__wrapped__(
                     lwindow,
-                    bg_flux = bg_flux,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    with_neighbours = with_neighbours,
-                    limited = limited,
-                    w = w,
-                    aggressive = aggressive,
-                    crop = crop,
-                    measure = measure,
-                    reverse = reverse,
-                    evaluate_initial = evaluate_initial,
-                    v_sep = v_sep,
-                    fitter = fitter,
+                    bg_flux=bg_flux,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
+                    limited=limited,
+                    w=w,
+                    aggressive=aggressive,
+                    crop=crop,
+                    measure=measure,
+                    reverse=reverse,
+                    evaluate_initial=evaluate_initial,
+                    v_sep=v_sep,
+                    fitter=fitter,
                 )
                 if not success:
                     logger.warning(
@@ -224,8 +225,7 @@ class LineWindows(SpecList):
         )
         return True
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def getMaskedCoords(
         self, 
         *,
@@ -236,7 +236,7 @@ class LineWindows(SpecList):
         with_neighbours: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-        bg_flux: BGFlux = {'pl', 'fe', 'ba', 'hg'},
+        bg_flux: BackgroundFlux | None = None,
 
         line: float | None = None,
         limited: bool = True,
@@ -245,6 +245,9 @@ class LineWindows(SpecList):
         """
         ** PYDANTIC VALIDATED METHOD **
         """
+        if bg_flux is None:
+            bg_flux = self.default_bg
+
         x = self._x_log if log else self._x
         dy = self._dy_log if log else self._dy
 
@@ -259,7 +262,7 @@ class LineWindows(SpecList):
             y        = get_log(y, self.y0, self._log_valid_pixels)
             y_smooth = get_log(y_smooth, self.y0, self._log_valid_pixels)
 
-        mask = self.getMask.__wrapped__.raw(
+        mask = self.getMask.__wrapped__(
             self,
             covered = covered,
             without_rejections = without_rejections,
@@ -273,8 +276,7 @@ class LineWindows(SpecList):
         )
         return x[mask], y[mask], dy[mask], y_smooth[mask]
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('loading', 'lines')
+    @validated_apply_info_to_method(subjects=('loading', 'lines'))
     def applyLineList(
         self,
         linelist: AbsoluteFilePath | LineList,
@@ -314,20 +316,17 @@ class LineWindows(SpecList):
             coords_or_spectrum = self.spectrum
         
         if isinstance(linelist, Path):
-            linelist = read_linelist.__wrapped__(linelist, self.info)
+            linelist = read_linelist.__wrapped__(path=linelist, info=self.info)
 
-        linelist.sort_values('line', inplace=True)
-        is_valid = (self.x_bounds[0] <= linelist['line']) \
-            & (linelist['line'] < self.x_bounds[1])
-        
-        if not is_valid.any():
-            return False
-
-        linelist = linelist[is_valid]
-        linelist.reset_index(drop=True, inplace=True)
-        
+        df = linelist.sort_values('line', inplace=False)
+        if self.x_bounds[0] is not None:
+            df.drop(df[df['line'] < self.x_bounds[0]].index, inplace=True)
+        if self.x_bounds[1] is not None:
+            df.drop(df[df['line'] >= self.x_bounds[1]].index, inplace=True)
+        df = df.reset_index(drop=True)
+                
         prev_line: float = None
-        for idx, row in linelist.iterrows():
+        for idx, row in df.iterrows():
             line = row['line']
 
             cond = (idx == 0)
@@ -365,20 +364,20 @@ class LineWindows(SpecList):
         self.checkLineDependencies.__wrapped__(self, linelist)
 
         for lwindow in self:
-            lwindow.prepareLines.__wrapped__.raw(
+            lwindow.prepareLines.__wrapped__(
                 lwindow,
-                v_sep = v_sep,
-                min_fittable_total = min_fittable_total,
-                min_fittable_ratio = min_fittable_ratio,
+                v_sep=v_sep,
+                min_fittable_total=min_fittable_total,
+                min_fittable_ratio=min_fittable_ratio,
             )
-            lwindow.prepareNeighbours.__wrapped__.raw(
+            lwindow.prepareNeighbours.__wrapped__(
                 lwindow,
-                sigma_res = sigma_res,
+                sigma_res=sigma_res,
             )
 
         return True
     
-    @validate_call(validate_return=False)
+    @validate_call
     def checkLineDependencies(
         self, 
         linelist: AbsoluteFilePath | LineList,
@@ -387,26 +386,26 @@ class LineWindows(SpecList):
         ** PYDANTIC VALIDATED METHOD **
         """
         if isinstance(linelist, Path):
-            linelist = read_linelist.__wrapped__(
-                linelist, self.info,
-            )
+            linelist = read_linelist.__wrapped__(path=linelist, info=self.info)
 
         all_added_lines: set[str] = set()
         for lwindow in self:
-            all_added_lines |= lwindow.names
+            all_added_lines.update(lwindow.lines.keys())
 
         repeat_call: bool = False
-
         for lwindow in self:
             for needed_line in lwindow.needs_line.values():
                 if needed_line in lwindow.names:
-                    # Line is already added!
+                    logger.warning(
+                        f"Needed line '{needed_line}' is already covered by "
+                        "the same 'LWindow'?"
+                    )
                     continue
 
                 if needed_line in all_added_lines:
                     # Line is added by another 'LWindow' class?!
                     logger.warning(
-                        f"Needed line '{needed_line}' is covered by another " \
+                        f"Needed line '{needed_line}' is covered by another "
                         "'LWindow'?"
                     )
                     return False
@@ -414,40 +413,40 @@ class LineWindows(SpecList):
                 ser = linelist[linelist['name'] == needed_line]
                 if len(ser) == 0:
                     logger.warning(
-                        f"Needed line '{needed_line}' could not be found in " \
+                        f"Needed line '{needed_line}' could not be found in "
                         "line list -> skipping!"
                     )
                     continue
 
                 if len(ser) > 1:
                     logger.warning(
-                        f"Found duplicates for '{needed_line}' in line list " \
+                        f"Found duplicates for '{needed_line}' in line list "
                         "-> skipping!"
                     )
                     continue
 
                 row = next(ser.iterrows())[1]
+                def get_bounds(s: str) -> tuple[float, float]:
+                    return (row[f'{s}_lower'], row[f'{s}_upper'])
+
                 lwindow.add.__wrapped__(
                     lwindow,
                     row['name'],
                     row['line'],
                     row['n_max'],
 
-                    needs_line = (a := row['needs_line']),
-
-                    strength_bounds = (row['strength_lower'], row['strength_upper']),
-                    v_off_bounds    = (row['v_off_lower'],    row['v_off_upper']),
-                    sigma_v_bounds  = (row['sigma_v_lower'],  row['sigma_v_upper']),
-                    
-                    is_copy_of      = row['is_copy_of'],
-                    scale_init      = row['scale_init'],
-                    scale_bounds    = (row['scale_lower'], row['scale_upper']),
-
-                    force_add = True,
+                    needs_line=row['needs_line'],
+                    strength_bounds=get_bounds('strength'),
+                    v_off_bounds=get_bounds('v_off'),
+                    sigma_v_bounds=get_bounds('sigma_v'),
+                    is_copy_of=row['is_copy_of'],
+                    scale_init=row['scale_init'],
+                    scale_bounds=get_bounds('scale'),
+                    force_add=True,
                 )
                 all_added_lines.add(needed_line)
 
-                repeat_call |= bool(a)
+                repeat_call |= bool(row['needs_line'])
 
         if repeat_call:
             return self.checkLineDependencies.__wrapped__(self, linelist)
@@ -487,11 +486,8 @@ class LineWindows(SpecList):
                 if master not in orig.names:
                     continue
 
-                # Update graph to show connection
                 self.graph[idx_o].add(idx_d)
-
-                # Update origin to show connection
-                orig.copies_to[master] = (idx_d, mimic)
+                orig.copies_to[master].append((idx_d, mimic))
 
         return True
     
@@ -502,7 +498,7 @@ class LineWindows(SpecList):
                 return list(range(len(self)))
         return self.graph.expand(inplace=True).createChain()
 
-    def getModel(self) -> Union[GaussianModel, CompoundModel_[GaussianModel], None]:
+    def getModel(self) -> GaussianModel | CompoundModel_[GaussianModel] | None:
         """
         Retrieves and combines each 'LWindow's current fit/model, combining them
         into a single model. 
@@ -515,19 +511,16 @@ class LineWindows(SpecList):
         their 'tie' attributes enabled. 
         """
         models = [
-            mod for lwindow in self \
+            mod 
+            for lwindow in self
             if (mod := lwindow.getModel(thaw=True)) is not None
         ]
-        return (
-            None \
-            if len(models) == 0 \
-            else sum(models[1:], start=models[0])
-        )
+        return sum(models[1:], start=models[0]) if models else None
     
-    @validate_call(validate_return=False)
+    @validate_call
     def applyFit(
         self,
-        fit: Union[GaussianModel, CompoundModel_[GaussianModel]],
+        fit: GaussianModel | CompoundModel_[GaussianModel],
         fit_info: FitInfo,
     ) -> Self:
         """
@@ -576,4 +569,25 @@ class LineWindows(SpecList):
             )
             count += n_free
 
+        return self
+    
+    @validate_call
+    def adoptFit(
+        self,
+        fit: GaussianModel | CompoundModel_[GaussianModel],
+    ) -> Self:
+        """
+        ** PYDANTIC VALIDATED METHOD **
+        """
+        fs = fit if (fit.n_submodels > 1) else (fit,)
+        for lwindow in self:
+            submodels = [f for f in fs if f.pure_name in lwindow.names]
+            if len(submodels) == 0:
+                continue
+
+            model = sum(submodels[1:], start=submodels[0])
+            lwindow.adoptFit.__wrapped__(
+                lwindow,
+                model,
+            )
         return self

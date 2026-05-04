@@ -3,16 +3,14 @@ from typing import Callable
 from dataclasses import dataclass, field
 from pydantic import validate_call
 
-from quasar_typing.numpy import FloatVector, BoolVector
+from quasar_typing.numpy import FloatVector, BoolVector, CoordsTuple
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc.coords_tuple import CoordsTuple
 
 from quasar_utils.setup import Info
 
 from ._specdata import _SpecData
 
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass
 class SpecData(_SpecData):
@@ -22,7 +20,7 @@ class SpecData(_SpecData):
     """
     spectrum: _SpecData | None = field(default=None, init=False)
 
-    @validate_call(validate_return=False)
+    @validate_call
     def __init__(
         self,
         coords_or_spectrum: CoordsTuple | _SpecData,

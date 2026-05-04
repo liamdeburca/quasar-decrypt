@@ -1,9 +1,11 @@
 __all__ = ['LWindow']
 
 from logging import getLogger
-from typing import Self, Iterable, Optional, Union, ClassVar
+from typing import Self, Iterable, ClassVar, Literal
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 from numpy import (
     inf, array, empty, invert, interp, exp, linspace, convolve, argmax, 
     isfinite, diff, unique
@@ -30,21 +32,28 @@ from quasar_typing.pathlib import AbsoluteDirPath, RelativeFilePath
 from quasar_typing.astropy import (
     FitInfo, FitterInstance, QTable_, CompoundModel_,
 )
-from quasar_typing.misc.literals import (
-    Scale, Variant, BootstrapType, VaryLines, FWHMStrategy, OutLines, 
-    OutMeasures, BGFlux,
+from quasar_typing.misc import (
+    Scale, Variant, BootstrapType, VaryLines, FWHMStrategy, BackgroundFlux, 
+    ModelTypes, OutLines, OutMeasures,
 )
 from quasar_typing.misc.pool import Pool_
 
-from quasar_utils.wrappers import apply_info_to_method
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 
 from quasar_models import PowerLawModel, GaussianModel, IronModel, BalmerModel
 from quasar_models.line import _VProfileCopy, VProfileCopyDict
 from quasar_models.utils.astropy import apply_bounds, order_submodels
 
+from quasar_plotting import quickplot, absorptionplot, fitplot
+from quasar_plotting.utils import get_coords
+from quasar_plotting.colors import DEFAULT_COLORS
+
+from quasar_errors.model_samples import GaussianSampleList
+
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
+
+type LineModel = GaussianModel | CompoundModel_[GaussianModel]
 
 @dataclass(init=False)
 class LWindow(SpecData):
@@ -62,22 +71,26 @@ class LWindow(SpecData):
     scale_init: dict[str, float] = field(default_factory=dict, init=False)
     scale_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
     
-    copies_to: dict[str, tuple[int, str]] = field(default_factory=dict, init=False)
+    copies_to: dict[str, list[tuple[int, str]]] = field(default_factory=lambda: defaultdict(list), init=False)
     i_bounds: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
     blacklist: dict[str, bool] = field(default_factory=dict, init=False)
     _blacklist: dict[str, bool] = field(default_factory=dict, init=False)
     
     neighbours: tuple[_SpecData | None, _SpecData | None] = field(default=(None, None), init=False)
-    prev_model: Union[GaussianModel, CompoundModel_, None] = field(default=None, init=False)
-    model: Union[GaussianModel, CompoundModel_, None] = field(default=None, init=False)
-    fit: Union[CompoundModel_, GaussianModel, None] = field(default=None, init=False)
-    fits: dict[int, Union[CompoundModel_, GaussianModel]] = field(default_factory=dict, init=False)
-    fit_info: dict[int, FitInfo] = field(default_factory=dict, init=False)
+    prev_model: LineModel | None = field(default=None, init=False)
+    model: LineModel | None = field(default=None, init=False)
+    fit: LineModel | None = field(default=None, init=False)
+    fit_info: FitInfo | None = field(default=None, init=False)
+
+    fits: dict[int, LineModel] = field(default_factory=dict, init=False)
+    fit_infos: dict[int, FitInfo] = field(default_factory=dict, init=False)
+
+    cropped: set[str] = field(default_factory=set, init=False)
 
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
     
-    default_bg: ClassVar[BGFlux] = {'pl', 'fe', 'ba', 'hg'}
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'em'})
 
     def __post_init__(self):
         self.names = set()
@@ -94,20 +107,27 @@ class LWindow(SpecData):
         self.scale_init = {}
         self.scale_bounds = {}
 
-        self.copies_to = {}
+        self.copies_to = defaultdict(list)
         self.i_bounds = {}
         self.blacklist = {}
         self._blacklist = {}
 
         self.fits = {}
         self.fit_infos = {}
+
+        self.cropped = set()
+
+    @property
+    def sample(self) -> GaussianSampleList | None:
+        if (model := self.getModel()) is None:
+            return None
+        return GaussianSampleList.fromGaussianModels(model)
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('loading', 'lines', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('loading', 'lines', 'nonlinear'))
     def __call__(
         self,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -136,7 +156,7 @@ class LWindow(SpecData):
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
 
         with stopwatch() as watch:
-            success = self.prepareLines.__wrapped__.raw(
+            success = self.prepareLines.__wrapped__(
                 self,
                 v_sep = v_sep,
                 min_fittable_total = min_fittable_total,
@@ -147,7 +167,7 @@ class LWindow(SpecData):
                 return False
             
             if with_neighbours:
-                success = self.prepareNeighbours.__wrapped__.raw(
+                success = self.prepareNeighbours.__wrapped__(
                     self,
                     sigma_res = sigma_res,
                 )
@@ -170,7 +190,7 @@ class LWindow(SpecData):
                 )
                 return False
 
-            success = self.makeInitialFit.__wrapped__.raw(
+            success = self.makeInitialFit.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -185,7 +205,7 @@ class LWindow(SpecData):
                 )
                 return False
             
-            success = self.makeFinalFit.__wrapped__.raw(
+            success = self.makeFinalFit.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -213,8 +233,7 @@ class LWindow(SpecData):
         )
         return True
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def getMask(
         self,
         *,
@@ -270,8 +289,7 @@ class LWindow(SpecData):
 
         return mask
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def getMaskedCoords(
         self, 
         *,
@@ -282,7 +300,7 @@ class LWindow(SpecData):
         with_neighbours: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-        bg_flux: BGFlux = set(),
+        bg_flux: BackgroundFlux | None = None,
 
         line: float | str | None = None,
         limited: bool = True,
@@ -291,6 +309,9 @@ class LWindow(SpecData):
         """
         ** PYDANTIC VALIDATED METHOD **
         """
+        if bg_flux is None:
+            bg_flux = self.default_bg
+
         x = self._x_log if log else self._x
         dy = self._dy_log if log else self._dy
 
@@ -304,7 +325,7 @@ class LWindow(SpecData):
             y        = get_log(y, self.y0, self._log_valid_pixels)
             y_smooth = get_log(y_smooth, self.y0, self._log_valid_pixels)
 
-        mask = self.getMask.__wrapped__.raw(
+        mask = self.getMask.__wrapped__(
             self,
             covered = covered,
             without_rejections = without_rejections,
@@ -318,8 +339,7 @@ class LWindow(SpecData):
         )
         return x[mask], y[mask], dy[mask], y_smooth[mask]
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines')
+    @validated_apply_info_to_method(subjects=('lines',))
     def add(
         self, 
         name: str,
@@ -377,8 +397,7 @@ class LWindow(SpecData):
 
         return False 
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines')
+    @validated_apply_info_to_method(subjects=('lines',))
     def prepareLines(
         self, 
         *,
@@ -454,26 +473,29 @@ class LWindow(SpecData):
 
             # Update velocity offset bounds
 
-            lower_bounds = array([
-                self.v_off_bounds[name][0] for name in self.names
-            ], dtype=float)
-            upper_bounds = array([
-                self.v_off_bounds[name][1] for name in self.names
-            ], dtype=float)
+            v_off_bounds: dict[float, tuple[float, float]] = {}
+            for name, line in self.lines.items():
+                b = self.v_off_bounds[name]
+                if line in v_off_bounds:
+                    # Use the largest possible bounds
+                    v_off_bounds[line] = (
+                        min(v_off_bounds[line][0], b[0]),
+                        max(v_off_bounds[line][1], b[1]),
+                    )
+                else:
+                    v_off_bounds[line] = b
+
+            lower_bounds = array([v_off_bounds[line][0] for line in _lines])
+            upper_bounds = array([v_off_bounds[line][1] for line in _lines])
 
             _x = empty(_lines.size+1)
-            _x[0] = max([
-                self.x_bounds[0],
-                _lines[0] * (1 + lower_bounds[0])
-            ])
+            _x[0] = max(self.x_bounds[0], _lines[0] * (1 + lower_bounds[0]))
+            
             _x[1:-1] = common_middle(
                 _lines[:-1], _lines[1:],
                 -upper_bounds[:-1], lower_bounds[1:],   #! Does this make sense?
             )
-            _x[-1] = min([
-                self.x_bounds[1],
-                _lines[-1] * (1 + upper_bounds[-1])
-            ])
+            _x[-1] = min(self.x_bounds[1], _lines[-1] * (1 + upper_bounds[-1]))
 
             x1_dict = dict(zip(_lines, _x[:-1]))
             x2_dict = dict(zip(_lines, _x[1:]))
@@ -489,7 +511,7 @@ class LWindow(SpecData):
             self.blacklist [name] = (n_max == 1)
             self._blacklist[name] = (n_max == 1)
 
-        return self.gradeLines.__wrapped__.raw(
+        return self.gradeLines.__wrapped__(
             self,
             with_neighbours = True,
             min_fittable_total = min_fittable_total,
@@ -497,8 +519,7 @@ class LWindow(SpecData):
             v_sep = v_sep,
         )
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('loading', specific_kwargs={'sigma_res'})
+    @validated_apply_info_to_method(subjects=('loading',), specific_kwargs={'sigma_res'})
     def prepareNeighbours(
         self,
         *,
@@ -540,8 +561,7 @@ class LWindow(SpecData):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines')
+    @validated_apply_info_to_method(subjects=('lines',))
     def gradeLines(
         self,
         with_neighbours: bool = False,
@@ -559,7 +579,7 @@ class LWindow(SpecData):
 
         self.sortLines()
         for name, line in self.lines.items():
-            mask = self.getMask.__wrapped__.raw(
+            mask = self.getMask.__wrapped__(
                 self,
                 with_neighbours = with_neighbours,
                 covered = True,
@@ -601,12 +621,11 @@ class LWindow(SpecData):
 
         return True
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def instantiateModels(
         self, 
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -652,7 +671,10 @@ class LWindow(SpecData):
         self.sortLines()
         models = []
         for name, line in self.lines.items():
-            x, y, _, y_smooth = self.getMaskedCoords.__wrapped__.raw(
+            if line in self.cropped:
+                continue
+
+            x, y, _, y_smooth = self.getMaskedCoords.__wrapped__(
                 self,
                 valid = True,
                 bg_flux = bg_flux,
@@ -678,7 +700,7 @@ class LWindow(SpecData):
                     ">>> Successfully instantiated line '{}' at {:.1f}." \
                     .format(name, line)
                 )
-            except ValidationError as e:
+            except Exception as e:
                 logger.warning(
                     ">>> Failed instantiating line '{}' at {:.1f} due to:\n{}" \
                     .format(name, line, e)
@@ -701,13 +723,12 @@ class LWindow(SpecData):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('nonlinear', specific_kwargs={'fitter'})
+    @validated_apply_info_to_method(subjects=('nonlinear',), specific_kwargs={'fitter'})
     def fitModel(
         self,
         *,
         update_flux: bool = False,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -728,7 +749,7 @@ class LWindow(SpecData):
         msg = "Fitting model for {}: " \
             .format(self.__str__(simple=True).removesuffix('.'))
         
-        coords = self.getMaskedCoords.__wrapped__.raw(
+        coords = self.getMaskedCoords.__wrapped__(
             self,
             covered = True,
             valid = True,
@@ -776,12 +797,11 @@ class LWindow(SpecData):
 
         return True
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('lines', 'nonlinear'))
     def makeInitialFit(
         self, 
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -808,7 +828,7 @@ class LWindow(SpecData):
             if not success: 
                 return False
 
-        success = self.fitModel.__wrapped__.raw(
+        success = self.fitModel.__wrapped__(
             self,
             bg_flux = bg_flux,
             without_rejections = without_rejections,
@@ -820,7 +840,7 @@ class LWindow(SpecData):
             return False
 
         if isinstance(evaluate_initial, (int, float)):
-            x, _, dy = self.getMaskedCoords.__wrapped__.raw(
+            x, _, dy = self.getMaskedCoords.__wrapped__(
                 self,
                 covered = True,
                 valid = True,
@@ -842,12 +862,11 @@ class LWindow(SpecData):
 
         return True
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'w'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'w'})
     def addLine(
         self,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -860,7 +879,7 @@ class LWindow(SpecData):
             bg_flux = self.default_bg
 
         n = self.fit.n_submodels
-        x, y, dy = self.getMaskedCoords.__wrapped__.raw(
+        x, y, dy = self.getMaskedCoords.__wrapped__(
             self,
             covered = True,
             valid = True,
@@ -898,12 +917,11 @@ class LWindow(SpecData):
 
         return f.makeCopy(*data)
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('lines', 'nonlinear'))
     def makeFinalFit(
         self,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -927,7 +945,7 @@ class LWindow(SpecData):
 
         # Instantiate if necessary
         if self.fit is None:
-            self.makeInitialFit.__wrapped__.raw(
+            self.makeInitialFit.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -951,7 +969,7 @@ class LWindow(SpecData):
                 if self.fit.n_submodels == 1
                 else None
             )
-            continue_fitting = self.isUnderFitted.__wrapped__.raw(
+            continue_fitting = self.isUnderFitted.__wrapped__(
                 self,
                 self.fit.n_submodels,
                 bg_flux = bg_flux,
@@ -972,7 +990,7 @@ class LWindow(SpecData):
                 break
 
             # Add a line component
-            new_model = self.addLine.__wrapped__.raw(
+            new_model = self.addLine.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -983,7 +1001,7 @@ class LWindow(SpecData):
             current_config[new_model.pure_name] += 1
 
             self.model = self.fit + new_model
-            self.fitModel.__wrapped__.raw(
+            self.fitModel.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -1000,7 +1018,7 @@ class LWindow(SpecData):
             all_configs.append(_config)
 
             # Check if model is over-fitted
-            is_over, is_over_features = self.isOverFitted.__wrapped__.raw(
+            is_over, is_over_features = self.isOverFitted.__wrapped__(
                 self,
                 self.fit.n_submodels - 1,
                 self.fit.n_submodels, 
@@ -1033,7 +1051,7 @@ class LWindow(SpecData):
                     ]
 
                     self.model = sum(submodels[1:], start=submodels[0])
-                    self.fitModel.__wrapped__.raw(
+                    self.fitModel.__wrapped__(
                         self,
                         update_flux = False,
                         bg_flux = bg_flux,
@@ -1052,7 +1070,7 @@ class LWindow(SpecData):
 
         # Perform final model cropping
         if crop:
-            self.cropFit.__wrapped__.raw(
+            self.cropFit.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -1072,12 +1090,11 @@ class LWindow(SpecData):
         
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('lines', 'nonlinear'))
     def cropFit(
         self,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -1142,12 +1159,19 @@ class LWindow(SpecData):
             return True
         
         fit = self.fit
+        fs = fit if fit.n_submodels > 1 else (fit,)
         n = fit.n_submodels
         fit_info = self.fit_infos[n]
 
         configuration = self.getConfiguration()
-        single_lines =   [f for f in fit if configuration[f.pure_name] == 1]
-        multiple_lines = [f for f in fit if configuration[f.pure_name] >= 2]
+
+        single_lines: list[GaussianModel] = []
+        multiple_lines: list[GaussianModel | _VProfileCopy] = []
+        for f in fs:
+            if configuration[f.pure_name] == 1 and isinstance(f, GaussianModel):
+                single_lines.append(f)
+            else:
+                multiple_lines.append(f)
 
         msg += "no. of single lines: {}, no. of multiple lines: {}. " \
             .format(len(single_lines), n - len(single_lines))
@@ -1168,7 +1192,7 @@ class LWindow(SpecData):
         submodels = single_lines + multiple_lines
         self.model = sum(submodels[1:], start=submodels[0])
 
-        success = self.fitModel.__wrapped__.raw(
+        success = self.fitModel.__wrapped__(
             self,
             update_flux = False,
             bg_flux = bg_flux,
@@ -1181,7 +1205,7 @@ class LWindow(SpecData):
             msg += "Fitting the cropped model failed -> skipping cropping!"
             return False
         
-        is_over, is_over_features = self.isOverFitted.__wrapped__.raw(
+        is_over, is_over_features = self.isOverFitted.__wrapped__(
             self,
             self.fit.n_submodels,       #? Cropped fit
             self.fit.n_submodels + 1,   #? Previous fit
@@ -1198,7 +1222,8 @@ class LWindow(SpecData):
             #* on fit quality, i.e. using the more advanced model constitutes
             #* over-fitting. 
             #* => Recursive call...
-            return self.cropFit.__wrapped__.raw(
+            self.cropped.add(removed_line.pure_name)
+            return self.cropFit.__wrapped__(
                 self,
                 bg_flux = bg_flux,
                 without_rejections = without_rejections,
@@ -1221,8 +1246,8 @@ class LWindow(SpecData):
             )
             return True
 
-    @validate_call(validate_return=False)
-    def getModel(self, thaw: bool = False) -> Optional[CompoundModel_]:
+    @validate_call
+    def getModel(self, thaw: bool = False) -> CompoundModel_ | None:
         """
         ** PYDANTIC VALIDATED METHOD **
 
@@ -1234,10 +1259,10 @@ class LWindow(SpecData):
         retrieved model inplace will therefore NOT update the 'LWindow's model, 
         and the fit will need to be applied using" 'ApplyFit'. 
         """
-        if self.model is None:
+        fit = self.fit or self.model
+        if fit is None:
             return None
-
-        fit = self.model if (self.fit is None) else self.fit
+        
         if thaw:
             fit = fit.copy()
             fs = (fit,) if fit.n_submodels == 1 else fit
@@ -1247,7 +1272,7 @@ class LWindow(SpecData):
 
         return fit
 
-    @validate_call(validate_return=False)
+    @validate_call
     def createVelocityProfileCopy(
         self,
         master: str,
@@ -1264,21 +1289,25 @@ class LWindow(SpecData):
         a 'pure_name' equal to 'master' are used for the velocity profile. 
         """
         if master not in self.names:
-            msg = f"Could not find any lines with name '{master}' in \
-                {self.__str__(simple=True)}!"
-            raise ValueError(msg)
+            raise ValueError(
+                f"Line '{master}' not found in "
+                f"{self.__str__(simple=True).removesuffix('.')}!  Available "
+                f"names are: {self.names}")
 
         model = self.getModel.__wrapped__(self, thaw=False)
         ms = (model,) if model.n_submodels == 1 else model
+        names = set(m.pure_name for m in ms)
+
+        if master not in names:
+            raise ValueError(
+                f"Line '{master}' not found in the current model of "
+                f"{self.__str__(simple=True).removesuffix('.')}! Available "
+                f"lines are: {names}"
+            )
 
         submodels = [m for m in ms if m.pure_name == master]
 
-        if (n := len(submodels)) == 0:
-            msg = f"Could not find any submodels with name '{master}' in \
-                {self.__str__(simple=True)}!"
-            raise ValueError(msg)
-
-        return VProfileCopyDict[n].from_model(
+        return VProfileCopyDict[len(submodels)].from_model(
             wave,
             mimic,
             sum(submodels[1:], start=submodels[0]),
@@ -1286,10 +1315,10 @@ class LWindow(SpecData):
             **model_kwargs,
         )
     
-    @apply_info_to_method('lines', specific_kwargs={'adapt_scale'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'adapt_scale'})
     def applyMyself(
         self,
-        line_windows: list[Self] | None = None,
+        line_windows: list[SpecData] | None = None,
         *,
         adapt_scale: bool | None = None,
     ) -> Self:
@@ -1306,24 +1335,32 @@ class LWindow(SpecData):
         """
         if line_windows is None:
             assert self.spectrum is not None
-            line_windows = self.spectrum['em']
+            line_windows = self.spectrum.em
 
-        for master, (idx_d, mimic) in self.copies_to.items():
-            (_lwindow := line_windows[idx_d]).applyVelocityProfileCopy.raw(
-                _lwindow,
-                self.createVelocityProfileCopy(
-                    master,
-                    _lwindow.lines[mimic],
-                    mimic,
-                    freeze = True,
-                ),
-                adapt_scale = adapt_scale,
-            )
+        for master, children in self.copies_to.items():
+            for idx_d, mimic in children:
+                lwindow = line_windows[idx_d]
+
+                # Check if master line has been cropped
+                if master in self.cropped:
+                    # Crop corresponding mimic line
+                    lwindow.cropped.add(mimic)
+                    continue
+
+                lwindow.applyVelocityProfileCopy.__wrapped__(
+                    lwindow,
+                    self.createVelocityProfileCopy(
+                        master,
+                        lwindow.lines[mimic],
+                        mimic,
+                        freeze = True,
+                    ),
+                    adapt_scale = adapt_scale,
+                )
 
         return self
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'adapt_scale'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'adapt_scale'})
     def applyVelocityProfileCopy(
         self,
         master_model: _VProfileCopy,
@@ -1387,10 +1424,10 @@ class LWindow(SpecData):
 
         return self
 
-    @validate_call(validate_return=False)
+    @validate_call
     def applyFit(
         self,
-        fit: Union[GaussianModel, CompoundModel_[GaussianModel]],
+        fit: GaussianModel | CompoundModel_[GaussianModel],
         fit_info: FitInfo,
         freeze: bool = False
     ) -> Self:
@@ -1418,11 +1455,36 @@ class LWindow(SpecData):
         self.fit_infos[n] = fit_info
 
         return self
+    
+    @validate_call
+    def adoptFit(
+        self,
+        fit: GaussianModel | CompoundModel_[GaussianModel],
+        freeze: bool = False
+    ) -> Self:
+        """
+        ** PYDANTIC VALIDATED METHOD **
+        """
+        if freeze:
+            fit = fit.copy()
+            fs = (fit,) if fit.n_submodels == 1 else fit
+            for f in (f for f in fs if isinstance(f, _VProfileCopy)):
+                f._freeze_velocity_profile(inplace=True)
+                f._forget_ties(inplace=True)
 
-    @validate_call(validate_return=False)
+        n = fit.n_submodels
+        self.fit = fit
+        self.fit_info = None
+        
+        self.fits[n] = fit
+        self.fit_infos[n] = None
+
+        return self
+
+    @validate_call
     def updateLinesEmission(
         self,
-        model: Union[GaussianModel, CompoundModel_[GaussianModel], None],
+        model: GaussianModel | CompoundModel_[GaussianModel] | None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -1537,13 +1599,12 @@ class LWindow(SpecData):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def isUnderFitted(
         self,
         n: int,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -1557,7 +1618,7 @@ class LWindow(SpecData):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        coords = self.getMaskedCoords.__wrapped__.raw(
+        coords = self.getMaskedCoords.__wrapped__(
             self,
             covered = True,
             valid = True,
@@ -1576,14 +1637,13 @@ class LWindow(SpecData):
         )
         return under(), under.getFeatures(as_dict=True)
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('lines', specific_kwargs={'v_sep'})
+    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def isOverFitted(
         self,
         n: int,
         m: int,
         *,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
@@ -1599,7 +1659,7 @@ class LWindow(SpecData):
 
         assert n < m
 
-        coords = self.getMaskedCoords.__wrapped__.raw(
+        coords = self.getMaskedCoords.__wrapped__(
             self,
             covered = True,
             valid = True,
@@ -1621,16 +1681,16 @@ class LWindow(SpecData):
 
     ### Error estimation
 
-    @apply_info_to_method('error', 'nonlinear')
-    @validate_call(validate_return=False)
+    @validated_apply_info_to_method(subjects=('error', 'nonlinear'))
     def instantiateBootstrapper(
         self,
         *,
-        pl: Optional[PowerLawModel] = None,
-        fe: Optional[IronModel] = None,
-        ba: Optional[BalmerModel] = None,
+        pl: PowerLawModel | None = None,
+        fe: IronModel | None = None,
+        ba: BalmerModel | None = None,
+        hg: None = None,
 
-        model_types: BGFlux | None = None,
+        model_types: ModelTypes | None = None,
 
         without_rejections: bool = False,
         without_absorption: bool = False,
@@ -1649,6 +1709,7 @@ class LWindow(SpecData):
         renew_rng: bool | None = None,
         replace_missing: bool | None = None,
         tqdm_disable: bool | None = None,
+        tqdm_leave: bool | None = None,
 
         fitter: FitterInstance | None = None,
     ) -> BaseBootstrapper:
@@ -1666,6 +1727,7 @@ class LWindow(SpecData):
             pl=pl,
             fe=fe,
             ba=ba,
+            hg=hg,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             with_neighbours=(scale == 'semilocal'),
@@ -1681,12 +1743,13 @@ class LWindow(SpecData):
             renew_rng=renew_rng,
             replace_missing=replace_missing,
             tqdm_disable=tqdm_disable,
+            tqdm_leave=tqdm_leave,
             logger=logger,
         )
         self.bootstrapper = cls(*args, **kwargs)
         return self.bootstrapper
     
-    @validate_call(validate_return=False)
+    @validate_call
     def runBootstrapper(self) -> ErrorResult:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -1703,8 +1766,7 @@ class LWindow(SpecData):
         self.error_result = self.bootstrapper.toErrorResult(out)
         return self.error_result
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('nonlinear', 'error', start=6)
+    @validated_apply_info_to_method(subjects=('nonlinear', 'error'), start=6)
     def bootstrap(
         self,
         *,
@@ -1712,9 +1774,9 @@ class LWindow(SpecData):
         without_absorption: bool = False,
         cfit: ContinuumFitResult | None = None,
         pool: Pool_ | None = None,
-        pl_model: Optional[PowerLawModel] = None,
-        fe_model: Optional[IronModel] = None,
-        ba_model: Optional[BalmerModel] = None,
+        pl_model: PowerLawModel | None = None,
+        fe_model: IronModel | None = None,
+        ba_model: BalmerModel | None = None,
 
         fitter: FitterInstance | None = None,
         scale: Scale | None = None,
@@ -1854,8 +1916,7 @@ class LWindow(SpecData):
 
         # return self
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('error')
+    @validated_apply_info_to_method(subjects=('error',))
     def analyseBootstrapSamples(
         self,
         directory: AbsoluteDirPath | None = None,
@@ -1896,3 +1957,211 @@ class LWindow(SpecData):
         #     tqdm_disable = tqdm_disable,
         #     tqdm_leave = tqdm_leave,
         # )
+
+    def quickplot(
+        self,
+        *,
+        figure: tuple[Figure, Axes] | None = None,
+        figsize: tuple[float, float] = (8, 6),
+        dpi: int = 300,
+        title: str | None = None,
+        n_sigma: float = 2.0,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+        pl_color: str | None = DEFAULT_COLORS['pl'],
+        fe_color: str | None = DEFAULT_COLORS['fe'],
+        ba_color: str | None = DEFAULT_COLORS['ba'],
+        hg_color: str | None = DEFAULT_COLORS['hg'],
+        em_color: str | None = DEFAULT_COLORS['em'],
+        sm_color: str | None = DEFAULT_COLORS['sm'],
+        ab_color: str | None = DEFAULT_COLORS['ab'],
+        xticks: tuple[float, float] | None = None,
+        yticks: tuple[float, float] | None = None,
+        logx: bool = False,
+        logy: bool = False,
+    ) -> tuple[Figure, Axes]:
+        """
+        Basic plotting routing for 'Spectrum' classes.
+
+        NOTES
+        -----
+        This method overwrites but still calls the inherited '_quickplot'
+        method, setting 'title' equal to 'self.title' by default.
+        """
+        xlim = xlim or self.x_bounds
+        return quickplot(
+            get_coords(self, x_bounds=xlim, replace_with_nan=False),
+            self.info,
+            figure=figure,
+            figsize=figsize,
+            dpi=dpi,
+            title=title or self.__str__(simple=True).removesuffix('.'),
+            n_sigma=n_sigma,
+            xlabel=xlabel or 'auto',
+            ylabel=ylabel or 'auto',
+            xlim=xlim,
+            ylim=ylim or 'auto',
+            pl_color=pl_color,
+            fe_color=fe_color,
+            ba_color=ba_color,
+            hg_color=hg_color,
+            em_color=em_color,
+            sm_color=sm_color,
+            ab_color=ab_color,
+            xticks=xticks or 'auto',
+            yticks=yticks or 'auto',
+            logx=logx,
+            logy=logy,
+        )
+
+    def absorptionplot(
+        self,
+        *,
+        figure: tuple[Figure, list[Axes, Axes, Axes]] | None = None,
+        figsize: tuple[float, float] = (8, 6),
+        dpi: int = 300,
+        title: str | None = None,
+        height_ratio: float = 3.0,
+        n_sigma: float = 2.0,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        zlabel: str | None = None,
+        plabel: str | None = None,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+        zlim: tuple[float, float] | None = (-5, 5),
+        plim: tuple[float, float] | None = (-5, 0),
+        pl_color: str | None = DEFAULT_COLORS['pl'],
+        fe_color: str | None = DEFAULT_COLORS['fe'],
+        ba_color: str | None = DEFAULT_COLORS['ba'],
+        hg_color: str | None = DEFAULT_COLORS['hg'],
+        em_color: str | None = DEFAULT_COLORS['em'],
+        sm_color: str | None = DEFAULT_COLORS['sm'],
+        ab_color: str | None = DEFAULT_COLORS['ab'],
+        xticks: tuple[float, float] | None = None,
+        yticks: tuple[float, float] | None = None,
+        zticks: tuple[float, float] | None = None,
+        pticks: tuple[float, float] | None = None,
+        logx: bool = False,
+        logy: bool = False,
+        logp: bool = True,
+    ) -> tuple[Figure, list[Axes]]:
+        xlim = xlim or self.x_bounds
+        return absorptionplot(
+            get_coords(self, x_bounds=xlim, replace_with_nan=False),
+            self.info,
+            figure=figure,
+            figsize=figsize,
+            dpi=dpi,
+            title=title or self.__str__(simple=True).removesuffix('.'),
+            height_ratio=height_ratio,
+            n_sigma=n_sigma,
+            z_crit=self.info.absorption.z_crit,
+            p_crit=self.info.absorption.p_crit,
+            xlabel=xlabel or 'auto',
+            ylabel=ylabel or 'auto',
+            zlabel=zlabel or 'auto',
+            plabel=plabel or 'auto',
+            xlim=xlim or 'auto',
+            ylim=ylim or 'auto',
+            zlim=zlim or 'auto',
+            plim=plim or 'auto',
+            pl_color=pl_color,
+            fe_color=fe_color,
+            ba_color=ba_color,
+            hg_color=hg_color,
+            em_color=em_color,
+            sm_color=sm_color,
+            ab_color=ab_color,
+            xticks=xticks or 'auto',
+            yticks=yticks or 'auto',
+            zticks=zticks or 'auto',
+            pticks=pticks or 'auto',
+            logx=logx,
+            logy=logy,
+            logp=logp,
+        )
+
+    def fitplot(
+        self,
+        *,
+        plot_components: bool = False,
+        plot_type: Literal['difference', 'residual'] = 'difference',
+        figure: tuple[Figure, list[Axes, Axes]] | None = None,
+        figsize: tuple[float, float] = (8, 6),
+        dpi: int = 300,
+        title: str | None = None,
+        height_ratio: float = 3.0,
+        n_sigma: float = 2.0,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        dlabel: str | None = None,
+        zlabel: str | None = None,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+        dlim: tuple[float, float] | None = None,
+        zlim: tuple[float, float] | None = (-5, 5),
+        pl_color: str | None = DEFAULT_COLORS['pl'],
+        fe_color: str | None = DEFAULT_COLORS['fe'],
+        ba_color: str | None = DEFAULT_COLORS['ba'],
+        hg_color: str | None = DEFAULT_COLORS['hg'],
+        em_color: str | None = DEFAULT_COLORS['em'],
+        sm_color: str | None = DEFAULT_COLORS['sm'],
+        ab_color: str | None = DEFAULT_COLORS['ab'],
+        xticks: tuple[float, float] | None = None,
+        yticks: tuple[float, float] | None = None,
+        dticks: tuple[float, float] | None = None,
+        zticks: tuple[float, float] | None = None,
+        logx: bool = False,
+        logy: bool = False,
+        cmap_name: str = 'tab20',
+        distinguish_narrow: bool = True,
+    ) -> tuple[Figure, list[Axes, Axes]]:
+        xlim = xlim or self.x_bounds
+        model = (self.spectrum or self).getModel() if plot_components else None
+        if model is not None:
+            ms = (model,) if model.n_submodels == 1 else model
+            submodels = []
+            for m in ms:
+                if m.model_type in ('pl', 'fe', 'ba', 'hg') or m.pure_name in self.names:
+                    submodels.append(m)
+
+            model = sum(submodels[1:], start=submodels[0]) if submodels else None
+
+        return fitplot(
+            get_coords(self, x_bounds=xlim, replace_with_nan=False),
+            self.info,
+            model=model,
+            plot_type=plot_type,
+            figure=figure,
+            figsize=figsize,
+            dpi=dpi,
+            title=title or self.__str__(simple=True).removesuffix('.'),
+            height_ratio=height_ratio,
+            n_sigma=n_sigma,
+            xlabel=xlabel or 'auto',
+            ylabel=ylabel or 'auto',
+            dlabel=dlabel or 'auto',
+            zlabel=zlabel or 'auto',
+            xlim=xlim or 'auto',
+            ylim=ylim or 'auto',
+            dlim=dlim or 'auto',
+            zlim=zlim or 'auto',
+            pl_color=pl_color,
+            fe_color=fe_color,
+            ba_color=ba_color,
+            hg_color=hg_color,
+            em_color=em_color,
+            sm_color=sm_color,
+            ab_color=ab_color,
+            xticks=xticks or 'auto',
+            yticks=yticks or 'auto',
+            dticks=dticks or 'auto',
+            zticks=zticks or 'auto',
+            logx=logx,
+            logy=logy,
+            cmap_name=cmap_name,
+            distinguish_narrow=distinguish_narrow,
+        )

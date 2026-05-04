@@ -1,141 +1,114 @@
-### Load 'is under-fitted models'
+__all__ = ['Under']
 
-import os
 from pathlib import Path
 from pickle import load
-from functools import lru_cache
-from collections.abc import Callable
-from numpy import dot, zeros_like, minimum, maximum, nan_to_num, nan, float64
-from numpy.typing import NDArray
+from functools import lru_cache, cached_property
+from typing import Callable, ClassVar
+from numpy import dot, zeros_like, minimum, maximum, nan_to_num, nan, float64, empty
 from scipy.stats import chi2
 
+from quasar_typing.numpy import FloatVector
 from quasar_utils.absorption.absorption import fft
+from dataclasses import dataclass, field
 
-directory = os.path.join(
-    Path(__file__).parent, 
-    'models',
-)
+### Load 'is under-fitted models'
 
-models = {}
-for fname in os.listdir(directory):
+_this_file: Path = Path(__file__).resolve()
+PATH_TO_MODELS = _this_file.parents[0] / 'models'
 
-    if fname.split('.')[-1] == 'pkl':
-        _fname = fname.split('.')[0]
-        model_type = _fname.split('_')[0]
-
-        if model_type == 'under':
-            n = int(_fname.split('_')[1])
-
-            path = os.path.join(directory, fname)
-            with open(path, 'rb') as f:
-                models[n] = load(f)
+@lru_cache(maxsize=1)
+def _get_classifiers() -> dict[int, Callable]:
+    classifiers = {}
+    for fname in PATH_TO_MODELS.glob('under_*.pkl'):
+        n = int(fname.name.removesuffix('.pkl').split('_')[1])
+        with open(fname, 'rb') as f:
+            classifiers[n] = load(f)
+    return classifiers
 
 ###
 
-
-def _number_of_free_params(model):
-    n = 0
-    for submodel in model:
-
-        for param_name in submodel.param_names:
-            param = getattr(submodel, param_name)
-            
-            if not (param.fixed or bool(param.tied)):
-                n += 1
-
-    return n
-
+@dataclass
 class Under:
-    measures = [
-        'SNR',
-        'LLH',
-        'Chi2',
-        'FFT',
-        'Cov',
-    ]
+    # Coordinates
+    x: FloatVector
+    y: FloatVector
+    dy: FloatVector
 
-    feature_names = [
+    # Fit
+    fit: Callable[[FloatVector], FloatVector] | None = None
+
+    snr: float = field(default=10, kw_only=True)
+
+    # Size of spectrum
+    n_pix: int = field(init=False)
+    # Fit parameters
+    n: int = field(default=0, init=False)
+    f: FloatVector = field(init=False)
+    z: FloatVector = field(init=False)
+    chi2: float = field(init=False)
+
+    measures: ClassVar[frozenset[str]] = frozenset({
+        'snr', 'llh', 'chi2', 'fft', 'cov',
+    })
+    feature_names: ClassVar[frozenset[str]] = frozenset({
         r"$SNR$",
         r"$LLH_{\text{mod.}}$",
         r"$p(\chi^2)$",
         r"$p(\text{FFT})$",
         r"$r_{\text{cov.}}$",
-    ]
+    })
+    classifiers: ClassVar[dict[int, Callable]] = _get_classifiers()
 
-    models = models
+    def __post_init__(self):
+        self.n_pix = self.x.size
 
-    def __init__(
-        self,
-        x: NDArray[float64],
-        y: NDArray[float64],
-        dy: NDArray[float64],
-        fit: Callable|None = None,
-        snr: float|int|None = None,
-    ):
-        self.N = len(x)
+        if (model := self.fit) is not None:
+            self.n = model.n_submodels
+            self.f = model(self.x)
+        else:
+            self.f = zeros_like(self.x)
 
-        self.x = x
-        self.y = y
-        self.dy = dy
-
-        self.fit = fit or zeros_like
-
-        self.n = 0 \
-            if (fit is None) \
-            else self.fit.n_submodels
-        
-        self.f = fit(x)
         self.z = (self.y - self.f) / self.dy
         self.chi2 = dot(self.z, self.z)
 
-        self.snr = snr or 10
-
-    def __call__(
-        self,
-        n: int|None = None,
-        n_default: int = 1,
-    ) -> bool:
-
-        classifier = self.models.get(
-            n or self.n,
-            self.models[n_default]
-        )
-        X = self.getFeatures()
-        y = classifier.predict(X)[0]
-
-        return bool(y)
-
-    @lru_cache(maxsize=1)
-    def getSNR(self) -> float:
-        return self.snr
-
-    @lru_cache(maxsize=1)
-    def getLLH(self) -> float:
-        return (1 - self.chi2 / self.N) / 2
+    @cached_property
+    def llh(self) -> float:
+        return (1 - self.chi2 / self.n_pix) / 2
     
-    @lru_cache(maxsize=1)
-    def getChi2(self) -> float:
-        return chi2(self.N).sf(self.chi2)
+    @cached_property
+    def chi2_sf(self) -> float:
+        return chi2(self.n_pix).sf(self.chi2)
 
-    @lru_cache(maxsize=1)
-    def getFFT(self) -> float:
+    @cached_property
+    def fft(self) -> float:
         return fft(self.z, log=False)[1]
 
-    @lru_cache(maxsize=1)
-    def getCov(self) -> float:
+    @cached_property
+    def cov(self) -> float:
         den = maximum(self.f, self.y).sum()
         return nan if den == 0 else minimum(self.f, self.y).sum() / den
 
-    @lru_cache(maxsize=1)
-    def getFeatures(
-        self,
-        as_dict: bool = False,
-        ) -> NDArray[float64]:
+    def getFeatures(self, as_dict: bool = False) -> FloatVector:
         if as_dict:
-            return {m: f for m, f in zip(self.measures, self.getFeatures()[0])}
-        
-        return nan_to_num(
-            [getattr(self, f"get{measure}")() for measure in self.measures],
-            neginf = -1e8,
-            posinf = 1e8
-        )[None,:]
+            return dict(zip(self.measures, self.getFeatures()[0]))
+
+        features = empty(len(self.measures), dtype=float64)
+        for i, measure in enumerate(self.measures):
+            if measure == 'snr':
+                features[i] = self.snr
+            elif measure == 'chi2':
+                features[i] = self.chi2_sf
+            else:
+                features[i] = getattr(self, measure)
+
+        return nan_to_num(features, neginf=-1e8, posinf=1e8)[None,:]
+
+    def __call__(self, n: int | None = None, n_default: int = 1) -> bool:
+        classifier = self.classifiers.get(
+            n or self.n,
+            self.classifiers[n_default]
+        )
+        X = self.getFeatures(as_dict=False)
+        y = classifier.predict(X)[0]
+
+        return bool(y)

@@ -1,7 +1,7 @@
 __all__ = ['ContinuumWindows']
 
 from logging import getLogger
-from typing import Self, Optional, ClassVar, Iterable
+from typing import Self, ClassVar, Iterable
 from dataclasses import dataclass, field
 from scipy.optimize import OptimizeResult
 from numpy import zeros_like
@@ -10,39 +10,45 @@ from .cwindow import CWindow
 from ..utils.speclist import SpecList
 from ..utils.general import stopwatch
 
-from pydantic import validate_call, ValidationError
+from pydantic import ValidationError
 
 from quasar_typing.bounds import CoordBounds, AstropyBounds
 from quasar_typing.astropy import FitterInstance, FitInfo
-from quasar_typing.misc.literals import BGFlux, Suffix
+from quasar_typing.misc import BackgroundFlux, Suffix
 
-from quasar_utils.wrappers import apply_info_to_method
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 
 from quasar_models.continuum import PowerLawModel
 from quasar_models.utils.astropy import apply_bounds
 
+from quasar_errors.model_samples import PowerLawSample
+
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass(init=False)
-class ContinuumWindows(SpecList):
+class ContinuumWindows(SpecList[CWindow]):
     fit_info: FitInfo | None = field(default=None, init=False)
-    fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
-    fit_sc: Optional[PowerLawModel] = field(default=None, init=False)
-    fit: Optional[PowerLawModel] = field(default=None, init=False)
+    fit_raw: PowerLawModel | None = field(default=None, init=False)
+    fit_sc: PowerLawModel | None = field(default=None, init=False)
+    fit: PowerLawModel | None = field(default=None, init=False)
 
-    default_bg: ClassVar[BGFlux] = {'fe', 'ba', 'hg', 'em'}
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'pl'})
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('continuum')
+    @property
+    def sample(self) -> PowerLawSample | None:
+        if (model := self.getModel()) is None:
+            return None
+        return PowerLawSample.fromPowerLawModel(model)
+
+    @validated_apply_info_to_method(subjects=('continuum',))
     def populate(
         self,
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
+        ** PYDANTIC VALIDATED METHOD // INFO APPLIED TO METHOD **
         """
         kwargs = {}
         if self.spectrum is None:
@@ -75,11 +81,10 @@ class ContinuumWindows(SpecList):
 
         return self
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('continuum', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('continuum', 'nonlinear'))
     def __call__(
         self,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         *,
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -96,7 +101,7 @@ class ContinuumWindows(SpecList):
 
         with stopwatch() as watch:
             logger.debug(">>> [1/3] Getting initial (linear) fit.")
-            success = self.getLinearFit.__wrapped__.raw(
+            success = self.getLinearFit.__wrapped__(
                 self,
                 without_rejections = False,
                 without_absorption = True,
@@ -109,7 +114,7 @@ class ContinuumWindows(SpecList):
                 return False
 
             logger.debug(">>> [2/3] Performing sigma-clipping.")
-            _ = self.performSigmaClipping.__wrapped__.raw(
+            _ = self.performSigmaClipping.__wrapped__(
                 self,
                 without_absorption = True,
                 bg_flux = bg_flux,
@@ -119,7 +124,7 @@ class ContinuumWindows(SpecList):
             )
             
             logger.debug(">>> [3/3] Fine tuning.")
-            _ = self.performFineTuning.__wrapped__.raw(
+            _ = self.performFineTuning.__wrapped__(
                 self,
                 update_flux = True,
                 without_rejections = True,
@@ -137,15 +142,14 @@ class ContinuumWindows(SpecList):
         )
         return True
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('continuum')
+    @validated_apply_info_to_method(subjects=('continuum',))
     def getLinearFit(
         self,
         *,
         without_rejections: bool = True,
         without_absorption: bool = True,
         suffix: Suffix | None = 'raw',
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
     ) -> bool:
@@ -209,12 +213,11 @@ class ContinuumWindows(SpecList):
         self.updateContinuumEmission.__wrapped__(self, fit)
         return True
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('continuum')
+    @validated_apply_info_to_method(subjects=('continuum',))
     def performSigmaClipping(
         self,
         without_absorption: bool = True,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         *,
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -231,7 +234,7 @@ class ContinuumWindows(SpecList):
 
         if self.fit_raw is None:
             msg += " (got initial linear fit)."
-            success = self.getLinearFit.__wrapped__.raw(
+            success = self.getLinearFit.__wrapped__(
                 self,
                 without_rejections = False,
                 without_absorption = True,
@@ -282,7 +285,7 @@ class ContinuumWindows(SpecList):
                 self.applyRejections.__wrapped__(
                     self, rejections, enforce=True,
                 )
-                success = self.getLinearFit.__wrapped__.raw(
+                success = self.getLinearFit.__wrapped__(
                     self,
                     without_rejections = True,
                     without_absorption = without_absorption,
@@ -303,8 +306,7 @@ class ContinuumWindows(SpecList):
 
         return out
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('continuum', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('continuum', 'nonlinear'))
     def performFineTuning(
         self,
         *,
@@ -312,7 +314,7 @@ class ContinuumWindows(SpecList):
         without_rejections: bool = False,
         without_absorption: bool = False,
         suffix: Suffix = 'sc',
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
         fitter: FitterInstance | None = None,
@@ -328,7 +330,7 @@ class ContinuumWindows(SpecList):
 
         if self.fit_raw is None:
             msg += "(got initial linear fit), "
-            success = self.getLinearFit.__wrapped__.raw(
+            success = self.getLinearFit.__wrapped__(
                 self,
                 without_rejections = True,
                 without_absorption = True,
@@ -359,7 +361,8 @@ class ContinuumWindows(SpecList):
             log = logger.warning
             msg += " No continuum windows -> performing global fit!"
 
-            coords = self.getMaskedCoords(
+            coords = self.getMaskedCoords.__wrapped__(
+                self,
                 without_rejections = without_rejections,
                 without_absorption = without_absorption,
                 valid = True,
@@ -410,11 +413,11 @@ class ContinuumWindows(SpecList):
             )
         return True
 
-    @validate_call(validate_return=False)
+    @validate_call
     def getModel(
         self,
         suffix: Suffix | None = None,
-    ) -> Optional[PowerLawModel]:
+    ) -> PowerLawModel | None:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
@@ -430,7 +433,7 @@ class ContinuumWindows(SpecList):
         else:
             return self.fit_raw
             
-    @validate_call(validate_return=False)
+    @validate_call
     def applyFit(
         self,
         fit: PowerLawModel,
@@ -451,7 +454,31 @@ class ContinuumWindows(SpecList):
                 self.fit = fit
         
         for window in self:
-            window.applyFit(fit, fit_info, suffix=suffix)
+            window.applyFit.__wrapped__(window, fit, fit_info, suffix=suffix)
+
+        return self
+
+    @validate_call
+    def adoptFit(
+        self,
+        fit: PowerLawModel,
+        suffix: Suffix | None = None,
+    ) -> Self:
+        """
+        ** PYDANTIC VALIDATED METHOD **
+        """
+        self.fit_info = None
+
+        match suffix:
+            case 'raw':
+                self.fit_raw = fit
+            case 'sc': 
+                self.fit_sc = fit
+            case None:
+                self.fit = fit
+
+        for window in self:
+            window.adoptFit.__wrapped__(window, fit, suffix=suffix)
 
         return self
 

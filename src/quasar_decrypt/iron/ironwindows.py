@@ -1,42 +1,47 @@
 from logging import getLogger
-from typing import Self, Literal, Union, ClassVar, Iterable
+from typing import Self, Literal, ClassVar, Iterable
 from pathlib import Path
 from scipy.ndimage import binary_fill_holes
 from itertools import repeat
 from dataclasses import dataclass, field
-from pydantic import validate_call
-
-from quasar_utils.wrappers import apply_info_to_method
 
 from quasar_typing.numpy import FloatVector
 from quasar_typing.bounds import CoordBounds, AstropyBounds
-from quasar_typing.pathlib import AnyFITSPath
+from quasar_typing.pathlib import AbsoluteFITSPath
 from quasar_typing.astropy import FitterInstance, FitInfo, CompoundModel_
-from quasar_typing.misc.literals import BGFlux
+from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.iron import IronModel, IronTemplate
 from quasar_models.utils.astropy import apply_bounds
+
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
+
+from quasar_errors.model_samples import IronSampleList
 
 from .iwindow import IWindow
 from ..utils.speclist import SpecList
 
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass(init=False)
-class IronWindows(SpecList):
+class IronWindows(SpecList[IWindow]):
     templates: dict[str, IronTemplate] = field(default_factory=dict, init=False)
     template_models: dict[str, IronModel] = field(default_factory=dict, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
 
-    default_bg: ClassVar[BGFlux] = {'pl', 'ba', 'hg', 'em'}
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'fe'})
 
     def __post_init__(self):
         self.templates = {}
         self.template_models = {}
+
+    @property
+    def sample(self) -> IronSampleList | None:
+        if (model := self.getModel()) is None:
+            return None
+        return IronSampleList.fromIronModels(model)
         
-    @validate_call(validate_return=False)
-    @apply_info_to_method('iron')
+    @validated_apply_info_to_method(subjects=('iron',))
     def populate(
         self,
         *,
@@ -76,14 +81,14 @@ class IronWindows(SpecList):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('iron', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('iron', 'nonlinear'))
     def __call__(
         self,
+        *,
         without_rejections: bool = True,
         without_absorption: bool = True,
-        *,
-        template_files: list[AnyFITSPath] | None = None, 
+        bg_flux: BackgroundFlux | None = None,
+        template_files: list[AbsoluteFITSPath] | None = None, 
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -100,37 +105,47 @@ class IronWindows(SpecList):
         """
         ** PYDANTIC VALIDATED METHOD **
         """  
-        self.loadTemplates.__wrapped__.raw(
+        if bg_flux is None:
+            bg_flux = self.default_bg
+
+        self.loadTemplates.__wrapped__(
             self,
-            template_files = template_files,
-            resample = resample,
-            split = split,
-            fwhm = fwhm,
-            bias = bias,
-            ratio = ratio,
-            scale = scale,
-            allow_interp_fitting = allow_interp_fitting,
-            flux_bounds = flux_bounds,
-            fwhm_bounds = fwhm_bounds,
+            template_files=template_files,
+            resample=resample,
+            split=split,
+            fwhm=fwhm,
+            bias=bias,
+            ratio=ratio,
+            scale=scale,
+            allow_interp_fitting=allow_interp_fitting,
+            flux_bounds=flux_bounds,
+            fwhm_bounds=fwhm_bounds,
         )
         if raster:
-            self.getRasterFit.__wrapped__.raw(
+            self.getRasterFit.__wrapped__(
                 self,
-                covered = True,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
+                bg_flux=bg_flux,
+                covered=True,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
             )
         if fine_tune: 
-            self.performFineTuning.__wrapped__.raw(self, fitter=fitter)
+            self.performFineTuning.__wrapped__(
+                self, 
+                bg_flux=bg_flux,
+                covered=True,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                fitter=fitter,
+            )
 
         return True
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('iron')
+    @validated_apply_info_to_method(subjects=('iron',))
     def loadTemplates(
         self,
         *,
-        template_files: list[AnyFITSPath] | None = None, 
+        template_files: list[AbsoluteFITSPath] | None = None, 
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -277,15 +292,14 @@ class IronWindows(SpecList):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('iron')
+    @validated_apply_info_to_method(subjects=('iron',))
     def getRasterFit(
         self,
         *,
         covered: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = True,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -306,12 +320,10 @@ class IronWindows(SpecList):
         for model in self.template_models.values():
             model.rasterFit(*coords, inplace=True)
 
-        self.updateIronEmission.__wrapped__(
-            self, self.getModel(),
-        )
+        self.updateIronEmission.__wrapped__(self, self.getModel())
         return self
 
-    def getModel(self) -> Union[IronModel, CompoundModel_[IronModel], None]:
+    def getModel(self) -> IronModel | CompoundModel_[IronModel] | None:
         """
         Combines the available templates into a single (Split) TemplateModel or
         AstroPy compound model.
@@ -319,10 +331,10 @@ class IronWindows(SpecList):
         submodels = list(self.template_models.values())
         return sum(submodels[1:], start=submodels[0]) if submodels else None
     
-    @validate_call(validate_return=False)
+    @validate_call
     def applyFit(
         self,
-        fit: Union[IronModel, CompoundModel_[IronModel]],
+        fit: IronModel | CompoundModel_[IronModel],
         fit_info: FitInfo,
     ) -> Self:
         """
@@ -332,16 +344,28 @@ class IronWindows(SpecList):
         for submodel in ((fit,) if fit.n_submodels == 1 else fit):
             self.template_models[submodel.name] = submodel
         return self
-
-    @validate_call(validate_return=False)
-    @apply_info_to_method('nonlinear')
+    
+    @validate_call
+    def adoptFit(
+        self,
+        fit: IronModel | CompoundModel_[IronModel],
+    ) -> Self:
+        """
+        ** PYDANTIC VALIDATED METHOD **
+        """
+        self.fit_info = None
+        for submodel in ((fit,) if fit.n_submodels == 1 else fit):
+            self.template_models[submodel.name] = submodel
+        return self
+    
+    @validated_apply_info_to_method(subjects=('nonlinear',))
     def performFineTuning(
         self,
+        *,
         covered: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        bg_flux: BGFlux | None = None,
-        *,
+        bg_flux: BackgroundFlux | None = None,
         fitter: FitterInstance | None = None,
     ) -> Self:
         """

@@ -1,42 +1,48 @@
 from logging import getLogger
-from typing import Self, Optional, ClassVar, Iterable
+from typing import Self, ClassVar, Iterable
 from numpy import invert, linspace, stack
 from functools import partial
 from scipy.optimize import OptimizeResult
 from dataclasses import dataclass, field
 
-from pydantic import validate_call, ValidationError
+from pydantic import ValidationError
 
 from .bwindow import BWindow
 from ..utils.speclist import SpecList
 
 from ..utils.general import stopwatch
 
-from quasar_utils.wrappers import apply_info_to_method
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 
 from quasar_typing.numpy import FloatVector
 from quasar_typing.bounds import CoordBounds, AstropyBounds
 from quasar_typing.pathlib import AbsoluteFITSPath
 from quasar_typing.astropy import FitterInstance, FitInfo
-from quasar_typing.misc.literals import BGFlux
+from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.balmer import BalmerModel, BalmerTemplate, evaluation
 from quasar_models.utils.astropy import apply_bounds
 
+from quasar_errors.model_samples import BalmerSample
+
 logger = getLogger(__name__)
-logger.disabled = not getLogger().hasHandlers()
 
 @dataclass(init=False)
-class BalmerWindows(SpecList):
+class BalmerWindows(SpecList[BWindow]):
     template: BalmerTemplate | None = field(default=None, init=False)
-    model: Optional[BalmerModel] = field(default=None, init=False)
-    fit: Optional[BalmerModel] = field(default=None, init=False)
+    model: BalmerModel | None = field(default=None, init=False)
+    fit: BalmerModel | None = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
 
-    default_bg: ClassVar[BGFlux] = {'pl', 'fe', 'hg', 'em'}
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'ba'})
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer', specific_kwargs={'windows'})
+    @property
+    def sample(self) -> BalmerSample | None:
+        if (model := self.getModel()) is None:
+            return None
+        return BalmerSample.fromBalmerModel(model)
+
+    @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'windows'})
     def populate(
         self,
         *,
@@ -76,11 +82,10 @@ class BalmerWindows(SpecList):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer', 'nonlinear')
+    @validated_apply_info_to_method(subjects=('balmer', 'nonlinear'))
     def __call__(
         self,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         covered: bool = True,
@@ -114,7 +119,7 @@ class BalmerWindows(SpecList):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        self.loadTemplate.__wrapped__.raw(
+        self.loadTemplate.__wrapped__(
             self,
             template_file=template_file,
             flux=flux,
@@ -135,14 +140,14 @@ class BalmerWindows(SpecList):
             allow_interp_fitting=allow_interp_fitting,
             fixed=fixed,
         )
-        self.checkModelCoverage.__wrapped__.raw(
+        self.checkModelCoverage.__wrapped__(
             self,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             min_fittable_ratio=min_fittable_ratio,
             min_fittable_total=min_fittable_total,
         )
-        self.getRasterFit.__wrapped__.raw(
+        self.getRasterFit.__wrapped__(
             self,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -150,7 +155,7 @@ class BalmerWindows(SpecList):
             raster_n=raster_n,
             covered=covered,
         )
-        self.performFineTuning.__wrapped__.raw(
+        self.performFineTuning.__wrapped__(
             self,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -178,8 +183,7 @@ class BalmerWindows(SpecList):
         """
         raise NotImplementedError
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer')
+    @validated_apply_info_to_method(subjects=('balmer',))
     def createModel(
         self,
         *,
@@ -269,8 +273,7 @@ class BalmerWindows(SpecList):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer')
+    @validated_apply_info_to_method(subjects=('balmer',))
     def loadTemplate(
         self,
         *,
@@ -356,8 +359,7 @@ class BalmerWindows(SpecList):
 
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer')
+    @validated_apply_info_to_method(subjects=('balmer',))
     def checkModelCoverage(
         self,
         *,
@@ -401,8 +403,7 @@ class BalmerWindows(SpecList):
 
         return self
     
-    @validate_call(validate_return=False)
-    @apply_info_to_method('balmer', specific_kwargs={'raster_n'})
+    @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'raster_n'})
     def getRasterFit(
         self,
         *,
@@ -410,7 +411,7 @@ class BalmerWindows(SpecList):
         without_absorption: bool = False,
         without_rejections: bool = False,
         covered: bool = False,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
     ) -> Self:
         """
         Performs a raster fit on the Balmer pseudo-continuum model.
@@ -437,13 +438,12 @@ class BalmerWindows(SpecList):
         )
         return self
 
-    @validate_call(validate_return=False)
-    @apply_info_to_method('nonlinear')
+    @validated_apply_info_to_method(subjects=('nonlinear',))
     def performFineTuning(
         self,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        bg_flux: BGFlux | None = None,
+        bg_flux: BackgroundFlux | None = None,
         *,
         fitter: FitterInstance | None = None,
     ) -> Self:
@@ -491,7 +491,7 @@ class BalmerWindows(SpecList):
         return self
         
 
-    def getModel(self) -> Optional[BalmerModel]:
+    def getModel(self) -> BalmerModel | None:
         """
         Retrieves the Balmer pseudo-continuum model if available.
 
@@ -500,7 +500,7 @@ class BalmerWindows(SpecList):
         If a fitted Balmer pseudo-continuum model is available, it is
         returned. Otherwise an instantiated model is returned, if available.
         """
-        return self.model if (self.fit is None) else self.fit
+        return self.fit or self.model
     
     @validate_call
     def applyFit(
@@ -523,5 +523,21 @@ class BalmerWindows(SpecList):
 
         for bwindow in self:
             bwindow.applyFit.__wrapped__(bwindow, fit, fit_info)
+
+        return self
+    
+    @validate_call
+    def adoptFit(
+        self,
+        fit: BalmerModel,
+    ) -> Self:
+        """
+        ** PYDANTIC VALIDATED METHOD **
+        """
+        self.fit = fit
+        self.fit_info = None
+
+        for bwindow in self:
+            bwindow.adoptFit.__wrapped__(bwindow, fit)
 
         return self
