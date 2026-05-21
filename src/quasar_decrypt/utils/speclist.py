@@ -3,11 +3,11 @@ from abc import abstractmethod
 from typing import Iterable, Self, Callable, TypeVar
 from numpy import zeros_like, bool_
 from dataclasses import dataclass
-from pydantic import validate_call
 
 from quasar_typing.numpy import FloatVector, BoolVector, CoordsTuple
 from quasar_typing.bounds import CoordBounds
 
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.setup import Info
 
 from .specdata import SpecData
@@ -68,19 +68,14 @@ class SpecList(SpecData, list[T]):
             dy_log=dy_log,
             get_mask=get_mask,
         )
-        self.populate.__wrapped__(self, windows=windows)
+        self.populate.__unvalidated__(self, windows=windows)
 
-    @validate_call
+    @validated_apply_info_to_method(subjects=tuple())
     def populate(
         self,
-        *,
+        *, 
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-
-        This method does nothing.
-        """
         return self
 
     def __str__(self, simple: bool = False) -> str:

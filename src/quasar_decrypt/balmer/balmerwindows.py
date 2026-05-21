@@ -20,7 +20,11 @@ from quasar_typing.pathlib import AbsoluteFITSPath
 from quasar_typing.astropy import FitterInstance, FitInfo
 from quasar_typing.misc import BackgroundFlux
 
-from quasar_models.balmer import BalmerModel, BalmerTemplate, evaluation
+from quasar_models.balmer import (
+    BalmerSeriesTemplate, 
+    BalmerContinuumTemplate, 
+    BalmerModel,
+)
 from quasar_models.utils.astropy import apply_bounds
 
 from quasar_errors.model_samples import BalmerSample
@@ -29,7 +33,6 @@ logger = getLogger(__name__)
 
 @dataclass(init=False)
 class BalmerWindows(SpecList[BWindow]):
-    template: BalmerTemplate | None = field(default=None, init=False)
     model: BalmerModel | None = field(default=None, init=False)
     fit: BalmerModel | None = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
@@ -42,7 +45,10 @@ class BalmerWindows(SpecList[BWindow]):
             return None
         return BalmerSample.fromBalmerModel(model)
 
-    @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'windows'})
+    @validated_apply_info_to_method(
+        subjects=('balmer',), 
+        specific_kwargs={'windows'},
+    )
     def populate(
         self,
         *,
@@ -163,201 +169,116 @@ class BalmerWindows(SpecList[BWindow]):
             fitter=fitter,
         )
 
-    @classmethod
-    def _load_balmer_series_data(
-        cls,
-        *args,
-    ) -> tuple[FloatVector, FloatVector]:
+    @validated_apply_info_to_method(
+            subjects=('balmer',),
+            specific_kwargs={'source', 'temp', 'dens', 'n_u_min', 'n_u_max'},
+        )
+    def loadBalmerSeriesTemplate(
+        self,
+        *,
+        source: str | None = None,
+        temp: float | None = None,
+        dens: float | None = None,
+        n_u_min: int | None = None,
+        n_u_max: int | None = None,
+        path: str | AbsoluteFITSPath | None = None,
+    ) -> BalmerSeriesTemplate:
         """
-        Loads Balmer series data (wavelengths and weights).
+        Loads a BalmerSeriesTemplate instance.
         """
-        raise NotImplementedError
+        if path is None:
+            BalmerSeriesTemplate.load_from_cache(
+                source, temp, dens, (n_u_min, n_u_max), 
+                info=self.info,
+            )
+        return BalmerSeriesTemplate.load(path, self.info)
 
+    @validated_apply_info_to_method(
+            subjects=('balmer',),
+            specific_kwargs={'temp', 'tau', 'scale'},
+        )
+    def loadBalmerContinuumTemplate(
+        self,
+        *,
+        temp: float | None = None,
+        tau: float | None = None,
+        scale: float | None = None,
+        path: str | AbsoluteFITSPath | None = None,
+    ) -> BalmerContinuumTemplate:
+        """
+        Loads a BalmerContinuumTemplate instance.
+        """
+        if path is None:
+            BalmerContinuumTemplate.load_from_cache(
+                temp, tau, scale,
+                info=self.info,
+            )
+        return BalmerContinuumTemplate.load(path, self.info)
+
+    @validated_apply_info_to_method(subjects=('balmer',))
     def instantiateModel(
         self,
-        *args,
-    ) -> Self:
-        """
-        Convenience function for creating either a custom BalmerModel instance 
-        or loading a template from file. 
-        """
-        raise NotImplementedError
-    
-    @validated_apply_info_to_method(subjects=('balmer',))
-    def createModel(
-        self,
         *,
         flux: float | None = None,
         fwhm: float | None = None,
+        ratio: float | None = None,
+
+        source: str | None = None,
         temp: float | None = None,
+        dens: float | None = None,
+        n_u_min: int | None = None,
+        n_u_max: int | None = None,
         tau: float | None = None,
         scale: float | None = None,
-        ratio: float | None = None,
-        edge: float | None = None,
-        waves: FloatVector | None = None,
-        weights: FloatVector | None = None,
-
-        flux_bounds: AstropyBounds | None = None,
-        fwhm_bounds: AstropyBounds | None = None,
-        temp_bounds: AstropyBounds | None = None,
-        tau_bounds: AstropyBounds | None = None,
-        scale_bounds: AstropyBounds | None = None,
-        ratio_bounds: AstropyBounds | None = None,
 
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
-        raster_n: int | None = None,
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-
-        Creates a BalmerModel instance using the given parameters and bounds. 
-        If 'allow_interp_fitting' is True, this function will generate a custom
-        BalmerTemplate instance s.t. the BalmerModel instance can perform
-        template fitting by interpolation between 'raster_n' templates. 
-        """
-        self.model: BalmerModel = BalmerModel(
-            apply_bounds.__wrapped__(flux, flux_bounds),
-            apply_bounds.__wrapped__(fwhm, fwhm_bounds),
-            _temp := apply_bounds.__wrapped__(temp, temp_bounds),
-            _tau := apply_bounds.__wrapped__(tau, tau_bounds),
-            _scale := apply_bounds.__wrapped__(scale, scale_bounds),
-            _ratio := apply_bounds.__wrapped__(ratio, ratio_bounds),
-            edge=edge,
-            waves=waves,
-            weights=weights,
-            boltz=self.info.units.getBoltzmannFactor(),
-            allow_interp_fitting=allow_interp_fitting,
-            name='balmer_model',
-        )
-        if allow_interp_fitting:
-            if None in fwhm_bounds:
-                msg = "Tried to generated template for BalmerModel instance, \
-                    but no closed bounds on FWHM parameter."
-                logger.critical(msg)
-            else:
-                msg = "Generating template for BalmerModel instance, which may \
-                    be inefficient for pipelines. Consider caching a similar \
-                    BalmerTemplate instance instead." 
-                logger.warning(msg)
-
-                _fwhm = linspace(*fwhm_bounds, raster_n, endpoint=True)
-                _x = self._x[self._valid_pixels]
-
-                forward = partial(
-                    evaluation.evaluate,
-                    flux=1.0, temp=_temp, tau=_tau, scale=_scale, ratio=_ratio,
-                    sigma_res=self.info.loading['sigma_res'],
-                    edge=edge, 
-                    waves=waves, weights=weights,
-                    boltz=self.info.units.getBoltzmannFactor(),
-                    x_grid=_x,
-                )
-                _data = stack([forward(_f) for _f in _fwhm], axis=0)
-
-                self.template = BalmerTemplate(
-                    _fwhm, _x, _data,
-                    info=self.info,
-                    is_logspace=True,
-                    based_on_template=True,
-                    name='generated_balmer_template',
-                )
-                self.model.template = self.template
-
-        for param_name in self.model.param_names:
-            getattr(self.model, param_name).fixed = fixed.get(param_name, False)
-
-        if self.model._perform_template_fitting:
-            msg = "Template fitting enabled!"
-            logger.debug(msg)
-
-        return self
-
-    @validated_apply_info_to_method(subjects=('balmer',))
-    def loadTemplate(
-        self,
-        *,
-        template_file: str | AbsoluteFITSPath | None = None,
-
-        flux: float | None = None,
-        fwhm: float | None = None,
-        temp: float | None = None,
-        tau: float | None = None,
-        scale: float | None = None,
-        ratio: float | None = None,
-        edge: float | None = None,
-        waves: FloatVector | None = None,
-        weights: FloatVector | None = None,
-
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
-        temp_bounds: AstropyBounds | None = None,
-        tau_bounds: AstropyBounds | None = None,
-        scale_bounds: AstropyBounds | None = None,
         ratio_bounds: AstropyBounds | None = None,
-
-        allow_interp_fitting: bool | None = None,
-        fixed: dict[str, bool] | None = None,
-    ) -> Self:
+    ) -> BalmerModel:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
-        Loads a BalmerTemplate from the given file and creates a corresponding
-        BalmerModel instance. 
+        Instantiates a BalmerModel instance using the given parameters and 
+        bounds.
         """
-        try: 
-            template = BalmerTemplate.load(template_file, info=self.info)
-        except FileNotFoundError:
-            msg = f"Could not find template file '{template_file}' -> Skipping!"
-            logger.critical(msg)
-            return self
+        series_template = self.loadBalmerSeriesTemplate.__wrapped__(
+            self,
+            source=source,
+            temp=temp,
+            dens=dens,
+            n_u_min=n_u_min,
+            n_u_max=n_u_max,
+        ).createLogspace(self._x, inplace=False, keep_x=True)
+
+        continuum_template = self.loadBalmerContinuumTemplate.__wrapped__(
+            self,
+            temp=temp,
+            tau=tau,
+            scale=scale,
+        ).createLogspace(self._x, inplace=False, keep_x=True)
         
-        if not template.is_logspace:
-            msg = f"BalmerTemplate @ {template_file} will be transformer to \
-                logspace, which may be inefficient for pipelines. Consider \
-                caching a logspace-equivalent of this BalmerTemplate."
-            logger.warning(msg)
-
-            template.createLogspace(
-                self._x[self._valid_pixels], inplace=True, keep_x=True,
-            )
-
-        # Uses the template-assigned value by default
-        #? Apply these values to the BalmerInfo instance?
-        _temp    = getattr(template, 'temp', temp)
-        _tau     = getattr(template, 'tau', tau)
-        _scale   = getattr(template, 'scale', scale)
-        _ratio   = getattr(template, 'ratio', ratio)
-        _edge    = getattr(template, 'edge', edge)
-        _waves   = getattr(template, 'waves', waves)
-        _weights = getattr(template, 'weights', weights)
-        
-        self.template: BalmerTemplate = template
-        self.model: BalmerModel = BalmerModel(
-            apply_bounds.__wrapped__(flux, flux_bounds),
-            apply_bounds.__wrapped__(fwhm, fwhm_bounds),
-            apply_bounds.__wrapped__(_temp, temp_bounds),
-            apply_bounds.__wrapped__(_tau, tau_bounds),
-            apply_bounds.__wrapped__(_scale, scale_bounds),
-            apply_bounds.__wrapped__(_ratio, ratio_bounds),
-
-            edge=_edge,
-            sigma_res=self.info.loading['sigma_res'],
-            waves=_waves,
-            weights=_weights,
-            boltz=self.info.units.getBoltzmannFactor(),
-            template=self.template,
+        model = BalmerModel(
+            flux, fwhm, ratio,
+            info=self.info,
+            series_template=series_template,
+            continuum_template=continuum_template,
             allow_interp_fitting=allow_interp_fitting,
-            name='balmer_model',
         )
-        for param_name in self.model.param_names:
-            getattr(self.model, param_name).fixed = fixed.get(param_name, False)
+        
+        # flux
+        model.flux.value = apply_bounds(flux, flux_bounds)
+        model.flux.bounds = flux_bounds
+        model.flux.fixed = fixed['flux']
+        # fwhm
+        model.fwhm.value = apply_bounds(fwhm, fwhm_bounds)
+        model.fwhm.bounds = fwhm_bounds
+        model.fwhm.fixed = fixed['fwhm']
+        # ratio
+        model.ratio.value = apply_bounds(ratio, ratio_bounds)
+        model.ratio.bounds = ratio_bounds
+        model.ratio.fixed = fixed['ratio']
 
-        if self.model._perform_template_fitting:
-            msg = "Template fitting enabled!"
-            logger.debug(msg)
-
-        return self
+        return model
 
     @validated_apply_info_to_method(subjects=('balmer',))
     def checkModelCoverage(
@@ -367,13 +288,14 @@ class BalmerWindows(SpecList[BWindow]):
         without_absorption: bool = False,
         min_fittable_ratio: float | None = None,
         min_fittable_total: int | None = None,
-    ) -> Self:
+    ) -> bool:
         """
         ** PYDANTIC VALIDATED METHOD **
 
         Checks the degree of coverage of each side of the Balmer 
         pseudo-continuum.
         """
+        self.model
         model: BalmerModel = self.getModel()
         assert model is not None, "Model has not been instantiated!"
         
@@ -388,26 +310,46 @@ class BalmerWindows(SpecList[BWindow]):
         is_blue = (self.x <= model.edge)
         n_blue: int = fittable_pixels[is_blue].sum()
         r_blue: float = fittable_pixels[is_blue].mean() if n_blue > 0 else 0.0
-        
-        if (r_blue < min_fittable_ratio) or (n_blue < min_fittable_total):
-            model._ignore_blue_side()
-
-        # The red side: Balmer series contribution
+        cond1 = (r_blue < min_fittable_ratio) or (n_blue < min_fittable_total)
 
         is_red = invert(is_blue)
         n_red: int = fittable_pixels[is_red].sum()
         r_red: float = fittable_pixels[is_red].mean() if n_red > 0 else 0.0
+        cond2 = (r_red < min_fittable_ratio) or (n_red < min_fittable_total)
 
-        if (r_red < min_fittable_ratio) or (n_red < min_fittable_total):
-            model._ignore_red_side()
+        if cond1 and cond2:
+            msg = "Insufficient coverage on both sides of the Balmer "\
+                "pseudo-continuum: removing model!"
+            logger.debug(msg)
+            return False
 
-        return self
+        elif cond1:
+            msg = "Insufficient coverage on the blue side of the Balmer "\
+                "pseudo-continuum: freezing 'ratio' parameter!"
+            logger.debug(msg)
+        elif cond2:
+            msg = "Insufficient coverage on the red side of the Balmer "\
+                "pseudo-continuum: freezing 'ratio' parameter!"
+            logger.debug(msg)
+        else:
+            msg = "Sufficient coverage on both sides of the Balmer "\
+                "pseudo-continuum: proceeding with fitting!"
+            logger.debug(msg)
+            return True
+
+        model.ratio.value = 1.0
+        model.ratio.bounds = (
+            model.ratio.bounds[0],
+            min(model.ratio.bounds[1], 1.0),
+        )
+        model.ratio.fixed = True
+
+        return True
     
-    @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'raster_n'})
+    @validate_call
     def getRasterFit(
         self,
         *,
-        raster_n: int | None = None,
         without_absorption: bool = False,
         without_rejections: bool = False,
         covered: bool = False,
@@ -434,7 +376,6 @@ class BalmerWindows(SpecList[BWindow]):
         self.model.rasterFit.__wrapped__(
             self.model,
             *coords,
-            raster_n = raster_n,
         )
         return self
 

@@ -20,7 +20,7 @@ from quasar_utils.decorators import validate_call, validated_apply_info_to_metho
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 
 from quasar_models.continuum import PowerLawModel
-from quasar_models.utils.astropy import apply_bounds
+from quasar_models.utils.astropy import apply_bounds, get_free_params
 
 from quasar_errors.model_samples import PowerLawSample
 
@@ -41,7 +41,10 @@ class ContinuumWindows(SpecList[CWindow]):
             return None
         return PowerLawSample.fromPowerLawModel(model)
 
-    @validated_apply_info_to_method(subjects=('continuum',))
+    @validated_apply_info_to_method(
+        subjects=('continuum',), 
+        specific_kwargs={'windows'},
+    )
     def populate(
         self,
         *,
@@ -194,12 +197,8 @@ class ContinuumWindows(SpecList[CWindow]):
         else:
             prev_model = self.getModel.__wrapped__(self, suffix=suffix)
         
-        try:
-            with stopwatch() as watch:
-                fit = prev_model.from_linear_fit(*coords)
-        except ValidationError as e:
-            log(msg + f" Failed fitting due to a validation error:\n{e}")
-            return False
+        with stopwatch() as watch:
+            fit = prev_model.from_linear_fit(*coords)
 
         msg += " Finished linear fit in {:.1f} ms.".format(1e3 * watch.elapsed)
         log(msg)
@@ -348,19 +347,65 @@ class ContinuumWindows(SpecList[CWindow]):
         model = self.getModel.__wrapped__(
             self, suffix=suffix,
         )
-        msg += " 'flux': {:.1f} | ({}, {})".format(
-            model.flux.value, 
-            *model.flux.bounds,
+        msg += "flux={:.1f} ({:.1f},{:.1f})".format(
+            model.flux.value, *model.flux.bounds,
         )
-        msg += " 'alpha': {:.2f} | ({}, {})".format(
-            model.alpha.value, 
-            *model.alpha.bounds,
+        msg += " alpha={:.2f} | ({:.2f},{:.2f})".format(
+            model.alpha.value, *model.alpha.bounds,
         )
 
         if self.is_empty:
-            log = logger.warning
-            msg += " No continuum windows -> performing global fit!"
+            msg += "performing global fit due to missing continuum windows -> "
 
+        coords = self.getMaskedCoords.__wrapped__(
+            self,
+            covered=not self.is_empty,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=True,
+            bg_flux=bg_flux,
+        )
+        n_pix = coords[0].size
+        n_free_params = sum(get_free_params(model).values())
+
+        if n_pix <= n_free_params:
+            msg += "cancelling fine-tuning due to insufficient no. of data " \
+                f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
+            self.applyFit.__wrapped__(
+                self, self.getModel(), OptimizeResult(),
+            )
+            logger.warning(msg)
+            return False
+        
+        try:
+            with stopwatch() as watch:
+                fit, fit_info = fitter(model, *coords, inplace=False)
+            msg += "Successfully performed fine-tuning in {:.1f} ms: " \
+                "flux={:.1f} ({:.1f},{:.1f}), " \
+                "alpha={:.2f} | ({:.2f},{:.2f})" \
+                .format(
+                    1e3 * watch.elapsed, 
+                    fit.flux.value, *fit.flux.bounds, 
+                    fit.alpha.value, *fit.alpha.bounds,
+                )
+            logger.debug(msg)
+        except ValidationError as e:
+            msg += f"failed fitting due to a validation error: {e}"
+            logger.warning(msg)
+            self.applyFit.__wrapped__(
+                self, self.getModel(), OptimizeResult(),
+            )
+            return False
+        except Exception as e:
+            msg += f"failed fitting due to an unexpected error: {e}"
+            logger.warning(msg)
+            self.applyFit.__wrapped__(
+                self, self.getModel(), OptimizeResult(),
+            )
+            return False
+
+        if self.is_empty:
+            msg += " No continuum windows -> performing global fit!"
             coords = self.getMaskedCoords.__wrapped__(
                 self,
                 without_rejections = without_rejections,
@@ -368,7 +413,6 @@ class ContinuumWindows(SpecList[CWindow]):
                 valid = True,
             )
         else:
-            log = logger.debug
             coords = self.getMaskedCoords.__wrapped__(
                 self,
                 covered = True,
@@ -377,40 +421,9 @@ class ContinuumWindows(SpecList[CWindow]):
                 valid = True,
             )
 
-        msg += f" No. of data points: {len(coords[0])}."
-
-        try:
-            with stopwatch() as watch:
-                fit, fit_info = fitter(
-                    model,
-                    *coords,
-                    inplace = False,
-                )
-        except ValidationError as e:
-            msg += f" Failed fitting due to a validation error: {e}"
-
-            log(msg)
-            self.applyFit.__wrapped__(
-                self, self.getModel(), OptimizeResult(),
-            )
-            return False
-
-        msg += " Finished fine-tuning in {:.1f} ms.".format(1e3 * watch.elapsed)
-        msg += " 'flux': {:.1f} | ({}, {})".format(
-            fit.flux.value, *fit.flux.bounds,
-        )
-        msg += " 'alpha': {:.2f} | ({}, {})".format(
-            fit.alpha.value, 
-            *fit.alpha.bounds,
-        )
-        log(msg)
-        self.applyFit.__wrapped__(
-            self, fit, fit_info,
-        )
+        self.applyFit.__wrapped__(self, fit, fit_info)
         if update_flux:
-            self.updateContinuumEmission.__wrapped__(
-                self, fit,
-            )
+            self.updateContinuumEmission.__wrapped__(self, fit)
         return True
 
     @validate_call

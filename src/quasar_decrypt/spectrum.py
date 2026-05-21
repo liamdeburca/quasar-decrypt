@@ -10,7 +10,11 @@ from matplotlib.axes import Axes
 from pydantic_core import ValidationError
 
 from quasar_errors.bootstrapping import BaseBootstrapper
-from quasar_errors.spectrum_utils import format_bootstrapping_kwargs_for_spectrum
+from quasar_errors.nested_sampling import BaseNestedSampler
+from quasar_errors.spectrum_utils import (
+    format_bootstrapping_kwargs_for_spectrum,
+    format_nested_sampling_kwargs_for_spectrum,
+)
 from quasar_errors.error_result import ErrorResult
 from quasar_errors.model_samples import (
     PowerLawSample, IronSampleList, BalmerSample, GaussianSampleList, Sample,
@@ -63,6 +67,7 @@ class Spectrum(_SpecData):
     line_windows: LineWindows | None = field(default=None, init=False)
 
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
+    nested_sampler: BaseNestedSampler | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
 
     @property
@@ -217,10 +222,14 @@ class Spectrum(_SpecData):
         Truncates the spectrum if edges contain NaN values.
         """
         mask = self._valid_pixels
-        msg = ">>> "
 
-        if mask[0] and mask[-1]:
-            msg += "No invalid pixels at either edge. "
+        n_valid = self._valid_pixels.sum()
+        if n_valid == 0:
+            logger.warning("All pixels are invalid! Cannot truncate spectrum.")
+        elif n_valid == 1:
+            logger.critical("Only one valid pixel! Cannot truncate spectrum.")
+        elif self._valid_pixels[0] and self._valid_pixels[-1]:
+            logger.debug("No invalid pixels at either edge")
         else:
             valid_indices = argwhere(mask).flatten()
             idx_start = valid_indices[0]
@@ -228,22 +237,22 @@ class Spectrum(_SpecData):
             sel = slice(valid_indices[0], valid_indices[-1]+1)
 
             n = len(mask)
-            n_tot = (n_blue := idx_start) + (n_red := n - 1 - idx_end)
+            n_blue = idx_start
+            n_red = n - 1 - idx_end
+            n_tot = n_blue + n_red
 
             self.__init__.__wrapped__(
                 self,
                 self.path,
                 self.title,
                 (self._x[sel], self._y[sel], self._dy[sel]),
-                info = self.info,
+                info=self.info,
+            )            
+            logger.debug(
+                "Cutting %d/%d pixel(s): %d/%d (blue edge), %d/%d (red edge)",
+                n_tot, n, n_blue, n, n_red, n,
             )
-
-            msg += "Cutting {}/{} pixel(s): ".format(n_tot, n) \
-                + "{}/{} (blue edge), ".format(n_blue, n) \
-                + "{}/{} (red edge).".format(n_red, n)
-            
-        logger.debug(msg)
-            
+                        
     @validated_apply_info_to_method(subjects=('lines',))
     def cropLymanAlphaForest(
         self, 
@@ -618,9 +627,8 @@ class Spectrum(_SpecData):
         """
         from .utils.general import stopwatch
 
-        msg = "Finalising fit for {}: ".format(
-            self.__str__(simple=True).removesuffix('.'),
-        )
+        s = self.__str__(simple=True).removesuffix('.')
+        msg = f"Finalising fit for {s}: "
 
         if (model_types is None) and (data_types is None):
             model_types = ModelTypes({'all'})
@@ -631,7 +639,8 @@ class Spectrum(_SpecData):
             data_types = model_types.copy()
 
         if not any(self[dt] is not None for dt in data_types):
-            logger.warning(msg + "No data to fit: cancelling!")
+            msg += f"no data types found for {data_types}. "
+            logger.warning(msg)
             return False
         
         if bg_flux is None:
@@ -639,7 +648,7 @@ class Spectrum(_SpecData):
             _bg_flux.add('all')
             bg_flux = BackgroundFlux(_bg_flux)
 
-        msg += f"{model_types=}, {data_types=}, {bg_flux=}"
+        msg += f"{model_types=}, {data_types=}, {bg_flux=} -> "
 
         coords = self.getMaskedCoords.__wrapped__(
             self,
@@ -651,15 +660,24 @@ class Spectrum(_SpecData):
             without_absorption=without_absorption,
             valid=True,
         )
-        n_data = len(coords[0])
-        msg += f"{n_data=}, "
-
         model = self.getModel.__wrapped__(self, model_types=model_types)
         if model is None:
-            logger.warning(msg + "No models to fit: cancelling!")
+            msg += "no models found!"
+            logger.warning(msg)
             return False
 
-        msg += f"n_submodels={model.n_submodels}. "
+        n_pix = coords[0].size
+        n_free_params = sum(get_free_params(model).values())
+
+        if n_pix <= n_free_params:
+            msg += "cancelling final fitting due to insufficient no. of data " \
+                f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
+            logger.critical(msg)
+            return False
+        
+        msg += "n_pixels={}, n_submodels={} (n_free_params={}), " \
+            .format(n_pix, model.n_submodels, n_free_params)
+        
         try:
             with stopwatch() as watch:
                 fit, fit_info = fitter(
@@ -667,15 +685,18 @@ class Spectrum(_SpecData):
                     *coords,
                     inplace = False,
                 )
+            msg += "successfully finalised fit in {:.1f} ms." \
+                .format(watch.elapsed)
         except ValidationError as e: 
-            logger.warning(
-                msg + f"Failed fitting due to validation error: {e}",
-            )
+            msg += f"failed fitting due to validation error: {e}"
+            logger.warning(msg)
+            return False
+        except Exception as e:
+            msg += f"failed fitting due to an unexpected error: {e}"
+            logger.warning(msg)
             return False
         
-        logger.debug(
-            msg + f"Finished fitting in {watch.elapsed:.1f} ms."
-        )
+        logger.debug(msg)    
         self.applyFit(fit, fit_info)
 
         return True
@@ -1003,6 +1024,82 @@ class Spectrum(_SpecData):
         ** PYDANTIC VALIDATED METHOD // INFO APPLIED TO METHOD **
         """
         raise NotImplementedError
+
+    @validated_apply_info_to_method(subjects=('error',))
+    def instantiateNestedSampler(
+        self,
+        *,
+        covered: bool = True,
+        data_types: DataTypes = DataTypes({'all'}),
+        model_types: ModelTypes = ModelTypes({'all'}),
+
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+
+        pool: Pool_ | None = None,
+
+        iterations: int | None = None,
+        random_state: RandomState_ | None = None,
+        renew_rng: bool | None = None,
+        replace_missing: bool | None = None,
+        tqdm_disable: bool | None = None,
+        tqdm_leave: bool | None = None,
+    ) -> BaseNestedSampler:
+        """
+        ...
+        """    
+        cls, args, kwargs = format_nested_sampling_kwargs_for_spectrum(
+            self,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            variant='standard',
+            data_types=data_types,
+            model_types=model_types,
+            nested_type='uniform',
+            pool=pool,
+            iterations=iterations,
+            random_state=random_state,
+            renew_rng=renew_rng,
+            replace_missing=replace_missing,
+            tqdm_disable=tqdm_disable,
+            tqdm_leave=tqdm_leave,
+            logger=logger,
+        )
+        self.nested_sampler = cls(*args, **kwargs)
+        self.nested_sampler.instantiateSampler()
+        return self.nested_sampler
+
+    def runNestedSampler(
+        self, 
+        *, 
+        maxiter: int,
+        dlogz: float | None = None,
+        print_progress: bool = True,
+        scale: Scale | None = None) -> ErrorResult:
+        """
+        ...
+        """
+        if scale == 'semilocal' or scale == 'local':
+            pass
+
+        if self.nested_sampler is None:
+            msg = "No nested sampler instance found! "\
+                "Run 'instantiateNestedSampler()' method first."
+            logger.critical(msg)
+            raise AttributeError(msg)
+        
+        if self.error_result is not None:
+            logger.debug("Existing 'error_result' will be overwritten.")
+
+        out = self.nested_sampler.run(
+            maxiter=maxiter,
+            dlogz=dlogz,
+            print_progress=print_progress,
+        )
+
+        self.error_result = self.nested_sampler.toErrorResult(out)
+        return self.error_result
 
     def quickplot(
         self,

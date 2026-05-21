@@ -3,7 +3,7 @@ __all__ = ['_SpecData']
 from logging import getLogger
 from typing import Self, Callable
 from dataclasses import dataclass
-from numpy import zeros_like, invert, isfinite, ones_like, float64, bool_, ascontiguousarray
+from numpy import zeros_like, invert, isfinite, ones_like, float64, bool_, ascontiguousarray, inf
 
 from quasar_models.continuum import PowerLawModel
 from quasar_models.iron import IronModel
@@ -164,12 +164,20 @@ class _SpecData:
             ascontiguousarray(p_absorbed)
         )
 
-        if x_bounds is None:
+        if x_bounds is not None:
+            self.x_bounds = x_bounds
+        else:
             x = self._x[self._valid_pixels]
             dx = self._dx[self._valid_pixels]
-            self.x_bounds = (x[0] - dx[0] / 2, x[-1] + dx[-1] / 2)
-        else:
-            self.x_bounds = x_bounds
+
+            if x.size < 2:
+                msg = "No. of valid pixels is less than 2! This is likely " \
+                    "due to most pixels being invalid. Valid fraction: {}/{}" \
+                    .format(x.size, self._x.size)
+                logger.critical(msg)
+                self.x_bounds = (0, inf)
+            else:
+                self.x_bounds = (x[0] - dx[0] / 2, x[-1] + dx[-1] / 2)
 
         self.x0 = x0 or info.continuum['x0']
         self.y0 = y0 or info.continuum['y0']

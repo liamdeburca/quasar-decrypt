@@ -1,11 +1,11 @@
 """
-The Balmer window class: 'BWindow'.
+The Host window class: 'HWindow'.
 """
 from logging import getLogger
 from typing import Self, ClassVar
 from dataclasses import dataclass, field
 
-from quasar_models.balmer import BalmerModel
+from quasar_models.host import HostGalaxyModel
 from quasar_typing.astropy import FitInfo
 from quasar_typing.misc import BackgroundFlux
 from quasar_utils.decorators import validate_call
@@ -15,17 +15,17 @@ from ..utils.specdata import SpecData
 logger = getLogger(__name__)
 
 @dataclass(init=False)
-class BWindow(SpecData):
-    model: BalmerModel | None = field(default=None, init=False)
-    fit: BalmerModel | None = field(default=None, init=False)
+class HWindow(SpecData):
+    model: HostGalaxyModel | None = field(default=None, init=False)
+    fit: HostGalaxyModel | None = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
 
-    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'ba'})
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'hg'})
     
     @validate_call
     def applyFit(
         self,
-        fit: BalmerModel,
+        fit: HostGalaxyModel,
         fit_info: FitInfo,
     ) -> Self:
         """
@@ -38,7 +38,7 @@ class BWindow(SpecData):
     @validate_call
     def adoptFit(
         self,
-        fit: BalmerModel,
+        fit: HostGalaxyModel,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
