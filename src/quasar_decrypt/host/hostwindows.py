@@ -6,16 +6,15 @@ from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
-from .hwindow import HWindow
-from ..utils.speclist import SpecList
+from quasar_decrypt.host import HWindow
+from quasar_decrypt.utils.speclist import SpecList
 
-from ..utils.general import stopwatch
-
+from quasar_utils.fitting import FitterInstance
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 
 from quasar_typing.bounds import CoordBounds, AstropyBounds
 from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_typing.astropy import FitterInstance, FitInfo
+from quasar_typing.astropy import FitInfo
 from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.host import (
@@ -23,8 +22,6 @@ from quasar_models.host import (
     HostGalaxyModel,
 )
 from quasar_models.utils.astropy import get_free_params
-
-# from quasar_errors.model_samples
 
 logger = getLogger(__name__)
 
@@ -92,11 +89,14 @@ class HostWindows(SpecList[HWindow]):
     @validated_apply_info_to_method(subjects=('host', 'nonlinear'))
     def __call__(
         self,
+        *,
+        template_model: HostGalaxyModel | None = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
+
         covered: bool = True,
-        *,
+
         template_file: str | AbsoluteFITSPath | None = None,
         flux: float | None = None,
         fwhm: float | None = None,
@@ -113,6 +113,14 @@ class HostWindows(SpecList[HWindow]):
         """
         if bg_flux is None:
             bg_flux = self.default_bg
+
+        if template_model is not None:
+            self.applyFit.__wrapped__(
+                self,
+                template_model,
+            )
+        else:
+            pass
 
     @validate_call
     def loadHostGalaxyTemplate(
@@ -407,41 +415,44 @@ class HostWindows(SpecList[HWindow]):
         return self.fit or self.model
     
     @validate_call
-    def applyFit(
-        self,
-        fit: HostGalaxyModel,
-        fit_info: FitInfo,
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-
-        Applies the given Balmer pseudo-continuum fit.
-
-        Notes
-        -----
-        This method does NOT update the Balmer pseudo-continuum emission array,
-        '_y_ba'. This should be updated separately using 'updateBalmerEmission'.
-        """
-        self.fit = fit
-        self.fit_info = fit_info
-
-        for bwindow in self:
-            bwindow.applyFit.__wrapped__(bwindow, fit, fit_info)
-
-        return self
-    
-    @validate_call
     def adoptFit(
         self,
         fit: HostGalaxyModel,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
+        Identical to 'applyFit'.
         """
-        self.fit = fit
-        self.fit_info = None
+        return self.applyFit.__wrapped__(
+            self,
+            fit,
+            fit_info=fit_info,
+            update_emission=update_emission,
+        )
 
-        for bwindow in self:
-            bwindow.adoptFit.__wrapped__(bwindow, fit)
+    @validate_call
+    def applyFit(
+        self,
+        fit: HostGalaxyModel,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> Self:
+        """
+        Applies the given Host Galaxy fit.
+        """        
+        self.fit_info = fit_info
+        self.fit = fit
+
+        if update_emission:
+            self.updateHostGalaxyEmission.__wrapped__(self, fit)
+
+            for hwindow in filter(lambda w: w._y_hg is not self._y_hg, self):
+                hwindow.updateHostGalaxyEmission.__wrapped__(
+                    hwindow,
+                    fit,
+                )
 
         return self

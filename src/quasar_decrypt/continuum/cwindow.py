@@ -3,13 +3,13 @@ from typing import Self, ClassVar
 from dataclasses import dataclass, field
 from numpy import dot
 
-from ..utils.specdata import SpecData
+from quasar_decrypt.utils.specdata import SpecData
 
-from pydantic import validate_call
+from quasar_utils.decorators import validate_call
+
 from quasar_typing.numpy import FloatVector
 from quasar_typing.astropy import FitInfo
 from quasar_typing.misc import BackgroundFlux, Suffix
-
 
 from quasar_models.continuum import PowerLawModel
 
@@ -98,35 +98,24 @@ class CWindow(SpecData):
     def applyFit(
         self,
         fit: PowerLawModel,
-        fit_info: FitInfo,
+        *,
+        fit_info: FitInfo | None = None,
         suffix: Suffix | None = None,
+        update_emission: bool = True,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
         self.fit_info = fit_info
+
         if suffix == 'raw':
             self.fit_raw = fit
         elif suffix == 'sc':
             self.fit_sc = fit
         else:
             self.fit = fit
-        return self
-    
-    @validate_call
-    def adoptFit(
-        self,
-        fit: PowerLawModel,
-        suffix: Suffix | None = None,
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self.fit_info = None
-        if suffix == 'raw':
-            self.fit_raw = fit
-        elif suffix == 'sc':
-            self.fit_sc = fit
-        else:
-            self.fit = fit
+
+        if update_emission:
+            self.updateContinuumEmission.__wrapped__(self, fit)
+
         return self

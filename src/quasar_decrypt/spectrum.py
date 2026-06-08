@@ -21,6 +21,7 @@ from quasar_errors.model_samples import (
 )
 
 from quasar_utils.setup import Info
+from quasar_utils.fitting import FitterInstance
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.absorption import remove_absorption, smooth_spectrum
 from quasar_utils.continuum_fit_result import ContinuumFitResult
@@ -31,7 +32,7 @@ from quasar_typing.pandas import LineList
 from quasar_typing.pathlib import (
     AbsoluteFilePath, AbsoluteDirPath, RelativeFilePath, AbsoluteFITSPath,
 )
-from quasar_typing.astropy import FitterInstance, Model_, FitInfo, QTable_
+from quasar_typing.astropy import Model_, FitInfo, QTable_, CompoundModel_
 from quasar_typing.numpy import CoordsTuple
 from quasar_typing.misc import (
     Pool_, 
@@ -39,6 +40,13 @@ from quasar_typing.misc import (
     Scale, Variant, BootstrapType, VaryLines,
 )
 
+from quasar_models import (
+    PowerLawModel, 
+    IronModel,
+    BalmerModel,
+    HostGalaxyModel,
+    GaussianModel,
+)
 from quasar_models.utils.astropy import get_model_parts, get_free_params
 
 from quasar_plotting import quickplot, absorptionplot, fitplot
@@ -382,7 +390,6 @@ class Spectrum(_SpecData):
         self.balmer_windows = BalmerWindows(self, windows=windows)
         return self
 
-    @validate_call
     def instantiateLines(self) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -390,10 +397,79 @@ class Spectrum(_SpecData):
         self.line_windows = LineWindows(self)
         return self
 
+    @validated_apply_info_to_method(
+        subjects=('lines',),
+        specific_kwargs={
+            'sigma_res', 'v_sep', 'forced_splits', 'min_fittable_total', 
+            'min_fittable_ratio',
+        },
+    )
+    def instantiateFromTemplateModel(
+        self,
+        template_model: Model_,
+        *,
+        linelist: AbsoluteFilePath | LineList,
+
+        continuum_windows: list[CoordBounds] | None = None,
+        iron_windows: list[CoordBounds] | None = None,
+        balmer_windows: list[CoordBounds] | None = None,
+        host_windows: list[CoordBounds] | None = None,
+
+        sigma_res: float | None = None,
+        v_sep: float | None = None,
+        forced_splits: FloatVector | None = None,
+        min_fittable_total: int | None = None,
+        min_fittable_ratio: float | None = None,
+    ) -> Self:
+        fs = (template_model,) if template_model.n_submodels == 1 else template_model
+        model_components = set(f.model_type for f in fs)
+
+        if 'pl' in model_components:
+            self.instantiateContinuum.__unvalidated__(
+                self,
+                windows=continuum_windows,
+            )
+        if 'fe' in model_components:
+            self.instantiateIron.__unvalidated__(
+                self,
+                windows=iron_windows,
+            )
+        if 'ba' in model_components:
+            self.instantiateBalmer.__unvalidated__(
+                self,
+                windows=balmer_windows,
+            )
+        if 'hg' in model_components:
+            self.instantiateHost.__unvalidated__(
+                self,
+                windows=host_windows,
+            )
+        if 'em' in model_components:
+            self.instantiateLines()
+            self.line_windows.applyLineList.__unvalidated__(
+                self.line_windows,
+                linelist,
+                sigma_res=sigma_res,
+                v_sep=v_sep,
+                forced_splits=forced_splits,
+                min_fittable_total=min_fittable_total,
+                min_fittable_ratio=min_fittable_ratio,
+            )
+
+        self.adoptFit.__wrapped__(
+            self,
+            template_model,
+            update_emission=True,
+        )
+        return self
+        
     @validated_apply_info_to_method(subjects=('continuum', 'nonlinear'))
     def fitContinuum(
         self,
         *,
+        template_model: PowerLawModel | None = None,
+        bg_flux: BackgroundFlux | None = None,
+
         windows: list[CoordBounds] | None = None,
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -401,8 +477,6 @@ class Spectrum(_SpecData):
         fitter: FitterInstance | None = None,
     ) -> None:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Fits the continuum and creates a 'CSSpectrum' class. 
         Takes the following steps:
 
@@ -436,6 +510,10 @@ class Spectrum(_SpecData):
         )
         self.continuum_windows.__call__.__wrapped__(
             self.continuum_windows,
+
+            template_model=template_model,
+            bg_flux=bg_flux,
+
             sigmas=sigmas,
             flux_bounds=flux_bounds,
             alpha_bounds=alpha_bounds,
@@ -445,9 +523,12 @@ class Spectrum(_SpecData):
     @validated_apply_info_to_method(subjects=('iron', 'nonlinear'))
     def fitIron(
         self,
-        without_rejections: bool = False,
-        without_absorption: bool = True,
         *,
+        template_model: IronModel | CompoundModel_[IronModel] | None = None,
+        bg_flux: BackgroundFlux | None = None,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+
         windows: list[CoordBounds] | None = None,
         template_files: list[AbsoluteFITSPath] | None = None, 
         resample: bool | None = None,
@@ -472,29 +553,36 @@ class Spectrum(_SpecData):
         )
         self.iron_windows.__call__.__wrapped__(
             self.iron_windows,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            template_files = template_files,
-            resample = resample,
-            flux_bounds = flux_bounds,
-            fwhm_bounds = fwhm_bounds,
-            split = split,
-            fwhm = fwhm,
-            bias = bias,
-            ratio = ratio,
-            scale = scale,
-            allow_interp_fitting = allow_interp_fitting,
-            raster = raster,
-            fine_tune = fine_tune,
-            fitter = fitter,
+
+            template_model=template_model,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+
+            template_files=template_files,
+            resample=resample,
+            flux_bounds=flux_bounds,
+            fwhm_bounds=fwhm_bounds,
+            split=split,
+            fwhm=fwhm,
+            bias=bias,
+            ratio=ratio,
+            scale=scale,
+            allow_interp_fitting=allow_interp_fitting,
+            raster=raster,
+            fine_tune=fine_tune,
+            fitter=fitter,
         )
         
     @validated_apply_info_to_method(subjects=('balmer', 'nonlinear'))
     def fitBalmer(
         self,
-        without_rejections: bool = False,
-        without_absorption: bool = True,
         *,
+        template_model: BalmerModel | None = None,
+        bg_flux: BackgroundFlux | None = None,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+
         windows: list[CoordBounds] | None = None,
         template_files: list[AbsoluteFITSPath] | None = None, 
         resample: bool | None = None,
@@ -516,8 +604,12 @@ class Spectrum(_SpecData):
         )
         self.balmer_windows.__call__.__wrapped__(
             self.balmer_windows,
+
+            template_model=template_model,
+            bg_flux=bg_flux,
             without_rejections = without_rejections,
             without_absorption = without_absorption,
+
             template_files = template_files,
             resample = resample,
             flux_bounds = flux_bounds,
@@ -535,6 +627,8 @@ class Spectrum(_SpecData):
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
+        template_model: GaussianModel | CompoundModel_[GaussianModel] | None = None,
+
         bg_flux: BackgroundFlux = BackgroundFlux({'pl', 'fe', 'ba', 'hg'}),
         without_rejections: bool = False,
         without_absorption: bool = False,
@@ -579,6 +673,8 @@ class Spectrum(_SpecData):
         self.line_windows.__call__.__wrapped__(
             self.line_windows,
             linelist,
+
+            template_model = template_model,
             bg_flux = bg_flux,
             without_rejections = without_rejections,
             without_absorption = without_absorption,
@@ -697,7 +793,12 @@ class Spectrum(_SpecData):
             return False
         
         logger.debug(msg)    
-        self.applyFit(fit, fit_info)
+        self.applyFit.__wrapped__(
+            self, 
+            fit, 
+            fit_info=fit_info,
+            update_emission=True,
+        )
 
         return True
 
@@ -814,76 +915,92 @@ class Spectrum(_SpecData):
         return None if len(models) == 0 else sum(models[1:], start=models[0])
     
     @validate_call
-    def applyFit(
-        self,
-        fit: Model_,
-        fit_info: FitInfo,
-    ) -> None:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        method_dict: dict[ModelTypes, str] = {
-            'pl': 'updateContinuumEmission',
-            'fe': 'updateIronEmission',
-            'ba': 'updateBalmerEmission',
-            'hg': 'updateHostEmission',
-            'em': 'updateLinesEmission',
-        }
-
-        count = 0
-        parts = get_model_parts(fit)
-        for key, method in method_dict.items():
-            model = parts[key]
-            if model is None:
-                continue
-
-            n_free = sum(get_free_params(model).values())
-            sel = slice(count, count+n_free)
-            finfo = OptimizeResult(
-                message =    fit_info.message,
-                success =    fit_info.success,
-                status =     fit_info.status,
-                fun =        fit_info.fun,
-                x =          fit_info.x[sel],
-                cost =       fit_info.cost,
-                jac =        fit_info.jac[sel,sel],
-                grad =       fit_info.grad[sel],
-                optimality = fit_info.optimality,
-                nfev =       fit_info.nfev,
-                njev =       fit_info.njev,
-                param_cov =  fit_info.param_cov[sel,sel]
-            )
-
-            windows = self[key]
-            windows.applyFit.__wrapped__(windows, model, finfo)
-            getattr(self, method).__wrapped__(self, model)
-
-            count += n_free
-
-    @validate_call
     def adoptFit(
         self,
         fit: Model_,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
     ) -> None:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        method_dict: dict[ModelTypes, str] = {
-            'pl': 'updateContinuumEmission',
-            'fe': 'updateIronEmission',
-            'ba': 'updateBalmerEmission',
-            'hg': 'updateHostEmission',
-            'em': 'updateLinesEmission',
-        }
+        count = 0
         parts = get_model_parts(fit)
-        for key, method in method_dict.items():
+        for key in ('pl', 'fe', 'ba', 'hg', 'em'):
             model = parts[key]
             if model is None:
                 continue
 
+            if fit_info is None:
+                finfo = None
+            else:
+                n_free = sum(get_free_params(model).values())
+                sel = slice(count, count+n_free)
+                finfo = OptimizeResult(
+                    message =    fit_info.message,
+                    success =    fit_info.success,
+                    status =     fit_info.status,
+                    fun =        fit_info.fun,
+                    x =          fit_info.x[sel],
+                    cost =       fit_info.cost,
+                    jac =        fit_info.jac[sel,sel],
+                    grad =       fit_info.grad[sel],
+                    optimality = fit_info.optimality,
+                    nfev =       fit_info.nfev,
+                    njev =       fit_info.njev,
+                    param_cov =  fit_info.param_cov[sel,sel]
+                )
+                count += n_free
+
             windows = self[key]
-            windows.adoptFit.__wrapped__(windows, model)
-            getattr(self, method).__wrapped__(self, model)
+            windows.adoptFit.__wrapped__(
+                windows, 
+                model, 
+                fit_info=finfo,
+                update_emission=update_emission,
+            )
+    
+    @validate_call
+    def applyFit(
+        self,
+        fit: Model_,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> None:
+        count = 0
+        parts = get_model_parts(fit)
+        for key in ('pl', 'fe', 'ba', 'hg', 'em'):
+            model = parts[key]
+            if model is None:
+                continue
+
+            if fit_info is None:
+                finfo = None
+            else:
+                n_free = sum(get_free_params(model).values())
+                sel = slice(count, count+n_free)
+                finfo = OptimizeResult(
+                    message =    fit_info.message,
+                    success =    fit_info.success,
+                    status =     fit_info.status,
+                    fun =        fit_info.fun,
+                    x =          fit_info.x[sel],
+                    cost =       fit_info.cost,
+                    jac =        fit_info.jac[sel,sel],
+                    grad =       fit_info.grad[sel],
+                    optimality = fit_info.optimality,
+                    nfev =       fit_info.nfev,
+                    njev =       fit_info.njev,
+                    param_cov =  fit_info.param_cov[sel,sel]
+                )
+                count += n_free
+
+            windows = self[key]
+            windows.applyFit.__wrapped__(
+                windows, 
+                model, 
+                fit_info=finfo,
+                update_emission=update_emission,
+            )
     
     def summariseContinuumFit(self) -> ContinuumFitResult:
         try:

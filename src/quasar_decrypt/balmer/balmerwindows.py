@@ -1,23 +1,22 @@
 from logging import getLogger
 from typing import Self, ClassVar, Iterable
-from numpy import invert, linspace, stack
-from functools import partial
+from numpy import invert
 from scipy.optimize import OptimizeResult
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
-from .bwindow import BWindow
-from ..utils.speclist import SpecList
-
-from ..utils.general import stopwatch
+from quasar_decrypt.utils.speclist import SpecList
+from quasar_decrypt.balmer.bwindow import BWindow
+from quasar_decrypt.utils.general import stopwatch
 
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
+from quasar_utils.fitting import FitterInstance
 
 from quasar_typing.numpy import FloatVector
 from quasar_typing.bounds import CoordBounds, AstropyBounds
 from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_typing.astropy import FitterInstance, FitInfo
+from quasar_typing.astropy import FitInfo
 from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.balmer import (
@@ -91,11 +90,14 @@ class BalmerWindows(SpecList[BWindow]):
     @validated_apply_info_to_method(subjects=('balmer', 'nonlinear'))
     def __call__(
         self,
+        *,
+        template_model: BalmerModel | None = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
+        
         covered: bool = True,
-        *,
+
         template_file: str | AbsoluteFITSPath | None = None,
         flux: float | None = None,
         fwhm: float | None = None,
@@ -125,42 +127,49 @@ class BalmerWindows(SpecList[BWindow]):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        self.loadTemplate.__wrapped__(
-            self,
-            template_file=template_file,
-            flux=flux,
-            fwhm=fwhm,
-            temp=temp,
-            tau=tau,
-            scale=scale,
-            ratio=ratio,
-            edge=edge,
-            waves=waves,
-            weights=weights,
-            flux_bounds=flux_bounds,
-            fwhm_bounds=fwhm_bounds,
-            temp_bounds=temp_bounds,
-            tau_bounds=tau_bounds,
-            scale_bounds=scale_bounds,
-            ratio_bounds=ratio_bounds,
-            allow_interp_fitting=allow_interp_fitting,
-            fixed=fixed,
-        )
-        self.checkModelCoverage.__wrapped__(
-            self,
-            without_rejections=without_rejections,
-            without_absorption=without_absorption,
-            min_fittable_ratio=min_fittable_ratio,
-            min_fittable_total=min_fittable_total,
-        )
-        self.getRasterFit.__wrapped__(
-            self,
-            without_rejections=without_rejections,
-            without_absorption=without_absorption,
-            bg_flux=bg_flux,
-            raster_n=raster_n,
-            covered=covered,
-        )
+        if template_model is not None:
+            self.applyFit.__wrapped__(
+                self,
+                template_model,
+            )
+        else:
+            self.loadTemplate.__wrapped__(
+                self,
+                template_file=template_file,
+                flux=flux,
+                fwhm=fwhm,
+                temp=temp,
+                tau=tau,
+                scale=scale,
+                ratio=ratio,
+                edge=edge,
+                waves=waves,
+                weights=weights,
+                flux_bounds=flux_bounds,
+                fwhm_bounds=fwhm_bounds,
+                temp_bounds=temp_bounds,
+                tau_bounds=tau_bounds,
+                scale_bounds=scale_bounds,
+                ratio_bounds=ratio_bounds,
+                allow_interp_fitting=allow_interp_fitting,
+                fixed=fixed,
+            )
+            self.checkModelCoverage.__wrapped__(
+                self,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                min_fittable_ratio=min_fittable_ratio,
+                min_fittable_total=min_fittable_total,
+            )
+            self.getRasterFit.__wrapped__(
+                self,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                bg_flux=bg_flux,
+                raster_n=raster_n,
+                covered=covered,
+            )
+
         self.performFineTuning.__wrapped__(
             self,
             without_rejections=without_rejections,
@@ -168,6 +177,7 @@ class BalmerWindows(SpecList[BWindow]):
             bg_flux=bg_flux,
             fitter=fitter,
         )
+        return True
 
     @validated_apply_info_to_method(
             subjects=('balmer',),
@@ -419,15 +429,16 @@ class BalmerWindows(SpecList[BWindow]):
                     inplace=False,
                 )
             msg += f"Finished fine-tuning in {1e3*watch.elapsed:.1f} ms."
+            self.applyFit.__wrapped__(
+                self, 
+                fit, 
+                fit_info=fit_info, 
+                update_emission=True,
+            )
+
         except ValidationError as e:
             msg += f"Failed fitting due to validation error: {e}"
             logger.critical(msg)
-
-            fit = model
-            fit_info = OptimizeResult()
-
-        self.applyFit.__wrapped__(self, fit, fit_info)
-        self.updateBalmerEmission.__wrapped__(self, fit)
 
         return self
         
@@ -444,41 +455,44 @@ class BalmerWindows(SpecList[BWindow]):
         return self.fit or self.model
     
     @validate_call
-    def applyFit(
-        self,
-        fit: BalmerModel,
-        fit_info: FitInfo,
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-
-        Applies the given Balmer pseudo-continuum fit.
-
-        Notes
-        -----
-        This method does NOT update the Balmer pseudo-continuum emission array,
-        '_y_ba'. This should be updated separately using 'updateBalmerEmission'.
-        """
-        self.fit = fit
-        self.fit_info = fit_info
-
-        for bwindow in self:
-            bwindow.applyFit.__wrapped__(bwindow, fit, fit_info)
-
-        return self
-    
-    @validate_call
     def adoptFit(
         self,
         fit: BalmerModel,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
+        Identical to 'applyFit'.
+        """
+        return self.applyFit.__wrapped__(
+            self,
+            fit,
+            fit_info=fit_info,
+            update_emission=update_emission,
+        )
+
+    @validate_call
+    def applyFit(
+        self,
+        fit: BalmerModel,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> Self:
+        """
+        Applies the given Balmer pseudo-continuum fit.
         """
         self.fit = fit
-        self.fit_info = None
+        self.fit_info = fit_info
+        
+        if update_emission:
+            self.updateBalmerEmission.__wrapped__(self, fit)
 
-        for bwindow in self:
-            bwindow.adoptFit.__wrapped__(bwindow, fit)
+            for bwindow in filter(lambda w: w._y_ba is not self._y_ba, self):
+                bwindow.updateBalmerEmission.__wrapped__(
+                    bwindow,
+                    fit,
+                )
 
         return self

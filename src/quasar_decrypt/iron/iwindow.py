@@ -2,7 +2,7 @@ from logging import getLogger
 from typing import ClassVar
 from dataclasses import dataclass
 
-from ..utils.specdata import SpecData
+from quasar_decrypt.utils.specdata import SpecData
 from quasar_typing.misc import BackgroundFlux
 
 logger = getLogger(__name__)

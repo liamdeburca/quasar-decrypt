@@ -8,7 +8,7 @@ from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from numpy import (
     inf, array, empty, invert, interp, exp, linspace, convolve, argmax, 
-    isfinite, diff, unique
+    isfinite, unique, zeros_like,
 )
 from scipy.ndimage import binary_dilation
 
@@ -18,9 +18,6 @@ from .utils import common_middle
 
 from ..ml import Under, Over
 
-from pydantic import validate_call
-from pydantic_core import ValidationError
-
 from quasar_errors.bootstrapping import BaseBootstrapper
 from quasar_errors.error_result import ErrorResult
 from quasar_errors.spectrum_utils.format_bootstrapping_kwargs_for_lwindow \
@@ -29,20 +26,19 @@ from quasar_errors.spectrum_utils.format_bootstrapping_kwargs_for_lwindow \
 from quasar_typing.numpy import BoolVector, FloatVector, RandomState_
 from quasar_typing.bounds import AstropyBounds
 from quasar_typing.pathlib import AbsoluteDirPath, RelativeFilePath
-from quasar_typing.astropy import (
-    FitInfo, FitterInstance, QTable_, CompoundModel_,
-)
+from quasar_typing.astropy import FitInfo, QTable_, CompoundModel_
 from quasar_typing.misc import (
     Scale, Variant, BootstrapType, VaryLines, FWHMStrategy, BackgroundFlux, 
     ModelTypes, OutLines, OutMeasures,
 )
 from quasar_typing.misc.pool import Pool_
 
-from quasar_utils.decorators import validated_apply_info_to_method
+from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.continuum_fit_result import ContinuumFitResult
+from quasar_utils.fitting import FitterInstance
 
 from quasar_models import PowerLawModel, GaussianModel, IronModel, BalmerModel
-from quasar_models.line import _VProfileCopy, VProfileCopyDict
+from quasar_models.line import _VProfileCopy, VProfileCopyDict, VProfileCopy1G
 from quasar_models.utils.astropy import apply_bounds, order_submodels
 
 from quasar_plotting import quickplot, absorptionplot, fitplot
@@ -68,16 +64,18 @@ class LWindow(SpecData):
     v_off_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
     
     is_copy_of: dict[str, str] = field(default_factory=dict, init=False)
+    is_multiplet_of: dict[str, str] = field(default_factory=dict, init=False)
     scale_init: dict[str, float] = field(default_factory=dict, init=False)
     scale_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
+    scale_fixed: dict[str, bool] = field(default_factory=dict, init=False)
     
-    copies_to: dict[str, list[tuple[int, str]]] = field(default_factory=lambda: defaultdict(list), init=False)
+    copies_to: dict[str, list[tuple[int | None, str]]] = field(default_factory=lambda: defaultdict(list), init=False)
     i_bounds: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
     blacklist: dict[str, bool] = field(default_factory=dict, init=False)
     _blacklist: dict[str, bool] = field(default_factory=dict, init=False)
     
     neighbours: tuple[_SpecData | None, _SpecData | None] = field(default=(None, None), init=False)
-    prev_model: LineModel | None = field(default=None, init=False)
+    # prev_model: LineModel | None = field(default=None, init=False)
     model: LineModel | None = field(default=None, init=False)
     fit: LineModel | None = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
@@ -89,6 +87,8 @@ class LWindow(SpecData):
 
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
+
+    _y_em_contrib: FloatVector = field(init=False)
     
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'em'})
 
@@ -106,8 +106,10 @@ class LWindow(SpecData):
         self.is_copy_of = {}
         self.scale_init = {}
         self.scale_bounds = {}
+        self.scale_fixed = {}
 
         self.copies_to = defaultdict(list)
+        self.is_multiplet_of = {}
         self.i_bounds = {}
         self.blacklist = {}
         self._blacklist = {}
@@ -116,6 +118,8 @@ class LWindow(SpecData):
         self.fit_infos = {}
 
         self.cropped = set()
+
+        self._y_em_contrib = zeros_like(self._y)
 
     @property
     def sample(self) -> GaussianSampleList | None:
@@ -156,20 +160,21 @@ class LWindow(SpecData):
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
 
         with stopwatch() as watch:
-            success = self.prepareLines.__wrapped__(
-                self,
-                v_sep = v_sep,
-                min_fittable_total = min_fittable_total,
-                min_fittable_ratio = min_fittable_ratio,
-            )
-            if not success: 
-                logger.warning(">>> Failed pipeline during 'prepareLines'!")
+            try:
+                self.prepareLines.__wrapped__(
+                    self,
+                    v_sep=v_sep,
+                    min_fittable_total=min_fittable_total,
+                    min_fittable_ratio=min_fittable_ratio,
+                )
+            except Exception as e:
+                logger.warning(f"Failed pipeline during `prepareLines` due to: {e}")
                 return False
-            
+                        
             if with_neighbours:
                 success = self.prepareNeighbours.__wrapped__(
                     self,
-                    sigma_res = sigma_res,
+                    sigma_res=sigma_res,
                 )
                 if not success: 
                     logger.warning(
@@ -179,10 +184,10 @@ class LWindow(SpecData):
 
             success = self.instantiateModels.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
             )
             if not success: 
                 logger.warning(
@@ -192,12 +197,12 @@ class LWindow(SpecData):
 
             success = self.makeInitialFit.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                evaluate_initial = evaluate_initial,
-                fitter = fitter,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                evaluate_initial=evaluate_initial,
+                fitter=fitter,
             )
             if not success:
                 logger.warning(
@@ -207,19 +212,19 @@ class LWindow(SpecData):
             
             success = self.makeFinalFit.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                limited = limited,
-                w = w,
-                aggressive = aggressive,
-                crop = crop,
-                measure = measure,
-                reverse = reverse,
-                evaluate_initial = evaluate_initial,
-                v_sep = v_sep,
-                fitter = fitter,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                limited=limited,
+                w=w,
+                aggressive=aggressive,
+                crop=crop,
+                measure=measure,
+                reverse=reverse,
+                evaluate_initial=evaluate_initial,
+                v_sep=v_sep,
+                fitter=fitter,
             )
             if not success:
                 logger.warning(
@@ -353,6 +358,7 @@ class LWindow(SpecData):
         sigma_v_bounds: AstropyBounds | None = None,
         scale_init: float | None = None,
         scale_bounds: AstropyBounds | None = None,
+        scale_fixed: bool | None = None,
         force_add: bool = False,
     ) -> bool:
         """
@@ -378,12 +384,12 @@ class LWindow(SpecData):
             or force_add:
             self.names.add(name)
             
-            self.lines          [name] = line
-            self.n_maxs         [name] = n_max
+            self.lines           [name] = line
+            self.n_maxs          [name] = n_max
 
-            self.strength_bounds[name] = strength_bounds
-            self.sigma_v_bounds [name] = sigma_v_bounds
-            self.v_off_bounds   [name] = v_off_bounds
+            self.strength_bounds [name] = strength_bounds
+            self.sigma_v_bounds  [name] = sigma_v_bounds
+            self.v_off_bounds    [name] = v_off_bounds
 
             if bool(needs_line):
                 self.needs_line  [name] = needs_line
@@ -391,7 +397,8 @@ class LWindow(SpecData):
             if bool(is_copy_of):
                 self.is_copy_of  [name] = is_copy_of
                 self.scale_init  [name] = scale_init
-                self.scale_bounds[name] = scale_bounds  
+                self.scale_bounds[name] = scale_bounds
+                self.scale_fixed [name] = scale_fixed
 
             return True
 
@@ -401,13 +408,12 @@ class LWindow(SpecData):
     def prepareLines(
         self, 
         *,
+        grade_lines: bool = True,
         v_sep: float | None = None,
         min_fittable_total: int | None = None,
         min_fittable_ratio: float | None = None,
-    ) -> bool:
+    ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Performs the following steps:
         1.  Sorts the expected emission lines, and truncates the SubSlice if 
             necessary. 
@@ -432,7 +438,7 @@ class LWindow(SpecData):
 
         if len(self.lines) == 0:
             # No lines to consider.
-            return False
+            return self
         
         elif len(self.lines) == 1:
             # Only one line to consider.
@@ -506,18 +512,37 @@ class LWindow(SpecData):
                     min(curr_bounds[1], x2_dict[line] / line - 1),
                 )
 
-        # STEP 2
-        for name, n_max in self.n_maxs.items():
-            self.blacklist [name] = (n_max == 1)
-            self._blacklist[name] = (n_max == 1)
+        # Check multiplets
+        self.is_multiplet_of.clear()
+        self.copies_to.clear()
+        for mimic, master in filter(
+            lambda item: item[1] in self.names, 
+            self.is_copy_of.items(),
+        ):
+            self.is_multiplet_of[mimic] = master  
+            self.copies_to[master].append((None, mimic))
 
-        return self.gradeLines.__wrapped__(
-            self,
-            with_neighbours = True,
-            min_fittable_total = min_fittable_total,
-            min_fittable_ratio = min_fittable_ratio,
-            v_sep = v_sep,
-        )
+        # STEP 2
+        for name in self.names:
+            # Blacklist lines which are:
+            # - Limited to a single Gaussian, or
+            # - Copies of other lines.
+            self.blacklist[name] = self._blacklist[name] = any([
+                self.n_maxs[name] == 1,
+                name in self.is_copy_of,
+                name in self.is_multiplet_of,
+            ])
+
+        if grade_lines:
+            _ = self.gradeLines.__wrapped__(
+                self,
+                with_neighbours=True,
+                min_fittable_total=min_fittable_total,
+                min_fittable_ratio=min_fittable_ratio,
+                v_sep=v_sep,
+            )
+        
+        return self
 
     @validated_apply_info_to_method(subjects=('loading',), specific_kwargs={'sigma_res'})
     def prepareNeighbours(
@@ -577,15 +602,17 @@ class LWindow(SpecData):
 
         lines_to_remove: set[str] = set()
 
-        self.sortLines()
-        for name, line in self.lines.items():
+        for name, line in self.sortLines():
+            if (name in self.is_copy_of) or (name in self.is_multiplet_of):
+                continue
+
             mask = self.getMask.__wrapped__(
                 self,
-                with_neighbours = with_neighbours,
-                covered = True,
-                line = line,
-                limited = True,
-                v_sep = v_sep,
+                with_neighbours=with_neighbours,
+                covered=True,
+                line=line,
+                limited=True,
+                v_sep=v_sep,
             )
             absorbed_pixels = self._absorbed_pixels[mask]
             valid_pixels = self._valid_pixels[mask]
@@ -619,7 +646,7 @@ class LWindow(SpecData):
         for name in lines_to_remove: 
             self.removeLine(name)
 
-        return True
+        return self
 
     @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
     def instantiateModels(
@@ -668,25 +695,36 @@ class LWindow(SpecData):
             .format(self.__str__(True).removesuffix('.'))
         )
 
-        self.sortLines()
-        models = []
-        for name, line in self.lines.items():
+        models: dict[str, GaussianModel] = {}
+        for name, line in self.sortLines():
             if line in self.cropped:
+                continue
+
+            if name in self.is_multiplet_of:
+                models[name] = VProfileCopy1G.from_model(
+                    line, 
+                    name, 
+                    models[self.is_multiplet_of[name]],
+                    strength_scale_value=self.scale_init[name],
+                    strength_scale_bounds=self.scale_bounds[name],
+                    strength_scale_fixed=self.scale_fixed[name],
+                    freeze=False,
+                )
                 continue
 
             x, y, _, y_smooth = self.getMaskedCoords.__wrapped__(
                 self,
-                valid = True,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                line = name,
-                limited = True,
-                v_sep = v_sep,
+                valid=True,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                line=name,
+                limited=True,
+                v_sep=v_sep,
             )
             try:
-                model = GaussianModel.instantiate(
+                models[name] = GaussianModel.instantiate(
                     line,
                     x, y, y_smooth,
                     name = name,
@@ -707,12 +745,11 @@ class LWindow(SpecData):
                 )
                 continue
 
-            models.append(model)
-
         if len(models) == 0: 
             return False
-
-        self.model = sum(models[1:], start=models[0])
+        
+        submodels = list(models.values())
+        self.model = sum(submodels[1:], start=submodels[0])
         # Remove current fit if existant
         self.fit = None
 
@@ -751,50 +788,33 @@ class LWindow(SpecData):
         
         coords = self.getMaskedCoords.__wrapped__(
             self,
-            covered = True,
-            valid = True,
-
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            bg_flux = bg_flux,
+            covered=True,
+            valid=True,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            bg_flux=bg_flux,
         )[:3]
         msg += f"no. of Gaussians: {self.model.n_submodels}, "
         msg += f"no. of data points: {len(coords[0])}. "
         
-        try:
-            with stopwatch() as watch:
-                fit, fit_info = fitter(
-                    self.model,
-                    *coords, 
-                    False,
-                )
-        except ValidationError as e:
-            logger.warning(
-                msg + f"Failed fitting due to validation error:\n{e}"
+        with stopwatch() as watch:
+            fit, fit_info = fitter(
+                self.model,
+                *coords, 
+                False,
             )
-            return False
-        except ValueError as e:
-            ms = [self.model] if self.model.n_submodels == 1 else self.model
-            for m in ms:
-                msg += f"Model: {m.name}, "
-                msg += "strength: {:.1e}|{:.1e}|{:.1e}, ".format(m.strength.value, *m.strength.bounds)
-                msg += "sigma_v: {:.1e}|{:.1e}|{:.1e}, ".format(m.sigma_v.value, *m.sigma_v.bounds)
-                msg += "v_off: {:.1e}|{:.1e}|{:.1e}, ".format(m.v_off.value, *m.v_off.bounds)
-                msg += "\n"
-            raise ValueError(msg + f"Failed fitting due to value error:\n{e}")
         
         msg += "Finished fitting in {:.1f} ms." \
             .format(1e3 * watch.elapsed)
         logger.debug(msg)
 
         self.applyFit.__wrapped__(
-            self, fit, fit_info,
-            freeze = False,
+            self,
+            fit,
+            fit_info=fit_info,
+            update_emission=update_flux,
         )
-        if update_flux: 
-            self.updateLinesEmission.__wrapped__(self, fit)
-
         return True
     
     @validated_apply_info_to_method(subjects=('lines', 'nonlinear'))
@@ -809,8 +829,6 @@ class LWindow(SpecData):
         fitter: FitterInstance | None = None,
     ) -> bool:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         If necessary, instantiates the initial model (one profile function per 
         known emission line), and fits the model. 
         """
@@ -820,21 +838,21 @@ class LWindow(SpecData):
         if self.model is None:
             success = self.instantiateModels.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
             )
             if not success: 
                 return False
 
         success = self.fitModel.__wrapped__(
             self,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            fitter = fitter,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            fitter=fitter,
         )
         if not success: 
             return False
@@ -842,23 +860,22 @@ class LWindow(SpecData):
         if isinstance(evaluate_initial, (int, float)):
             x, _, dy = self.getMaskedCoords.__wrapped__(
                 self,
-                covered = True,
-                valid = True,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
+                covered=True,
+                valid=True,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
             )[:3]
 
-            for f in ([self.fit] if self.fit.n_submodels == 1 else self.fit):
-                pure_name: str = f.pure_name
-                
-                if self.blacklist[pure_name]: 
-                    continue
-
+            fs = (self.fits,) if self.fit.n_submodels == 1 else self.fit
+            for f in filter(
+                lambda f: not self.blacklist[f.pure_name], 
+                fs,
+            ):
                 # Interpolate noise level and compare with peak flux density
                 crit_val = evaluate_initial * interp(f.mu, x, dy)
-                self.blacklist[pure_name] = (f.peak < crit_val)
+                self.blacklist[f.pure_name] = (f.peak < crit_val)
 
         return True
 
@@ -871,51 +888,52 @@ class LWindow(SpecData):
         without_absorption: bool = False,
         with_neighbours: bool = False,
         w: int | None = None,            #! Make 'lines'-specific window size?
-    ) -> GaussianModel:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+    ) -> tuple[GaussianModel, bool]:
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        n = self.fit.n_submodels
         x, y, dy = self.getMaskedCoords.__wrapped__(
             self,
-            covered = True,
-            valid = True,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
+            covered=True,
+            valid=True,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
         )[:3]
 
-        if (n == 1):
-            f = self.fit
-            data = (x, dy, (y - f(x)) / dy)
+        if self.fit.n_submodels == 1:
+            data = (x, dy, (y - self.fit(x)) / dy)
+            submodel = self.fit
         else:
+            fs = self.fit
             h = w // 2
 
-            valid_lines: list = [
-                f
-                for f in self.fit
-                if not self.blacklist[f.pure_name]
-            ]
+            # Filter out blacklisted lines, including velocity profile copies.
+            valid_lines = list(filter(
+                lambda f: not self.blacklist[f.pure_name],
+                fs,
+            ))
             waves = [f.wave for f in valid_lines]
 
             z = abs((y - self.fit(x)) / dy)
             z_convolved = convolve(
                 z, 
                 exp(-linspace(-3, 3, w)**2), 
-                mode = 'valid',
+                mode='valid',
             )
             z_interp = interp(waves, x[h:-h], z_convolved)
 
-            f = valid_lines[argmax(z_interp).flatten()[0]]
-            (lb, ub) = self.i_bounds[f.pure_name]
+            submodel: GaussianModel = valid_lines[argmax(z_interp).flatten()[0]]
+            (lb, ub) = self.i_bounds[submodel.pure_name]
             mask = (lb <= x) & (x < ub)
             data = (x[mask], dy[mask], z[mask])
 
-        return f.makeCopy(*data)
+        # Check if submodel is a 'master' model in a multiplet
+        return (
+            submodel.makeCopy(*data),
+            submodel.pure_name in self.is_multiplet_of.values(),
+        )
     
     @validated_apply_info_to_method(subjects=('lines', 'nonlinear'))
     def makeFinalFit(
@@ -937,7 +955,6 @@ class LWindow(SpecData):
         fitter: FitterInstance | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
         !!! veto func?
         """
         if bg_flux is None:
@@ -962,23 +979,18 @@ class LWindow(SpecData):
             # No additional models necessary
             continue_fitting = False
         
-        elif self.fit.n_submodels <= 2:        
+        elif self.fit.n_submodels <= 2:
             # Check if under-fitted
-            line = (
-                self.fit.wave
-                if self.fit.n_submodels == 1
-                else None
-            )
             continue_fitting = self.isUnderFitted.__wrapped__(
                 self,
                 self.fit.n_submodels,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                line = line,
-                limited = limited,
-                v_sep = v_sep,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                line=self.fit.wave if self.fit.n_submodels == 1 else None,
+                limited=limited,
+                v_sep=v_sep,
             )
 
         current_config = self.getConfiguration()
@@ -990,24 +1002,46 @@ class LWindow(SpecData):
                 break
 
             # Add a line component
-            new_model = self.addLine.__wrapped__(
+            new_model, check_multiplet = self.addLine.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                w = w,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                w=w,
             )
             current_config[new_model.pure_name] += 1
 
             self.model = self.fit + new_model
+            if check_multiplet:
+                # The new model is a master model in a multiplet. Add a Gaussian 
+                # component to each mimic line.
+                for mimic in (
+                    mimic
+                    for window_idx, mimic 
+                    in self.copies_to[new_model.pure_name]
+                    if window_idx is None
+                ):
+                    mimic_model = VProfileCopy1G.from_model(
+                        self.lines[mimic],
+                        mimic,
+                        new_model,
+                        strength_scale_value=self.scale_init[mimic],
+                        strength_scale_bounds=self.scale_bounds[mimic],
+                        strength_scale_fixed=self.scale_fixed[mimic],
+                        freeze=False,
+                    )
+
+                    self.model += mimic_model
+                    current_config[mimic] += 1
+
             self.fitModel.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                fitter = fitter,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                fitter=fitter,
             )
 
             # Check if current configuration has already been tried
@@ -1022,13 +1056,13 @@ class LWindow(SpecData):
                 self,
                 self.fit.n_submodels - 1,
                 self.fit.n_submodels, 
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                line = new_model.wave,
-                limited = limited,
-                v_sep = v_sep,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                line=new_model.wave,
+                limited=limited,
+                v_sep=v_sep,
             )
             if is_over or False: #? 'False' is placeholder for VETO function
                 # Check whether models are saturated (blacklisted) or touching 
@@ -1072,15 +1106,15 @@ class LWindow(SpecData):
         if crop:
             self.cropFit.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                limited = limited,
-                v_sep = v_sep,
-                measure = measure,
-                reverse = reverse,
-                fitter = fitter, 
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                limited=limited,
+                v_sep=v_sep,
+                measure=measure,
+                reverse=reverse,
+                fitter=fitter, 
             )
         else:
             self.updateLinesEmission.__wrapped__(self, self.fit)
@@ -1238,19 +1272,16 @@ class LWindow(SpecData):
         else:
             #* Recursion ends -> update 'fit' and 'fit_info' attributes
             self.applyFit.__wrapped__(
-                self, fit, fit_info,
-                freeze = False,
-            )
-            self.updateLinesEmission.__wrapped__(
-                self, fit,
+                self,
+                fit,
+                fit_info=fit_info,
+                update_emission=True,
             )
             return True
 
     @validate_call
     def getModel(self, thaw: bool = False) -> CompoundModel_ | None:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Retrieves this 'LWindow's current fit/model if available. 
 
         NOTES
@@ -1266,7 +1297,14 @@ class LWindow(SpecData):
         if thaw:
             fit = fit.copy()
             fs = (fit,) if fit.n_submodels == 1 else fit
-            for f in filter(lambda f: isinstance(f, _VProfileCopy), fs):
+
+            def filter_func(f):
+                # True if submodel is a velocity profile copy, but not a part of 
+                # a multiplet.
+                return isinstance(f, _VProfileCopy) \
+                    and f.pure_name not in self.is_multiplet_of
+
+            for f in filter(filter_func, fs):
                 f._thaw_velocity_profile(inplace=True)
                 f._remember_ties(inplace=True)
 
@@ -1338,7 +1376,10 @@ class LWindow(SpecData):
             line_windows = self.spectrum.em
 
         for master, children in self.copies_to.items():
-            for idx_d, mimic in children:
+            for idx_d, mimic in filter(
+                lambda item: item[0] is not None,
+                children,
+            ):
                 lwindow = line_windows[idx_d]
 
                 # Check if master line has been cropped
@@ -1425,15 +1466,60 @@ class LWindow(SpecData):
         return self
 
     @validate_call
+    def adoptFit(
+        self,
+        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> Self:
+        self.fits.clear()
+        self.fit_infos.clear()
+
+        n = fit.n_submodels
+        self.fits[n] = self.fit = self.model = fit
+        self.fit_infos[n] = self.fit_info = fit_info
+
+        # Update parameter bounds
+        for f in ((fit,) if fit.n_submodels == 1 else fit):
+            pure_name = f.pure_name
+
+            if isinstance(f, GaussianModel):
+                self.strength_bounds[pure_name] = f.strength.bounds
+                self.sigma_v_bounds[pure_name] = f.sigma_v.bounds
+                self.v_off_bounds[pure_name] = f.v_off.bounds
+
+            if isinstance(f, _VProfileCopy):
+                if pure_name not in self.is_copy_of:
+                    msg = "Found velocity profile copy, '{}', with no "\
+                        "corresponding entry in 'is_copy_of' dict: {}"\
+                        .format(pure_name, self.is_copy_of)
+                    raise ValueError(msg)
+
+                self.scale_init[pure_name]   = f.strength_scale.value
+                self.scale_bounds[pure_name] = f.strength_scale.bounds
+                self.scale_fixed[pure_name]  = f.strength_scale.fixed
+
+        # Update n_max values
+        self.n_maxs.update(self.getConfiguration())
+
+        # Update blacklist
+        for name in self.names:
+            self.blacklist[name] = self._blacklist[name] = True
+
+        if update_emission:
+            self.updateLinesEmission.__wrapped__(self, fit)
+    
+    @validate_call
     def applyFit(
         self,
-        fit: GaussianModel | CompoundModel_[GaussianModel],
-        fit_info: FitInfo,
-        freeze: bool = False
+        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        *,
+        fit_info: FitInfo | None = None,
+        freeze: bool = False,
+        update_emission: bool = False,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        
+        """        
         Applies the 'fit' and 'fit_info' values to this 'LWindow' class. 
 
         NOTES
@@ -1447,37 +1533,12 @@ class LWindow(SpecData):
                 f._freeze_velocity_profile(inplace=True)
                 f._forget_ties(inplace=True)
 
-        self.fit = fit
-        self.fit_info = fit_info
-        
         n = fit.n_submodels
-        self.fits[n] = fit
-        self.fit_infos[n] = fit_info
+        self.fits[n] = self.fit = fit
+        self.fit_infos[n] = self.fit_info = fit_info
 
-        return self
-    
-    @validate_call
-    def adoptFit(
-        self,
-        fit: GaussianModel | CompoundModel_[GaussianModel],
-        freeze: bool = False
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        if freeze:
-            fit = fit.copy()
-            fs = (fit,) if fit.n_submodels == 1 else fit
-            for f in (f for f in fs if isinstance(f, _VProfileCopy)):
-                f._freeze_velocity_profile(inplace=True)
-                f._forget_ties(inplace=True)
-
-        n = fit.n_submodels
-        self.fit = fit
-        self.fit_info = None
-        
-        self.fits[n] = fit
-        self.fit_infos[n] = None
+        if update_emission:
+            self.updateLinesEmission.__wrapped__(self, fit)
 
         return self
 
@@ -1497,14 +1558,18 @@ class LWindow(SpecData):
         If 'model' is not given, i.e. None, the previous model's contribution
         is removed. 
         """
-        mask = isfinite(self._x)
-        if self.prev_model is not None:
-            self._y_em[mask] -= self.prev_model(self._x[mask])
-            self.prev_model = None
+        # Subtract previous contribution
+        self._y_em -= self._y_em_contrib
+
+        # Calculate new contribution
+        self._y_em_contrib[:] = 0
 
         if model is not None:
-            self._y_em[mask] += model(self._x[mask])
-            self.prev_model = model.copy()
+            mask = isfinite(self._x)
+            self._y_em_contrib[mask] = model(self._x[mask])
+
+            # Add current contribution
+            self._y_em[mask] += self._y_em_contrib[mask]
 
         return self
 
@@ -1532,41 +1597,30 @@ class LWindow(SpecData):
             del self._blacklist[name]
 
         return self
+    
+    def sortLines(self) -> list[tuple[str, float]]:
+        def sorting_key(item: tuple[str, float]) -> tuple[float, float]:
+            return (
+                0.0 if item[0] in self.is_multiplet_of.values() else 1.0,
+                item[1]
+            )
+        return sorted(self.lines.items(), key=sorting_key)
 
-    def sortLines(self) -> Self:
+    def getConfiguration(
+        self,
+        *,
+        model: CompoundModel_ | None = None,
+    ) -> dict[str, int]:
+        """
+        Counts the number of submodels with the same `pure_name` attribute in 
+        the output of `self.getModel()`.
+        """
+        if model is None:
+            model = self.getModel()
 
-        if (diff(list(self.lines.values())) > 0).all(): 
-            return self
-
-        self.lines: dict[str, float] = dict(sorted(
-            self.lines.items(),
-            key=lambda item: item[1],
-        ))
-        self.names = set(self.lines.keys())
-
-        # def _sorted_dict(d: dict, lines=self.lines) -> dict:
-        #     return dict(sorted(
-        #         d.items(), key=lambda item: lines[item[0]],
-        #     ))
-
-        # self.n_maxs = _sorted_dict(self.n_maxs)
-        # self.strength_bounds = _sorted_dict(self.strength_bounds)
-        # self.sigma_v_bounds = _sorted_dict(self.sigma_v_bounds)
-        # self.v_off_bounds = _sorted_dict(self.v_off_bounds)
-
-        # if hasattr(self, 'i_bounds'):
-        #     self.i_bounds = _sorted_dict(self.i_bounds)
-        # if hasattr(self, 'blacklist'):
-        #     self.blacklist = _sorted_dict(self.blacklist)
-        # if hasattr(self, '_blacklist'):
-        #     self._blacklist = _sorted_dict(self._blacklist)
-
-        return self
-
-    def getConfiguration(self) -> dict[str, int]:
-
-        if (model := self.getModel()) is None: 
+        if model is None:
             return {}
+
         ms = (model,) if model.n_submodels == 1 else model
         return Counter(m.pure_name for m in ms)
     
@@ -1589,10 +1643,10 @@ class LWindow(SpecData):
             max_count = self.getConfiguration()
 
             for f in filter(lambda f: max_count[f.pure_name] > 1, fs):
-                f.name = '#'.join([
+                f.name = "{}#{}".format(
                     f.pure_name,
-                    str(current_count[f.pure_name]),
-                ])
+                    current_count[f.pure_name],
+                )
                 current_count[f.pure_name] += 1
 
             self.fit = sum(fs[1:], start=fs[0])

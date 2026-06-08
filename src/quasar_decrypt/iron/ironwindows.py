@@ -2,6 +2,7 @@ from logging import getLogger
 from typing import Self, Literal, ClassVar, Iterable
 from pathlib import Path
 from pydantic import ValidationError
+from numpy import isfinite
 from scipy.ndimage import binary_fill_holes
 from itertools import repeat
 from dataclasses import dataclass, field
@@ -10,13 +11,14 @@ from scipy.optimize import OptimizeResult
 from quasar_typing.numpy import FloatVector
 from quasar_typing.bounds import CoordBounds, AstropyBounds
 from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_typing.astropy import FitterInstance, FitInfo, CompoundModel_
+from quasar_typing.astropy import FitInfo, CompoundModel_
 from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.iron import IronModel, IronTemplate
 from quasar_models.utils.astropy import apply_bounds, get_free_params
 
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
+from quasar_utils.fitting import FitterInstance
 
 from quasar_errors.model_samples import IronSampleList
 
@@ -91,9 +93,11 @@ class IronWindows(SpecList[IWindow]):
     def __call__(
         self,
         *,
+        template_model: IronModel | CompoundModel_[IronModel] | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = True,
         without_absorption: bool = True,
-        bg_flux: BackgroundFlux | None = None,
+
         template_files: list[AbsoluteFITSPath] | None = None, 
         resample: bool | None = None,
         split: FloatVector | None = None,
@@ -114,35 +118,50 @@ class IronWindows(SpecList[IWindow]):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        self.loadTemplates.__wrapped__(
-            self,
-            template_files=template_files,
-            resample=resample,
-            split=split,
-            fwhm=fwhm,
-            bias=bias,
-            ratio=ratio,
-            scale=scale,
-            allow_interp_fitting=allow_interp_fitting,
-            flux_bounds=flux_bounds,
-            fwhm_bounds=fwhm_bounds,
-        )
-        if raster:
-            self.getRasterFit.__wrapped__(
+        if template_model is not None:
+            self.applyFit.__wrapped__(
                 self,
-                bg_flux=bg_flux,
-                covered=True,
-                without_rejections=without_rejections,
-                without_absorption=without_absorption,
+                template_model,
+                adopt_as_template=True,
             )
-        if fine_tune: 
             self.performFineTuning.__wrapped__(
                 self, 
                 bg_flux=bg_flux,
-                covered=True,
+                covered=not self.is_empty,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
                 fitter=fitter,
+            )
+        else:
+            self.loadTemplates.__wrapped__(
+                self,
+                template_files=template_files,
+                resample=resample,
+                split=split,
+                fwhm=fwhm,
+                bias=bias,
+                ratio=ratio,
+                scale=scale,
+                allow_interp_fitting=allow_interp_fitting,
+                flux_bounds=flux_bounds,
+                fwhm_bounds=fwhm_bounds,
+            )
+            if raster:
+                self.getRasterFit.__wrapped__(
+                    self,
+                    bg_flux=bg_flux,
+                    covered=not self.is_empty,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                )
+            if fine_tune: 
+                self.performFineTuning.__wrapped__(
+                    self, 
+                    bg_flux=bg_flux,
+                    covered=not self.is_empty,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    fitter=fitter,
             )
 
         return True
@@ -196,23 +215,20 @@ class IronWindows(SpecList[IWindow]):
         self.templates.clear()
         self.template_models.clear()
 
-        mask = self.getMask.__wrapped__(
-            self,
-            covered=not self.is_empty,
-            without_rejections=False,
-            without_absorption=False,
-            valid=True,
-        )
+        mask = isfinite(self._x)
+
+        if self.is_empty:
+            msg = "IronWindows is empty: using entire wavelength array to " \
+                "check coverages of IronTemplates."
+            logger.debug(msg)
+        else:
+            mask &= self.mask
+
         if mask.sum() < 2:
             msg = "Not enough valid pixels ({}) available to check coverage " \
                 "of any IronTemplate!".format(mask.sum())
             logger.warning(msg)
             return self
-        
-        if self.is_empty:
-            msg = "IronWindows is empty: using entire wavelength array to " \
-                "check coverages of IronTemplates."
-            logger.debug(msg)
 
         x = self._x[mask]
         for template_file, s, b, r in zip(
@@ -224,8 +240,8 @@ class IronWindows(SpecList[IWindow]):
                     info=self.info,
                 ).copy(with_matrices=True)
             except FileNotFoundError:
-                msg = f"Could not find template file '{template_file}' -> \
-                    Skipping."
+                msg = f"Could not find template file '{template_file}' -> "\
+                    "Skipping."
                 logger.warning(msg)
                 continue
 
@@ -273,7 +289,7 @@ class IronWindows(SpecList[IWindow]):
                 logger.warning(msg)
 
                 tx_wide = template.x[binary_fill_holes(template.data[-1] > 0)]
-                mask = self._valid_pixels \
+                mask = isfinite(self._x) \
                     & (tx_wide[0] <= self._x) & (self._x <= tx_wide[-1])
                 
                 template.createLogspace(self._x[mask], inplace=True, keep_x=True)
@@ -341,9 +357,9 @@ class IronWindows(SpecList[IWindow]):
             self,
             covered=covered,
             valid=True,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
         )
         n_pix = coords[0].size
 
@@ -366,32 +382,52 @@ class IronWindows(SpecList[IWindow]):
         """
         submodels = list(self.template_models.values())
         return sum(submodels[1:], start=submodels[0]) if submodels else None
+
+    @validate_call
+    def adoptFit(
+        self,
+        fit: IronModel | CompoundModel_[IronModel],
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> Self:        
+        self.fit_info = fit_info
+
+        self.templates.clear()
+        self.template_models.clear()
+
+        for template_model in ((fit,) if fit.n_submodels == 1 else fit):
+            self.templates[template_model.name] = template_model.template
+            self.template_models[template_model.name] = template_model
+
+        if update_emission:
+            self.updateIronEmission.__wrapped__(self, fit)
+
+            for iwindow in filter(lambda w: w._y_fe is not self._y_fe, self):
+                iwindow.updateIronEmission.__wrapped__(iwindow, fit)
+
+        return self
     
     @validate_call
     def applyFit(
         self,
         fit: IronModel | CompoundModel_[IronModel],
-        fit_info: FitInfo,
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+        
         self.fit_info = fit_info
-        for submodel in ((fit,) if fit.n_submodels == 1 else fit):
-            self.template_models[submodel.name] = submodel
-        return self
-    
-    @validate_call
-    def adoptFit(
-        self,
-        fit: IronModel | CompoundModel_[IronModel],
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self.fit_info = None
-        for submodel in ((fit,) if fit.n_submodels == 1 else fit):
-            self.template_models[submodel.name] = submodel
+        for template_model in ((fit,) if fit.n_submodels == 1 else fit):
+            key = template_model.name
+            self.template_models[template_model.name] = template_model
+
+        if update_emission:
+            self.updateIronEmission.__wrapped__(self, fit)
+
+            for iwindow in filter(lambda w: w._y_fe is not self._y_fe, self):
+                iwindow.updateIronEmission.__wrapped__(iwindow, fit)
+
         return self
     
     @validated_apply_info_to_method(subjects=('nonlinear',))
@@ -440,13 +476,14 @@ class IronWindows(SpecList[IWindow]):
         if n_pix <= n_free_params:
             msg += f"cancelling fine-tuning due to insufficient no. of data " \
                 f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
-            self.applyFit.__wrapped__(self, model, OptimizeResult())
+            self.applyFit.__wrapped__(
+                self, 
+                model,
+                update_emission=False,
+            )
             logger.warning(msg)
             return self
 
-        fit = model
-        fit_info = OptimizeResult()
-        fit, fit_info = fitter(model, *coords, inplace=False)
         try:
             with stopwatch() as watch:
                 fit, fit_info = fitter(model, *coords, inplace=False)
@@ -462,7 +499,10 @@ class IronWindows(SpecList[IWindow]):
             logger.warning(msg)
             return self
         
-        self.applyFit.__wrapped__(self, fit, fit_info)
-        self.updateIronEmission.__wrapped__(self, fit)
-        
+        self.applyFit.__wrapped__(
+            self, 
+            fit,
+            fit_info=fit_info,
+            update_emission=True,
+        )                
         return self

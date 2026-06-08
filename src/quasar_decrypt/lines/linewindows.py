@@ -11,19 +11,19 @@ from dataclasses import dataclass, field
 
 from .lwindow import LWindow
 from .graph_utils import Graph
-from ..utils.general import stopwatch
 from ..utils import SpecList, get_log
 
 from quasar_typing.numpy import FloatVector, BoolVector
 from quasar_typing.pathlib import AbsoluteFilePath
 from quasar_typing.pandas import LineList
-from quasar_typing.astropy import FitterInstance, CompoundModel_, FitInfo
+from quasar_typing.astropy import CompoundModel_, FitInfo
 from quasar_typing.misc import BackgroundFlux
 
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.pipeline.linelist import read_linelist
+from quasar_utils.fitting import FitterInstance
 
-from quasar_models.line import GaussianModel
+from quasar_models.line import GaussianModel, _VProfileCopy
 from quasar_models.utils.astropy import get_free_params
 
 from quasar_errors.model_samples import GaussianSampleList
@@ -96,6 +96,8 @@ class LineWindows(SpecList[LWindow]):
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
+        template_model: GaussianModel | CompoundModel_[GaussianModel] | None = None,
+
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
@@ -124,59 +126,80 @@ class LineWindows(SpecList[LWindow]):
         if bg_flux is None:
             bg_flux = self.default_bg
         
-        _n: int = 3 + len(self)
-
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
         self.updateLinesEmission()
 
-        with stopwatch() as watch:
-            logger.debug(f">>> [1/{_n}] Applying line list.")
-            success = self.applyLineList.__wrapped__(
+        ### 'applyLineList'
+        msg = "Applying line list: "
+        success = self.applyLineList.__wrapped__(
+            self,
+            linelist,
+            sigma_res = sigma_res,
+            v_sep = v_sep,
+            forced_splits = forced_splits,
+            min_fittable_total = min_fittable_total,
+            min_fittable_ratio = min_fittable_ratio,
+        )
+        if success:
+            logger.debug(msg + "success!")
+        if not success: 
+            logger.warning(msg + "failed!")
+            return False
+        
+        if template_model is not None:
+            logger.debug("Applying template model.")
+            self.applyFit.__wrapped__(
                 self,
-                linelist,
-                sigma_res = sigma_res,
-                v_sep = v_sep,
-                forced_splits = forced_splits,
-                min_fittable_total = min_fittable_total,
-                min_fittable_ratio = min_fittable_ratio,
+                template_model,
+                adopt_as_template=True,
             )
-            if not success: 
-                logger.warning("Failed pipeline during 'applyLineList'!")
-                return False
-            
-            logger.debug(f">>> [2/{_n}] Instantiating models.")
             for lwindow in self:
+                lwindow.fitModel.__wrapped__(
+                    lwindow,
+                    update_flux=True,
+                    bg_flux=bg_flux,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
+                    fitter=fitter,
+                )
+        else:
+            ### 'instantiateModels'
+            msg = "Instantiating models: "
+            for i, lwindow in enumerate(self):
                 success = lwindow.instantiateModels.__wrapped__(
                     lwindow,
-                    bg_flux = bg_flux,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    with_neighbours = with_neighbours,
+                    bg_flux=bg_flux,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    with_neighbours=with_neighbours,
                 )
                 if not success:
-                    logger.warning(
-                        ">>> Failed pipeline during 'instantiateModels' on {}!" \
-                        .format(lwindow.__str__(True).removesuffix('.'))
-                    )
+                    logger.warning(msg + f"failed on LWindow no. {i}!")
                     return False
+            logger.debug(msg + "success!")
 
-            logger.debug(f">>> [3/{_n}] Identifying appropriate fitting sequence.")
+            ### 'getFittingSequence'
+            msg = "Getting fitting sequence: "
             fitting_sequence = self.getFittingSequence()
+            try:
+                logger.debug(msg + "success!")
+            except Exception:
+                logger.warning(msg + "failed!")
+                return False
+            
+            if make_copies:
+                msg = "Applying velocity profile copies: "
+                if self.graph.is_circular:
+                    logger.warning(msg + "Circular graph detected -> continuing.")
+                    make_copies = False
+                else:
+                    logger.debug(msg + f"success: {fitting_sequence=}!")
 
-            apply_vel_copies: bool = make_copies
-            if apply_vel_copies:
-                logger.debug(
-                    ">>> Circular graph -> no velocity profiles copied!" \
-                    if self.graph.is_circular else \
-                    ">>> Graph is valid!"
-                )
-                apply_vel_copies ^= self.graph.is_circular
-
-            logger.debug(f">>> Fitting sequence: {fitting_sequence}")
-            for count, idx in enumerate(fitting_sequence, start=4):
-                logger.debug(f">>> [{count}/{_n}] Fitting 'LWindow' no. {idx}.")
-
+            msg = "Fitting Lwindows: "
+            for idx in fitting_sequence:
                 lwindow = self[idx]
+
                 success = lwindow.makeInitialFit.__wrapped__(
                     lwindow,
                     bg_flux=bg_flux,
@@ -187,12 +210,11 @@ class LineWindows(SpecList[LWindow]):
                     fitter=fitter,
                 )
                 if not success:
-                    logger.warning(
-                        ">>> Failed pipeline during 'makeInitialFit' on {}!" \
-                        .format(lwindow.__str__(True).removesuffix('.'))
-                    )
+                    msg += "failed during 'makeInitialFit' on LWindow no. "\
+                        f"{idx}!"
+                    logger.warning(msg)
                     return False
-
+                
                 success = lwindow.makeFinalFit.__wrapped__(
                     lwindow,
                     bg_flux=bg_flux,
@@ -210,19 +232,15 @@ class LineWindows(SpecList[LWindow]):
                     fitter=fitter,
                 )
                 if not success:
-                    logger.warning(
-                        ">>> Failed pipeline during 'makeFinalFit' on {}!" \
-                        .format(lwindow.__str__(True).removesuffix('.'))
-                    )
+                    msg += "failed during 'makeFinalFit' on LWindow no. "\
+                        f"{idx}!"
+                    logger.warning(msg)
                     return False
                 
-                if apply_vel_copies:
-                    lwindow.applyMyself()
-            
-        logger.debug(
-            "Finished entire pipeline in {:.1f} ms." \
-            .format(1e3 * watch.elapsed)
-        )
+                if make_copies:
+                    lwindow.applyMyself.__wrapped__(lwindow)
+            logger.debug(msg + "success!")
+
         return True
     
     @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
@@ -356,6 +374,7 @@ class LineWindows(SpecList[LWindow]):
                 
                 scale_init      = row['scale_init'],
                 scale_bounds    = (row['scale_lower'], row['scale_upper']),
+                scale_fixed     = row['scale_fixed'],
             )
             
             prev_line = line
@@ -464,7 +483,7 @@ class LineWindows(SpecList[LWindow]):
 
             ! FOR NOW the model to copy from must not be covered by the same
             ! 'LWindow' class. 
-            ! We can therefore skip everything if: len(self) < 2
+            ! We can therefore skip everything if: len(self) <= 1
 
         2.  Once the other 'LWindow' class has been found, update its 
             'copies_to' dictionary. Update the 'graph_edges' dictionary to
@@ -472,20 +491,20 @@ class LineWindows(SpecList[LWindow]):
         """
         self.graph: Graph = Graph(len(self))
 
-        if len(self) < 2:
+        if len(self) <= 1:
             return False
 
         for (idx_o, orig), (idx_d, dest) in product(
             enumerate(self),
-            filter(lambda tup: bool(tup[1].is_copy_of), enumerate(self)),
+            filter(lambda tup: tup[1].is_copy_of, enumerate(self)),
         ):
-            if idx_o == idx_d:
-                continue
-
-            for mimic, master in dest.is_copy_of.items():
-                if master not in orig.names:
+            for mimic, master in filter(
+                lambda item: item[1] in orig.names, 
+                dest.is_copy_of.items(),
+            ):
+                if idx_o == idx_d: 
                     continue
-
+                # Checks for velocity profile copies
                 self.graph[idx_o].add(idx_d)
                 orig.copies_to[master].append((idx_d, mimic))
 
@@ -518,14 +537,62 @@ class LineWindows(SpecList[LWindow]):
         return sum(models[1:], start=models[0]) if models else None
     
     @validate_call
+    def adoptFit(
+        self,
+        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        *,
+        fit_info: FitInfo | None = None,
+        update_emission: bool = False,
+    ) -> Self:
+        submodels = (fit,) if (fit.n_submodels == 1) else fit
+
+        count: int = 0
+        for lwindow in self:
+            fs = list(filter(lambda f: f.pure_name in lwindow.names, submodels))
+            if not fs:
+                continue
+
+            local_fit = sum(fs[1:], start=fs[0])
+            if fit_info is not None:
+                n_free = sum(get_free_params.__wrapped__(local_fit).values())
+                sel = slice(count, count+n_free)
+                local_fit_info = OptimizeResult(
+                    message =    fit_info.message,
+                    success =    fit_info.success,
+                    status =     fit_info.status,
+                    fun =        fit_info.fun,
+                    x =          fit_info.x[sel],
+                    cost =       fit_info.cost,
+                    jac =        fit_info.jac[sel,sel],
+                    grad =       fit_info.grad[sel],
+                    optimality = fit_info.optimality,
+                    nfev =       fit_info.nfev,
+                    njev =       fit_info.njev,
+                    param_cov =  fit_info.param_cov[sel,sel]
+                )
+                count += n_free
+            else:
+                local_fit_info = None
+
+            lwindow.adoptFit.__wrapped__(
+                lwindow,
+                local_fit,
+                fit_info=local_fit_info,
+                update_emission=update_emission,
+            )
+
+        return self
+    
+    @validate_call
     def applyFit(
         self,
-        fit: GaussianModel | CompoundModel_[GaussianModel],
-        fit_info: FitInfo,
+        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        *,
+        fit_info: FitInfo | None = None,
+        freeze: bool = False,
+        update_emission: bool = False,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Applies the 'fit' and 'fit_info' values to all 'LWindow' classes.
 
         Notes
@@ -535,59 +602,42 @@ class LineWindows(SpecList[LWindow]):
         other models' velocity profiles will have their parameters frozen and
         their 'tie' attributes disabled.
         """
-        fs = fit if (fit.n_submodels > 1) else [fit]
+        submodels = fit if (fit.n_submodels > 1) else [fit]
 
-        count = 0
+        count: int = 0
         for lwindow in self:
-            submodels = [f for f in fs if f.pure_name in lwindow.names]
-            if len(submodels) == 0:
+            fs = list(filter(lambda f: f.pure_name in lwindow.names, submodels))
+            if not fs:
                 continue
 
-            model = sum(submodels[1:], start=submodels[0])
-            n_free = sum(get_free_params.__wrapped__(model).values())
+            local_fit = sum(fs[1:], start=fs[0])
+            if fit_info is not None:
+                n_free = sum(get_free_params.__wrapped__(local_fit).values())
+                sel = slice(count, count+n_free)
+                local_fit_info = OptimizeResult(
+                    message =    fit_info.message,
+                    success =    fit_info.success,
+                    status =     fit_info.status,
+                    fun =        fit_info.fun,
+                    x =          fit_info.x[sel],
+                    cost =       fit_info.cost,
+                    jac =        fit_info.jac[sel,sel],
+                    grad =       fit_info.grad[sel],
+                    optimality = fit_info.optimality,
+                    nfev =       fit_info.nfev,
+                    njev =       fit_info.njev,
+                    param_cov =  fit_info.param_cov[sel,sel]
+                )
+                count += n_free
+            else:
+                local_fit_info = None
 
-            sel = slice(count, count+n_free)
-            finfo = OptimizeResult(
-                message =    fit_info.message,
-                success =    fit_info.success,
-                status =     fit_info.status,
-                fun =        fit_info.fun,
-                x =          fit_info.x[sel],
-                cost =       fit_info.cost,
-                jac =        fit_info.jac[sel,sel],
-                grad =       fit_info.grad[sel],
-                optimality = fit_info.optimality,
-                nfev =       fit_info.nfev,
-                njev =       fit_info.njev,
-                param_cov =  fit_info.param_cov[sel,sel]
-            )
             lwindow.applyFit.__wrapped__(
                 lwindow,
-                model, 
-                finfo,
-                freeze=True,
+                local_fit,
+                fit_info=local_fit_info,
+                freeze=freeze,
+                update_emission=update_emission,
             )
-            count += n_free
 
-        return self
-    
-    @validate_call
-    def adoptFit(
-        self,
-        fit: GaussianModel | CompoundModel_[GaussianModel],
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        fs = fit if (fit.n_submodels > 1) else (fit,)
-        for lwindow in self:
-            submodels = [f for f in fs if f.pure_name in lwindow.names]
-            if len(submodels) == 0:
-                continue
-
-            model = sum(submodels[1:], start=submodels[0])
-            lwindow.adoptFit.__wrapped__(
-                lwindow,
-                model,
-            )
         return self
