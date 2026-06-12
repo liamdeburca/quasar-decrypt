@@ -1,83 +1,20 @@
 from logging import getLogger
 from abc import abstractmethod
-from typing import Iterable, Self, Callable, TypeVar
+from typing import TypeVar
 from numpy import zeros_like, bool_
 from dataclasses import dataclass
 
-from quasar_typing.numpy import FloatVector, BoolVector, CoordsTuple
+from quasar_typing.numpy import BoolVector
 from quasar_typing.bounds import CoordBounds
 
-from quasar_utils.decorators import validate_call, validated_apply_info_to_method
-from quasar_utils.setup import Info
-
 from .specdata import SpecData
-from ._specdata import _SpecData
 
 T = TypeVar('T', bound='SpecData')
 
 logger = getLogger(__name__)
 
-@dataclass
+@dataclass(init=False)
 class SpecList(SpecData, list[T]):
-    @validate_call
-    def __init__(
-        self,
-        coords_or_spectrum: CoordsTuple | _SpecData,
-        *,
-        windows: Iterable[CoordBounds] | None = None,
-        x_bounds: CoordBounds | None = None,
-        info: Info = None,
-        y_smooth: FloatVector | None = None,
-        y_pl: FloatVector | None = None,
-        y_fe: FloatVector | None = None,
-        y_ba: FloatVector | None = None,
-        y_hg: FloatVector | None = None,
-        y_em: FloatVector | None = None,
-        rejected_pixels: BoolVector | None = None,
-        absorbed_pixels: BoolVector | None = None,
-        valid_pixels: BoolVector | None = None,
-        log_valid_pixels: BoolVector | None = None,
-        p_absorbed: FloatVector | None = None,
-        x0: float | None = None,
-        y0: float | None = None,
-        x_log: FloatVector | None = None,
-        y_log: FloatVector | None = None,
-        dy_log: FloatVector | None = None,
-        get_mask: Callable[[float, float], BoolVector] | None = None,
-    ):
-        super().__init__.__wrapped__(
-            self,
-            coords_or_spectrum,
-            x_bounds=x_bounds,
-            info=info,
-            y_smooth=y_smooth,
-            y_pl=y_pl,
-            y_fe=y_fe,
-            y_ba=y_ba,
-            y_hg=y_hg,
-            y_em=y_em,
-            rejected_pixels=rejected_pixels,
-            absorbed_pixels=absorbed_pixels,
-            valid_pixels=valid_pixels,
-            log_valid_pixels=log_valid_pixels,
-            p_absorbed=p_absorbed,
-            x0=x0,
-            y0=y0,
-            x_log=x_log,
-            y_log=y_log,
-            dy_log=dy_log,
-            get_mask=get_mask,
-        )
-        self.populate.__unvalidated__(self, windows=windows)
-
-    @validated_apply_info_to_method(subjects=tuple())
-    def populate(
-        self,
-        *, 
-        windows: Iterable[CoordBounds] | None = None,
-    ) -> Self:
-        return self
-
     def __str__(self, simple: bool = False) -> str:
 
         s = f"'{self.__class__.__name__}' class [" \

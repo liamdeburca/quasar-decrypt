@@ -46,17 +46,17 @@ class CWindow(SpecData):
         if log_valid is None:
             log_valid = log
 
-        x, y, dy = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='r', # r: read only
             covered=covered,
-            log=log,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=valid,
             log_valid=log_valid,
             bg_flux=bg_flux,
         )
-        return (y - fit(x)) / dy
+        return (masked_coords.y - fit(masked_coords.x)) / masked_coords.dy
 
     @validate_call
     def getSNR(
@@ -74,23 +74,21 @@ class CWindow(SpecData):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        x, y, _ = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='r', # r: read only
             covered=covered,
-            log=False,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
         )
-        dx = x * self.info.loading['sigma_res']
-        X = dx.sum()
+        X = masked_coords.dx.sum()
+        f = fit(masked_coords.x)
 
-        f = _f[0] if isinstance(_f := fit(x), tuple) else _f
-
-        snr = dot(f, dx) / X
-        snr /= (dot((y - f)**2, dx)**2 / X)**0.5
+        snr = dot(f, masked_coords.dx) / X
+        snr /= (dot((masked_coords.y - f)**2, masked_coords.dx)**2 / X)**0.5
 
         return snr
     

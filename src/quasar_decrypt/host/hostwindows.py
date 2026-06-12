@@ -27,7 +27,6 @@ logger = getLogger(__name__)
 
 @dataclass(init=False)
 class HostWindows(SpecList[HWindow]):
-
     templates: dict[str, HostGalaxyTemplate] = field(default_factory=dict, init=False)
     models: dict[str, HostGalaxyModel] = field(default_factory=dict, init=False)
 
@@ -52,37 +51,42 @@ class HostWindows(SpecList[HWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         kwargs = {}
         if self.spectrum is None:
-            coords_or_spectrum = self._coords
-            kwargs['info'] = self.info
+            kwargs['x'] = self._x
+            kwargs['y'] = self._y
+            kwargs['dy'] = self._dy
+            kwargs['dx'] = self._dx
+
             kwargs['y_smooth'] = self._y_smooth
             kwargs['y_pl'] = self._y_pl
             kwargs['y_fe'] = self._y_fe
             kwargs['y_ba'] = self._y_ba
             kwargs['y_hg'] = self._y_hg
             kwargs['y_em'] = self._y_em
+
             kwargs['rejected_pixels'] = self._rejected_pixels
             kwargs['absorbed_pixels'] = self._absorbed_pixels
             kwargs['valid_pixels'] = self._valid_pixels
             kwargs['log_valid_pixels'] = self._log_valid_pixels
             kwargs['p_absorbed'] = self._p_absorbed
+
             kwargs['x0'] = self.x0
             kwargs['y0'] = self.y0
             kwargs['x_log'] = self._x_log
             kwargs['y_log'] = self._y_log
             kwargs['dy_log'] = self._dy_log
+
+            kwargs['info'] = self.info
             kwargs['get_mask'] = self.get_mask
         else:
-            coords_or_spectrum = self.spectrum
+            kwargs['spectrum'] = self.spectrum
 
         for x_bounds in windows:
-            bwindow = HWindow(coords_or_spectrum, x_bounds=x_bounds, **kwargs)
-            if bwindow.size > 0:
-                self.append(bwindow)
+            kwargs['x_bounds'] = x_bounds
+            hwindow = HWindow.create.__wrapped__(HWindow, **kwargs)
+            if hwindow.size > 0:
+                self.append(hwindow)
 
         return self
 
@@ -280,23 +284,27 @@ class HostWindows(SpecList[HWindow]):
             if bg_flux is None:
                 bg_flux = self.default_bg
 
-            coords = self.getMaskedCoords.__wrapped__(
+            masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
+                mode='c', # c: continuum
                 covered=covered,
-                log=False,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
                 valid=True,
                 log_valid=False,
                 bg_flux=bg_flux,
             )
+
             chi2s: dict[str, float] = {}
             for name, model in self.models.items():
                 model.rasterFit.__wrapped__(
-                    model, *coords, 
+                    model, 
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.dy,
                     inplace=True,
                 )
-                z = (coords[1] - model(coords[0])) / coords[2]
+                z = (masked_coords.y - model(masked_coords.x)) / masked_coords.dy
                 chi2s[name] = dot(z, z)
 
             best_model_name = min(chi2s.keys(), key=chi2s.get)
@@ -308,7 +316,7 @@ class HostWindows(SpecList[HWindow]):
             logger.debug(msg)
 
             self.model = self.models[best_model_name]
-            self.applyFit(self.model, OptimizeResult())
+            self.applyFit(self.model)
             
         return self
 
@@ -322,9 +330,6 @@ class HostWindows(SpecList[HWindow]):
         *,
         fitter: FitterInstance | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         s = self.__str__(simple=True).removesuffix('.')
         msg = f"Performing fine-tuning fit on {s}: "
 
@@ -339,19 +344,19 @@ class HostWindows(SpecList[HWindow]):
             logger.warning(msg)
             only_model = False
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c', # c: contiguous
+            covered=not self.is_empty,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-            covered=True,
-            log=False,
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
         )
         
         _model = next(self.models.values())
-        n_pix = coords[0].size
+        n_pix = masked_coords.x.size
         n_free_params = sum(get_free_params(_model).values())
         if n_pix <= n_free_params:
             msg += f"cancelling fint-tuning due to insufficient no. of data "\
@@ -361,7 +366,13 @@ class HostWindows(SpecList[HWindow]):
         
         if only_model:
             try:
-                fit, fit_info = fitter(self.model, *coords, False)
+                fit, fit_info = fitter(
+                    self.model, 
+                    masked_coords.x, 
+                    masked_coords.y, 
+                    masked_coords.dy, 
+                    False,
+                )
             except ValidationError as e:
                 msg += f"failed fitting due to validation error: {e}"
                 logger.warning(msg)
@@ -375,13 +386,19 @@ class HostWindows(SpecList[HWindow]):
             was_successful_once = False
             for name, model in self.models.items():
                 try:
-                    _, fit_info = fitter(model, *coords, True)
+                    _, fit_info = fitter(
+                        model, 
+                        masked_coords.x, 
+                        masked_coords.y, 
+                        masked_coords.dy, 
+                        True,
+                    )
                     was_successful_once = True
                 except Exception:
                     msg += f"failed fitting model '{name}', "
                     chi2s[name] = inf
 
-                z = (coords[1] - model(coords[0])) / coords[2]
+                z = (masked_coords.y - model(masked_coords.x)) / masked_coords.dy
                 chi2s[name] = dot(z, z)
 
             if not was_successful_once:
@@ -389,7 +406,7 @@ class HostWindows(SpecList[HWindow]):
                 logger.warning(msg)
                 return self
 
-            best_model_name = min(chi2s.keys(), key=chi2s.get)
+            best_model_name: str = min(chi2s.keys(), key=chi2s.get)
             best_chi2 = chi2s[best_model_name]
 
             msg += "best-fit HostGalaxyModel is '{}' with chi2={:.2f}.".format(

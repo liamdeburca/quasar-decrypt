@@ -1,6 +1,9 @@
 from logging import getLogger
 from typing import Self
 
+from pydantic_core import PydanticCustomError
+from pydantic_core.core_schema import no_info_plain_validator_function
+
 logger = getLogger(__name__)
 
 class Graph(dict[int, set[int]]):
@@ -20,6 +23,20 @@ class Graph(dict[int, set[int]]):
 
         return '\n'.join(lines)
     
+    @classmethod
+    def _validate(cls, value: object) -> Self:
+        if not isinstance(value, cls):
+            msg = "Expected a '{}' instance, got {} instead.".format(
+                cls.__name__,
+                type(value).__name__,
+            )
+            raise PydanticCustomError('validation_error', msg)
+        return value
+    
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        return no_info_plain_validator_function(cls._validate)
+    
     def copy(self) -> Self:
         g = Graph()
         g.update(self)
@@ -30,8 +47,7 @@ class Graph(dict[int, set[int]]):
         This method expands all sets such that all downstream nodes are 
         shown.
         """
-        if inplace: new_graph: Graph = self
-        else:       new_graph: Graph = self.copy()
+        new_graph = self if inplace else self.copy()
 
         check: bool = (len(self) > 1)
         for orig, dests in sorted(

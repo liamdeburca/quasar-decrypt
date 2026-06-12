@@ -3,7 +3,6 @@ __all__ = ['ContinuumWindows']
 from logging import getLogger
 from typing import Self, ClassVar, Iterable
 from dataclasses import dataclass, field
-from scipy.optimize import OptimizeResult
 from numpy import zeros_like
 
 from .cwindow import CWindow
@@ -56,30 +55,38 @@ class ContinuumWindows(SpecList[CWindow]):
         """
         kwargs = {}
         if self.spectrum is None:
-            coords_or_spectrum = self._coords
-            kwargs['info'] = self.info
+            kwargs['x'] = self._x
+            kwargs['y'] = self._y
+            kwargs['dy'] = self._dy
+            kwargs['dx'] = self._dx
+
             kwargs['y_smooth'] = self._y_smooth
             kwargs['y_pl'] = self._y_pl
             kwargs['y_fe'] = self._y_fe
             kwargs['y_ba'] = self._y_ba
             kwargs['y_hg'] = self._y_hg
             kwargs['y_em'] = self._y_em
+
             kwargs['rejected_pixels'] = self._rejected_pixels
             kwargs['absorbed_pixels'] = self._absorbed_pixels
             kwargs['valid_pixels'] = self._valid_pixels
             kwargs['log_valid_pixels'] = self._log_valid_pixels
             kwargs['p_absorbed'] = self._p_absorbed
+
             kwargs['x0'] = self.x0
             kwargs['y0'] = self.y0
             kwargs['x_log'] = self._x_log
             kwargs['y_log'] = self._y_log
             kwargs['dy_log'] = self._dy_log
+
+            kwargs['info'] = self.info
             kwargs['get_mask'] = self.get_mask
         else:
-            coords_or_spectrum = self.spectrum
+            kwargs['spectrum'] = self.spectrum
 
         for x_bounds in windows:
-            cwindow = CWindow(coords_or_spectrum, x_bounds=x_bounds, **kwargs)
+            kwargs['x_bounds'] = x_bounds
+            cwindow = CWindow.create.__wrapped__(CWindow, **kwargs)
             if cwindow.size > 0:
                 self.append(cwindow)
 
@@ -166,9 +173,6 @@ class ContinuumWindows(SpecList[CWindow]):
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """      
         s = self.__str__(simple=True).removesuffix('.')
         msg = f"Performing linear fit on {s}:"
 
@@ -183,22 +187,23 @@ class ContinuumWindows(SpecList[CWindow]):
             log = logger.debug
             covered = True
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            covered = covered,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            valid = True,
-            log_valid = True,
-            bg_flux = bg_flux,
+            mode='c',
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=True,
+            log_valid=True,
+            bg_flux=bg_flux,
         )
-        msg += f" No. of data points: {len(coords[0])}."
+        msg += f" No. of data points: {masked_coords.size}."
 
         if self.fit_raw is None:
             prev_model = PowerLawModel(
                 self.x0, 
                 self.y0, 
-                apply_bounds.__wrapped__(coords[1].mean(), flux_bounds),
+                apply_bounds.__wrapped__(masked_coords.y.mean(), flux_bounds),
                 apply_bounds.__wrapped__(0, alpha_bounds),
                 name='powerlaw_model',
             )
@@ -208,7 +213,11 @@ class ContinuumWindows(SpecList[CWindow]):
             prev_model = self.getModel.__wrapped__(self, suffix=suffix)
         
         with stopwatch() as watch:
-            fit = prev_model.from_linear_fit(*coords)
+            fit = prev_model.from_linear_fit(
+                masked_coords.x,
+                masked_coords.y,
+                masked_coords.dy,
+            )
 
         msg += " Finished linear fit in {:.1f} ms.".format(1e3 * watch.elapsed)
         log(msg)
@@ -272,9 +281,12 @@ class ContinuumWindows(SpecList[CWindow]):
             valid=True,
             log_valid=True,
         )
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c',
             covered=True,
+            without_rejections=False,
+            without_absorption=False,
             valid=True,
             log_valid=True,
             bg_flux=bg_flux,
@@ -288,7 +300,9 @@ class ContinuumWindows(SpecList[CWindow]):
 
                 z = f.getResiduals.__wrapped__(
                     f,
-                    *coords,
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.dy,
                     log=True,
                 )
                 rejections[mask] = (abs(z) > sigma)
@@ -315,7 +329,7 @@ class ContinuumWindows(SpecList[CWindow]):
         logger.debug(msg)
 
         return out
-
+    
     @validated_apply_info_to_method(subjects=('continuum', 'nonlinear'))
     def performFineTuning(
         self,
@@ -328,9 +342,6 @@ class ContinuumWindows(SpecList[CWindow]):
         alpha_bounds: AstropyBounds | None = None,
         fitter: FitterInstance | None = None,
     ) -> bool:      
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """  
         s = self.__str__(simple=True).removesuffix('.')
         msg = f"Performing fine-tuning on {s}: "
 
@@ -367,15 +378,18 @@ class ContinuumWindows(SpecList[CWindow]):
         if self.is_empty:
             msg += "performing global fit due to missing continuum windows -> "
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c',
             covered=not self.is_empty,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=True,
+            log_valid=True,
             bg_flux=bg_flux,
         )
-        n_pix = coords[0].size
+    
+        n_pix = masked_coords.x.size
         n_free_params = sum(get_free_params(model).values())
 
         if n_pix <= n_free_params:
@@ -390,7 +404,11 @@ class ContinuumWindows(SpecList[CWindow]):
         
         try:
             with stopwatch() as watch:
-                fit, fit_info = fitter(model, *coords, inplace=False)
+                fit, fit_info = fitter(
+                    model, 
+                    masked_coords.x, masked_coords.y, masked_coords.dy, 
+                    inplace=False,
+                )
             msg += "Successfully performed fine-tuning in {:.1f} ms: " \
                 "flux={:.1f} ({:.1f},{:.1f}), " \
                 "alpha={:.2f} ({:.2f},{:.2f})" \
@@ -414,14 +432,6 @@ class ContinuumWindows(SpecList[CWindow]):
 
         if self.is_empty:
             msg += " No continuum windows -> performing global fit!"
-
-        coords = self.getMaskedCoords.__wrapped__(
-            self,
-            covered=not self.is_empty,
-            without_rejections=without_rejections,
-            without_absorption=without_absorption,
-            valid=True,
-        )
 
         self.applyFit.__wrapped__(
             self, 

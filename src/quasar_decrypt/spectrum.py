@@ -1,6 +1,7 @@
 from logging import getLogger
-from typing import Iterable, Literal, Self
-from dataclasses import dataclass, field
+from typing import Iterable, Literal, Self, Callable
+from pydantic.dataclasses import dataclass
+from dataclasses import field
 from numpy import isfinite, invert, argwhere, nanargmax, zeros_like, array_equal
 from scipy.optimize import OptimizeResult
 
@@ -10,7 +11,7 @@ from matplotlib.axes import Axes
 from pydantic_core import ValidationError
 
 from quasar_errors.bootstrapping import BaseBootstrapper
-from quasar_errors.nested_sampling import BaseNestedSampler
+from quasar_errors.nested_sampling import BaseNestedSampler, UniformNestedSampler
 from quasar_errors.spectrum_utils import (
     format_bootstrapping_kwargs_for_spectrum,
     format_nested_sampling_kwargs_for_spectrum,
@@ -33,7 +34,6 @@ from quasar_typing.pathlib import (
     AbsoluteFilePath, AbsoluteDirPath, RelativeFilePath, AbsoluteFITSPath,
 )
 from quasar_typing.astropy import Model_, FitInfo, QTable_, CompoundModel_
-from quasar_typing.numpy import CoordsTuple
 from quasar_typing.misc import (
     Pool_, 
     BackgroundFlux, ModelTypes, DataTypes,
@@ -44,7 +44,7 @@ from quasar_models import (
     PowerLawModel, 
     IronModel,
     BalmerModel,
-    HostGalaxyModel,
+    # HostGalaxyModel,
     GaussianModel,
 )
 from quasar_models.utils.astropy import get_model_parts, get_free_params
@@ -53,7 +53,9 @@ from quasar_plotting import quickplot, absorptionplot, fitplot
 from quasar_plotting.utils import get_coords
 from quasar_plotting.colors import DEFAULT_COLORS
 
-from .utils import _SpecData, SpecList, get_log
+from .utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, ContiguousMaskedCoords
+
+from .utils import _SpecData, SpecList
 from .continuum import ContinuumWindows
 from .iron import IronWindows
 from .balmer import BalmerWindows
@@ -63,8 +65,8 @@ logger = getLogger(__name__)
 
 @dataclass
 class Spectrum(_SpecData):
-    path: AbsoluteFilePath
-    title: str
+    path: AbsoluteFilePath = field(kw_only=True)
+    title: str = field(kw_only=True)
 
     _is_preprocessed: bool = field(default=False, init=False)
 
@@ -77,6 +79,146 @@ class Spectrum(_SpecData):
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     nested_sampler: BaseNestedSampler | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
+
+    @classmethod
+    @validate_call
+    def create(
+        cls,
+        *,
+        path: AbsoluteFilePath,
+        title: str,
+        x: FloatVector,
+        y: FloatVector,
+        dy: FloatVector,
+        dx: FloatVector | None = None,
+
+        y_smooth: FloatVector | None = None,
+        y_pl: FloatVector | None = None,
+        y_fe: FloatVector | None = None,
+        y_ba: FloatVector | None = None,
+        y_hg: FloatVector | None = None,
+        y_em: FloatVector | None = None,
+
+        rejected_pixels: BoolVector | None = None,
+        absorbed_pixels: BoolVector | None = None,
+        valid_pixels: BoolVector | None = None,
+        log_valid_pixels: BoolVector | None = None,
+        p_absorbed: FloatVector | None = None,
+
+        x0: float | None = None,
+        y0: float | None = None,
+        x_log: FloatVector | None = None,
+        y_log: FloatVector | None = None,
+        dy_log: FloatVector | None = None,
+
+        x_bounds: CoordBounds | None = None,
+        info: Info = None,
+        get_mask: Callable[[float, float], BoolVector] | None = None,
+    ) -> Self:
+        kwargs = cls.get_kwargs.__wrapped__(
+            cls,
+            path=path,
+            title=title,
+            x=x,
+            y=y,
+            dy=dy,
+            dx=dx,
+            
+            y_smooth=y_smooth,
+            y_pl=y_pl,
+            y_fe=y_fe,
+            y_ba=y_ba,
+            y_hg=y_hg,
+            y_em=y_em,
+
+            rejected_pixels=rejected_pixels,
+            absorbed_pixels=absorbed_pixels,
+            valid_pixels=valid_pixels,
+            log_valid_pixels=log_valid_pixels,
+            p_absorbed=p_absorbed,
+
+            x0=x0,
+            y0=y0,
+            x_log=x_log,
+            y_log=y_log,
+            dy_log=dy_log,
+
+            x_bounds=x_bounds,
+            info=info,
+            get_mask=get_mask,
+        )
+        return cls(**kwargs)
+
+    @classmethod
+    @validate_call
+    def get_kwargs(
+        cls,
+        *,
+        path: AbsoluteFilePath,
+        title: str,
+        x: FloatVector,
+        y: FloatVector,
+        dy: FloatVector,
+        dx: FloatVector | None = None,
+
+        y_smooth: FloatVector | None = None,
+        y_pl: FloatVector | None = None,
+        y_fe: FloatVector | None = None,
+        y_ba: FloatVector | None = None,
+        y_hg: FloatVector | None = None,
+        y_em: FloatVector | None = None,
+
+        rejected_pixels: BoolVector | None = None,
+        absorbed_pixels: BoolVector | None = None,
+        valid_pixels: BoolVector | None = None,
+        log_valid_pixels: BoolVector | None = None,
+        p_absorbed: FloatVector | None = None,
+
+        x0: float | None = None,
+        y0: float | None = None,
+        x_log: FloatVector | None = None,
+        y_log: FloatVector | None = None,
+        dy_log: FloatVector | None = None,
+
+        x_bounds: CoordBounds | None = None,
+        info: Info = None,
+        get_mask: Callable[[float, float], BoolVector] | None = None,
+    ) -> dict:
+        kwargs = {'path': path, 'title': title}
+        kwargs.update(super().get_kwargs.__wrapped__(
+            cls,
+            x=x,
+            y=y,
+            dy=dy,
+            dx=dx,
+
+            y_smooth=y_smooth,
+            y_pl=y_pl,
+            y_fe=y_fe,
+            y_ba=y_ba,
+            y_hg=y_hg,
+            y_em=y_em,
+
+            rejected_pixels=rejected_pixels,
+            absorbed_pixels=absorbed_pixels,
+            valid_pixels=valid_pixels,
+            log_valid_pixels=log_valid_pixels,
+            p_absorbed=p_absorbed,
+
+            x0=x0,
+            y0=y0,
+            x_log=x_log,
+            y_log=y_log,
+            dy_log=dy_log,
+
+            x_bounds=x_bounds,
+            info=info,
+            get_mask=get_mask,
+        ))
+        return kwargs
+    
+    def __post_init__(self) -> None:
+        self.preprocess()
 
     @property
     def pl(self) -> ContinuumWindows | None: return self.continuum_windows
@@ -122,21 +264,6 @@ class Spectrum(_SpecData):
     @property
     def basic_error_result(self) -> ErrorResult:
         return ErrorResult((self.basic_sample,), (1.0,))
-    
-    @validate_call
-    def __init__(
-        self,
-        path: AbsoluteFilePath,
-        title: str,
-        coords: CoordsTuple,
-        info: Info = None,
-    ):
-        self.path = path
-        self.title = title
-        super().__init__(coords, info=info)
-
-    def __post_init__(self):
-        self.preprocess()
 
     def __str__(self, simple: bool = False):
         s = "'Spectrum' class [{:.1f} <-> {:.1f}]".format(*self.x_bounds)
@@ -157,9 +284,6 @@ class Spectrum(_SpecData):
         refine: bool = False,
         x_limit: float | None = None,
     ) -> None:
-        """
-        ** PYDANTIC VALIDATED AND INFO-APPLIED METHOD **
-        """
         logger.debug("Running 'Spectrum' pipeline...")
         
         self.cropLymanAlphaForest.__wrapped__(
@@ -225,6 +349,40 @@ class Spectrum(_SpecData):
 
         self._valid_pixels = invert(mask)
 
+    def _truncate_range(self, sel: slice) -> None:
+        if sel.step not in (None, 1):
+            raise ValueError("Only contiguous truncation is supported.")
+
+        def f(arr): return arr[sel]
+
+        for key, value in super().get_kwargs.__wrapped__(
+            self.__class__,
+            x=f(self._x),
+            y=f(self._y),
+            dy=f(self._dy),
+            dx=f(self._dx),
+            x_bounds=None,
+            info=self.info,
+            y_smooth=f(self._y_smooth),
+            y_pl=f(self._y_pl),
+            y_fe=f(self._y_fe),
+            y_ba=f(self._y_ba),
+            y_hg=f(self._y_hg),
+            y_em=f(self._y_em),
+            rejected_pixels=f(self._rejected_pixels),
+            absorbed_pixels=f(self._absorbed_pixels),
+            valid_pixels=f(self._valid_pixels),
+            log_valid_pixels=f(self._log_valid_pixels),
+            p_absorbed=f(self._p_absorbed),
+            x0=self.x0,
+            y0=self.y0,
+            x_log=f(self._x_log),
+            y_log=f(self._y_log),
+            dy_log=f(self._dy_log),
+            get_mask=None,
+        ).items():
+            setattr(self, key, value)
+
     def truncateSpectrum(self) -> None:
         """
         Truncates the spectrum if edges contain NaN values.
@@ -249,13 +407,8 @@ class Spectrum(_SpecData):
             n_red = n - 1 - idx_end
             n_tot = n_blue + n_red
 
-            self.__init__.__wrapped__(
-                self,
-                self.path,
-                self.title,
-                (self._x[sel], self._y[sel], self._dy[sel]),
-                info=self.info,
-            )            
+            self._truncate_range(sel)
+
             logger.debug(
                 "Cutting %d/%d pixel(s): %d/%d (blue edge), %d/%d (red edge)",
                 n_tot, n, n_blue, n, n_red, n,
@@ -267,9 +420,6 @@ class Spectrum(_SpecData):
         *,
         x_limit: float | None = None,
     ) -> None:
-        """
-        ** PYDANTIC VALIDATED AND INFO-APPLIED METHOD **
-        """
         logger.debug(f"Cropping Lyman-alpha forest: {self}")
 
         indices = argwhere(self._x < x_limit).flatten()
@@ -329,9 +479,6 @@ class Spectrum(_SpecData):
         refine: bool | None = None,
         logspace: bool | None = None,
     ) -> None:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if array_equal(self._y, self._y_smooth):
             self.smoothSpectrum.__wrapped__(
                 self, w=w, p=p, logspace=logspace,
@@ -359,11 +506,16 @@ class Spectrum(_SpecData):
         windows: list[CoordBounds] | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Instantiates the Spectrum instance's 'continuum_windows' attribute.
         """
-        self.continuum_windows = ContinuumWindows(self, windows=windows)
+        self.continuum_windows = ContinuumWindows.create.__wrapped__(
+            ContinuumWindows,
+            spectrum=self,
+        )
+        self.continuum_windows.populate.__wrapped__(
+            self.continuum_windows,
+            windows=windows,
+        )
         return self
 
     @validated_apply_info_to_method(subjects=('iron',), specific_kwargs={'windows'})
@@ -372,10 +524,14 @@ class Spectrum(_SpecData):
         *,
         windows: list[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self.iron_windows = IronWindows(self, windows=windows)
+        self.iron_windows = IronWindows.create.__wrapped__(
+            IronWindows,
+            spectrum=self,
+        )
+        self.iron_windows.populate.__wrapped__(
+            self.iron_windows, 
+            windows=windows,
+        )
         return self
     
     @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'windows'})
@@ -384,17 +540,21 @@ class Spectrum(_SpecData):
         *,
         windows: list[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self.balmer_windows = BalmerWindows(self, windows=windows)
+        self.balmer_windows = BalmerWindows.create.__wrapped__(
+            BalmerWindows,
+            spectrum=self,
+        )
+        self.balmer_windows.populate.__wrapped__(
+            self.balmer_windows,
+            windows=windows,
+        )
         return self
 
     def instantiateLines(self) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self.line_windows = LineWindows(self)
+        self.line_windows = LineWindows.create.__wrapped__(
+            LineWindows,
+            spectrum=self,
+        )
         return self
 
     @validated_apply_info_to_method(
@@ -710,8 +870,6 @@ class Spectrum(_SpecData):
         fitter: FitterInstance | None = None,
     ) -> bool:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Notes
         -----
         If 'model_types' and 'data_types' are both None, they default to all 
@@ -726,18 +884,18 @@ class Spectrum(_SpecData):
         s = self.__str__(simple=True).removesuffix('.')
         msg = f"Finalising fit for {s}: "
 
-        if (model_types is None) and (data_types is None):
-            model_types = ModelTypes({'all'})
-            data_types = DataTypes({'all'})
-        elif (model_types is None):
-            model_types = data_types.copy()
-        elif (data_types is None):
-            data_types = model_types.copy()
+        if model_types is None:
+            model_types = (
+                ModelTypes({'all'}) 
+                if data_types is None 
+                else data_types.copy()
+            )
 
-        if not any(self[dt] is not None for dt in data_types):
-            msg += f"no data types found for {data_types}. "
-            logger.warning(msg)
-            return False
+        if data_types is not None:
+            if not any(self[dt] is not None for dt in data_types):
+                msg += f"no data types found for {data_types}. "
+                logger.warning(msg)
+                return False
         
         if bg_flux is None:
             _bg_flux = set(model_types)
@@ -746,23 +904,25 @@ class Spectrum(_SpecData):
 
         msg += f"{model_types=}, {data_types=}, {bg_flux=} -> "
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c', # c: contiguous
             data_types=data_types,
             bg_flux=bg_flux,
             covered=True,
-            log=False,
+            log_valid=False,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=True,
         )
+
         model = self.getModel.__wrapped__(self, model_types=model_types)
         if model is None:
             msg += "no models found!"
             logger.warning(msg)
             return False
 
-        n_pix = coords[0].size
+        n_pix = masked_coords.size
         n_free_params = sum(get_free_params(model).values())
 
         if n_pix <= n_free_params:
@@ -778,7 +938,9 @@ class Spectrum(_SpecData):
             with stopwatch() as watch:
                 fit, fit_info = fitter(
                     model,
-                    *coords,
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.dy,
                     inplace = False,
                 )
             msg += "successfully finalised fit in {:.1f} ms." \
@@ -856,46 +1018,39 @@ class Spectrum(_SpecData):
     def getMaskedCoords(
         self,
         *,
+        mode: Literal['r', 'c'] | None = None,
         data_types: DataTypes | None = None,
         bg_flux: BackgroundFlux | None = None,
         covered: bool = True,
-        log: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-    ) -> CoordsTuple:
+    ) -> MaskedCoords:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Notes
         -----
         If 'data_types' is None, the entire spectrum is considered, i.e.
         window-like objects' masks are not applied. 
         
         If 'bg_flux' is None, no background flux is subtracted.
-        """        
-        x = self._x_log if log else self._x
-        dy = self._dy_log if log else self._dy
-
-        y = self._y.copy()
-        if bg_flux:
-            for bg in bg_flux:
-                y -= getattr(self, f"_y_{bg}")
-
-        if log: 
-            y = get_log(y, self.y0, self._log_valid_pixels)
-
+        """
         mask = self.getMask.__wrapped__(
             self,
-            data_types = data_types,
-            covered = covered,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            valid = valid,
-            log_valid = log_valid,
+            data_types=data_types,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=valid,
+            log_valid=log_valid,
         )
-        return x[mask], y[mask], dy[mask]
+        match mode:
+            case 'r': 
+                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
+            case 'c': 
+                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
+            case None:
+                return MaskedCoords(self, mask, bg_flux=bg_flux)
     
     @validate_call
     def getModel(
@@ -1164,16 +1319,14 @@ class Spectrum(_SpecData):
     ) -> BaseNestedSampler:
         """
         ...
-        """    
-        cls, args, kwargs = format_nested_sampling_kwargs_for_spectrum(
-            self,
+        """
+        self.nested_sampler = UniformNestedSampler.from_spectrum(
+            spectrum=self,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-            variant='standard',
             data_types=data_types,
             model_types=model_types,
-            nested_type='uniform',
             pool=pool,
             iterations=iterations,
             random_state=random_state,
@@ -1183,7 +1336,6 @@ class Spectrum(_SpecData):
             tqdm_leave=tqdm_leave,
             logger=logger,
         )
-        self.nested_sampler = cls(*args, **kwargs)
         self.nested_sampler.instantiateSampler()
         return self.nested_sampler
 

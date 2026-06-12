@@ -1,7 +1,6 @@
 from logging import getLogger
 from typing import Self, ClassVar, Iterable
 from numpy import invert
-from scipy.optimize import OptimizeResult
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
@@ -53,35 +52,40 @@ class BalmerWindows(SpecList[BWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         kwargs = {}
         if self.spectrum is None:
-            coords_or_spectrum = self._coords
-            kwargs['info'] = self.info
+            kwargs['x'] = self._x
+            kwargs['y'] = self._y
+            kwargs['dy'] = self._dy
+            kwargs['dx'] = self._dx
+
             kwargs['y_smooth'] = self._y_smooth
             kwargs['y_pl'] = self._y_pl
             kwargs['y_fe'] = self._y_fe
             kwargs['y_ba'] = self._y_ba
             kwargs['y_hg'] = self._y_hg
             kwargs['y_em'] = self._y_em
+
             kwargs['rejected_pixels'] = self._rejected_pixels
             kwargs['absorbed_pixels'] = self._absorbed_pixels
             kwargs['valid_pixels'] = self._valid_pixels
             kwargs['log_valid_pixels'] = self._log_valid_pixels
             kwargs['p_absorbed'] = self._p_absorbed
+
             kwargs['x0'] = self.x0
             kwargs['y0'] = self.y0
             kwargs['x_log'] = self._x_log
             kwargs['y_log'] = self._y_log
             kwargs['dy_log'] = self._dy_log
+
+            kwargs['info'] = self.info
             kwargs['get_mask'] = self.get_mask
         else:
-            coords_or_spectrum = self.spectrum
+            kwargs['spectrum'] = self.spectrum
 
         for x_bounds in windows:
-            bwindow = BWindow(coords_or_spectrum, x_bounds=x_bounds, **kwargs)
+            kwargs['x_bounds'] = x_bounds
+            bwindow = BWindow.create.__wrapped__(BWindow, **kwargs)
             if bwindow.size > 0:
                 self.append(bwindow)
 
@@ -121,9 +125,6 @@ class BalmerWindows(SpecList[BWindow]):
         raster_n: int | None = None,
         fitter: FitterInstance | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -373,19 +374,21 @@ class BalmerWindows(SpecList[BWindow]):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            covered = covered,
-            log = False,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            valid = True,
-            log_valid = False,
-            bg_flux = bg_flux,
+            mode='c', # c: contiguous
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
         )
         self.model.rasterFit.__wrapped__(
             self.model,
-            *coords,
+            masked_coords.x,
+            masked_coords.y,
+            masked_coords.dy,
         )
         return self
 
@@ -411,12 +414,12 @@ class BalmerWindows(SpecList[BWindow]):
             msg = "No BalmerModel instance available!"
             raise ValueError(msg)
         
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c', # c: contiguous
+            covered=True,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-            covered=True,
-            log=False,
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
@@ -425,7 +428,9 @@ class BalmerWindows(SpecList[BWindow]):
             with stopwatch() as watch:
                 fit, fit_info = fitter(
                     model,
-                    *coords,
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.dy,
                     inplace=False,
                 )
             msg += f"Finished fine-tuning in {1e3*watch.elapsed:.1f} ms."
@@ -440,8 +445,7 @@ class BalmerWindows(SpecList[BWindow]):
             msg += f"Failed fitting due to validation error: {e}"
             logger.critical(msg)
 
-        return self
-        
+        return self        
 
     def getModel(self) -> BalmerModel | None:
         """

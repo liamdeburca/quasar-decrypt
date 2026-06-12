@@ -1,7 +1,7 @@
 __all__ = ['LineWindows']
 
 from logging import getLogger
-from typing import Self, ClassVar
+from typing import Self, ClassVar, Literal
 from numpy import zeros_like
 from pathlib import Path
 from itertools import product
@@ -27,6 +27,8 @@ from quasar_models.line import GaussianModel, _VProfileCopy
 from quasar_models.utils.astropy import get_free_params
 
 from quasar_errors.model_samples import GaussianSampleList
+
+from ..utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, ContiguousMaskedCoords
 
 logger = getLogger(__name__)
 
@@ -247,52 +249,40 @@ class LineWindows(SpecList[LWindow]):
     def getMaskedCoords(
         self, 
         *,
+        mode: Literal['c', 'r'] | None = None,
         covered: bool = False,
-        log: bool = False,
         without_rejections: bool = False, 
         without_absorption: bool = False,
         with_neighbours: bool = False,
         valid: bool = False,
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
-
         line: float | None = None,
         limited: bool = True,
         v_sep: float | None = None,
-    ) -> tuple[FloatVector, FloatVector, FloatVector, FloatVector]:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+    ) -> MaskedCoords:
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        x = self._x_log if log else self._x
-        dy = self._dy_log if log else self._dy
-
-        y = self._y.copy()
-        y_smooth = self._y_smooth.copy()
-        if bg_flux is not None:
-            for bg in bg_flux:
-                y        -= getattr(self, f"_y_{bg}")
-                y_smooth -= getattr(self, f"_y_{bg}")
-
-        if log: 
-            y        = get_log(y, self.y0, self._log_valid_pixels)
-            y_smooth = get_log(y_smooth, self.y0, self._log_valid_pixels)
-
         mask = self.getMask.__wrapped__(
             self,
-            covered = covered,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            valid = valid,
-            log_valid = log_valid,
-            line = line,
-            limited = limited,
-            v_sep = v_sep
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            valid=valid,
+            log_valid=log_valid,
+            line=line,
+            limited=limited,
+            v_sep=v_sep
         )
-        return x[mask], y[mask], dy[mask], y_smooth[mask]
+        match mode:
+            case 'c': 
+                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
+            case 'r':
+                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
+            case None:
+                return MaskedCoords(self, mask, bg_flux=bg_flux)
     
     @validated_apply_info_to_method(subjects=('loading', 'lines'))
     def applyLineList(
@@ -311,27 +301,34 @@ class LineWindows(SpecList[LWindow]):
         """
         kwargs = {'x_bounds': self.x_bounds}
         if self.spectrum is None:
-            coords_or_spectrum = self._coords
-            kwargs['info'] = self.info
+            kwargs['x'] = self._x
+            kwargs['y'] = self._y
+            kwargs['dy'] = self._dy
+            kwargs['dx'] = self._dx
+
             kwargs['y_smooth'] = self._y_smooth
             kwargs['y_pl'] = self._y_pl
             kwargs['y_fe'] = self._y_fe
             kwargs['y_ba'] = self._y_ba
             kwargs['y_hg'] = self._y_hg
             kwargs['y_em'] = self._y_em
+
             kwargs['rejected_pixels'] = self._rejected_pixels
             kwargs['absorbed_pixels'] = self._absorbed_pixels
             kwargs['valid_pixels'] = self._valid_pixels
             kwargs['log_valid_pixels'] = self._log_valid_pixels
             kwargs['p_absorbed'] = self._p_absorbed
+
             kwargs['x0'] = self.x0
             kwargs['y0'] = self.y0
             kwargs['x_log'] = self._x_log
             kwargs['y_log'] = self._y_log
             kwargs['dy_log'] = self._dy_log
+
+            kwargs['info'] = self.info
             kwargs['get_mask'] = self.get_mask
         else:
-            coords_or_spectrum = self.spectrum
+            kwargs['spectrum'] = self.spectrum
         
         if isinstance(linelist, Path):
             linelist = read_linelist.__wrapped__(path=linelist, info=self.info)
@@ -357,7 +354,11 @@ class LineWindows(SpecList[LWindow]):
                     (line - _line) > (_line + line) * v_sep
 
             if cond:
-                self.append(LWindow(coords_or_spectrum, **kwargs))
+                lwindow = LWindow.create.__wrapped__(
+                    LWindow,
+                    **kwargs,
+                )
+                self.append(lwindow)
 
             _ = self[-1].add.__wrapped__(
                 self[-1],

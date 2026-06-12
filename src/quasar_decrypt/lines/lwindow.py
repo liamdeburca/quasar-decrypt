@@ -8,11 +8,11 @@ from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from numpy import (
     inf, array, empty, invert, interp, exp, linspace, convolve, argmax, 
-    isfinite, unique, zeros_like,
+    isfinite, unique, zeros_like, float64,
 )
 from scipy.ndimage import binary_dilation
 
-from ..utils import _SpecData, SpecData, get_log
+from ..utils import SpecData
 from ..utils.general import stopwatch, get_bounds_indices
 from .utils import common_middle
 
@@ -47,79 +47,56 @@ from quasar_plotting.colors import DEFAULT_COLORS
 
 from quasar_errors.model_samples import GaussianSampleList
 
+from ..utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, ContiguousMaskedCoords
+
 logger = getLogger(__name__)
 
 type LineModel = GaussianModel | CompoundModel_[GaussianModel]
 
-@dataclass(init=False)
+@dataclass(kw_only=True)
 class LWindow(SpecData):
-    names: set[str] = field(default_factory=set, init=False)
+    names: set[str] = field(default_factory=set, kw_only=True)
     
-    lines: dict[str, float] = field(default_factory=dict, init=False)
-    n_maxs: dict[str, int] = field(default_factory=dict, init=False)
-    needs_line: dict[str, str] = field(default_factory=dict, init=False)
+    lines: dict[str, float] = field(default_factory=dict, kw_only=True)
+    n_maxs: dict[str, int] = field(default_factory=dict, kw_only=True)
+    needs_line: dict[str, str] = field(default_factory=dict, kw_only=True)
     
-    strength_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
-    sigma_v_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
-    v_off_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
+    strength_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    sigma_v_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    v_off_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
     
-    is_copy_of: dict[str, str] = field(default_factory=dict, init=False)
-    is_multiplet_of: dict[str, str] = field(default_factory=dict, init=False)
-    scale_init: dict[str, float] = field(default_factory=dict, init=False)
-    scale_bounds: dict[str, tuple] = field(default_factory=dict, init=False)
-    scale_fixed: dict[str, bool] = field(default_factory=dict, init=False)
+    is_copy_of: dict[str, str] = field(default_factory=dict, kw_only=True)
+    is_multiplet_of: dict[str, str] = field(default_factory=dict, kw_only=True)
+    scale_init: dict[str, float] = field(default_factory=dict, kw_only=True)
+    scale_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    scale_fixed: dict[str, bool] = field(default_factory=dict, kw_only=True)
     
-    copies_to: dict[str, list[tuple[int | None, str]]] = field(default_factory=lambda: defaultdict(list), init=False)
-    i_bounds: dict[str, tuple[float, float]] = field(default_factory=dict, init=False)
-    blacklist: dict[str, bool] = field(default_factory=dict, init=False)
-    _blacklist: dict[str, bool] = field(default_factory=dict, init=False)
+    copies_to: dict[str, list[tuple[int | None, str]]] = field(default_factory=lambda: defaultdict(list), kw_only=True)
+    i_bounds: dict[str, tuple[float, float]] = field(default_factory=dict, kw_only=True)
+    blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
+    _blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
     
-    neighbours: tuple[_SpecData | None, _SpecData | None] = field(default=(None, None), init=False)
-    # prev_model: LineModel | None = field(default=None, init=False)
-    model: LineModel | None = field(default=None, init=False)
-    fit: LineModel | None = field(default=None, init=False)
-    fit_info: FitInfo | None = field(default=None, init=False)
+    neighbours: tuple[SpecData | None, SpecData | None] = field(default=(None, None), kw_only=True)
+    # prev_model: LineModel | None = field(default=None, kw_only=True)
+    model: LineModel | None = field(default=None, kw_only=True)
+    fit: LineModel | None = field(default=None, kw_only=True)
+    fit_info: FitInfo | None = field(default=None, kw_only=True)
 
-    fits: dict[int, LineModel] = field(default_factory=dict, init=False)
-    fit_infos: dict[int, FitInfo] = field(default_factory=dict, init=False)
+    fits: dict[int, LineModel] = field(default_factory=dict, kw_only=True)
+    fit_infos: dict[int, FitInfo] = field(default_factory=dict, kw_only=True)
 
-    cropped: set[str] = field(default_factory=set, init=False)
+    cropped: set[str] = field(default_factory=set, kw_only=True)
 
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
 
-    _y_em_contrib: FloatVector = field(init=False)
+    _y_em_contrib: FloatVector | None = field(default=None, init=False)
     
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'em'})
 
     def __post_init__(self):
-        self.names = set()
-        
-        self.lines = {}
-        self.n_maxs = {}
-        self.needs_line = {}
-
-        self.strength_bounds = {}
-        self.sigma_v_bounds = {}
-        self.v_off_bounds = {}
-
-        self.is_copy_of = {}
-        self.scale_init = {}
-        self.scale_bounds = {}
-        self.scale_fixed = {}
-
-        self.copies_to = defaultdict(list)
-        self.is_multiplet_of = {}
-        self.i_bounds = {}
-        self.blacklist = {}
-        self._blacklist = {}
-
-        self.fits = {}
-        self.fit_infos = {}
-
-        self.cropped = set()
-
-        self._y_em_contrib = zeros_like(self._y)
+        if self._y_em_contrib is None:
+            self._y_em_contrib = zeros_like(self._x, dtype=float64)
 
     @property
     def sample(self) -> GaussianSampleList | None:
@@ -298,51 +275,40 @@ class LWindow(SpecData):
     def getMaskedCoords(
         self, 
         *,
+        mode: Literal['c', 'r'] | None = None,
         covered: bool = False,
-        log: bool = False,
         without_rejections: bool = False, 
         without_absorption: bool = False,
         with_neighbours: bool = False,
         valid: bool = False,
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
-
         line: float | str | None = None,
         limited: bool = True,
         v_sep: float | None = None,
-    ) -> tuple[FloatVector, FloatVector, FloatVector, FloatVector]:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+    ) -> MaskedCoords | ReadOnlyMaskedCoords | ContiguousMaskedCoords:
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        x = self._x_log if log else self._x
-        dy = self._dy_log if log else self._dy
-
-        y = self._y.copy()
-        y_smooth = self._y_smooth.copy()
-        for bg in bg_flux:
-            y        -= getattr(self, f"_y_{bg}")
-            y_smooth -= getattr(self, f"_y_{bg}")
-
-        if log: 
-            y        = get_log(y, self.y0, self._log_valid_pixels)
-            y_smooth = get_log(y_smooth, self.y0, self._log_valid_pixels)
-
         mask = self.getMask.__wrapped__(
             self,
-            covered = covered,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            valid = valid,
-            log_valid = log_valid,
-            line = line,
-            limited = limited,
-            v_sep = v_sep,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            valid=valid,
+            log_valid=log_valid,
+            line=line,
+            limited=limited,
+            v_sep=v_sep,
         )
-        return x[mask], y[mask], dy[mask], y_smooth[mask]
+        match mode:
+            case 'c':
+                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
+            case 'r':
+                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
+            case None:
+                return MaskedCoords(self, mask, bg_flux=bg_flux)
 
     @validated_apply_info_to_method(subjects=('lines',))
     def add(
@@ -362,8 +328,6 @@ class LWindow(SpecData):
         force_add: bool = False,
     ) -> bool:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Adds a given line to the SubSlice under the condition that it falls 
         within the covered wavelength range.
 
@@ -404,6 +368,59 @@ class LWindow(SpecData):
 
         return False 
 
+    @validated_apply_info_to_method(subjects=('nonlinear',))
+    def addCustomModel(
+        self,
+        new_model: GaussianModel,
+        *,
+        force_add: bool = False,
+        refit: bool = False,
+        update_flux: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        with_neighbours: bool = False,
+        fitter: FitterInstance | None = None,
+    ) -> None:
+        success = self.add.__wrapped__(
+            self,
+            new_model.pure_name,
+            new_model.wave,
+            1,
+            None,
+            None,
+            strength_bounds=new_model.strength.bounds,
+            sigma_v_bounds=new_model.sigma_v.bounds,
+            v_off_bounds=new_model.v_off.bounds,
+            scale_init=None,
+            scale_bounds=None,
+            scale_fixed=None,
+            force_add=force_add,
+        )
+        if not success: 
+            msg = "Failed to add custom model to `Lwindow` with bounds {}!"\
+                .format(self.x_bounds)
+            logger.warning(msg)
+            raise ValueError(msg)
+        
+        if refit:
+            self.model = self.fit + new_model
+            self.fitModel.__wrapped__(
+                self,
+                update_flux=update_flux,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                fitter=fitter,
+            )
+        else:
+            self.applyFit.__wrapped__(
+                self,
+                self.fit + new_model,
+                update_emission=update_flux,
+            )
+        
     @validated_apply_info_to_method(subjects=('lines',))
     def prepareLines(
         self, 
@@ -712,13 +729,16 @@ class LWindow(SpecData):
                 )
                 continue
 
-            x, y, _, y_smooth = self.getMaskedCoords.__wrapped__(
+            masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
-                valid=True,
-                bg_flux=bg_flux,
+                mode='c',
+                covered=True,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
                 with_neighbours=with_neighbours,
+                valid=True,
+                log_valid=False,
+                bg_flux=bg_flux,
                 line=name,
                 limited=True,
                 v_sep=v_sep,
@@ -726,13 +746,15 @@ class LWindow(SpecData):
             try:
                 models[name] = GaussianModel.instantiate(
                     line,
-                    x, y, y_smooth,
-                    name = name,
-                    strength_bounds = self.strength_bounds[name],
-                    v_off_bounds = self.v_off_bounds[name],
-                    sigma_v_bounds = self.sigma_v_bounds[name],
-                    sigma_res = self.info.loading['sigma_res'],
-                    logger = logger,
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.y_smooth,
+                    name=name,
+                    strength_bounds=self.strength_bounds[name],
+                    v_off_bounds=self.v_off_bounds[name],
+                    sigma_v_bounds=self.sigma_v_bounds[name],
+                    sigma_res=self.info.loading['sigma_res'],
+                    logger=logger,
                 )
                 logger.debug(
                     ">>> Successfully instantiated line '{}' at {:.1f}." \
@@ -786,22 +808,26 @@ class LWindow(SpecData):
         msg = "Fitting model for {}: " \
             .format(self.__str__(simple=True).removesuffix('.'))
         
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c',
             covered=True,
-            valid=True,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             with_neighbours=with_neighbours,
+            valid=True,
+            log_valid=False,
             bg_flux=bg_flux,
-        )[:3]
+        )
         msg += f"no. of Gaussians: {self.model.n_submodels}, "
-        msg += f"no. of data points: {len(coords[0])}. "
+        msg += f"no. of data points: {masked_coords.size}. "
         
         with stopwatch() as watch:
             fit, fit_info = fitter(
                 self.model,
-                *coords, 
+                masked_coords.x,
+                masked_coords.y,
+                masked_coords.dy,
                 False,
             )
         
@@ -858,15 +884,17 @@ class LWindow(SpecData):
             return False
 
         if isinstance(evaluate_initial, (int, float)):
-            x, _, dy = self.getMaskedCoords.__wrapped__(
+            masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
+                mode='c',
                 covered=True,
-                valid=True,
-                bg_flux=bg_flux,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
                 with_neighbours=with_neighbours,
-            )[:3]
+                valid=True,
+                log_valid=False,
+                bg_flux=bg_flux,
+            )
 
             fs = (self.fits,) if self.fit.n_submodels == 1 else self.fit
             for f in filter(
@@ -874,7 +902,11 @@ class LWindow(SpecData):
                 fs,
             ):
                 # Interpolate noise level and compare with peak flux density
-                crit_val = evaluate_initial * interp(f.mu, x, dy)
+                crit_val = evaluate_initial * interp(
+                    f.mu, 
+                    masked_coords.x, 
+                    masked_coords.dy,
+                )
                 self.blacklist[f.pure_name] = (f.peak < crit_val)
 
         return True
@@ -892,18 +924,23 @@ class LWindow(SpecData):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        x, y, dy = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c',
             covered=True,
-            valid=True,
-            bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             with_neighbours=with_neighbours,
-        )[:3]
-
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
+        )
         if self.fit.n_submodels == 1:
-            data = (x, dy, (y - self.fit(x)) / dy)
+            data = (
+                masked_coords.x, 
+                masked_coords.dy, 
+                (masked_coords.y - self.fit(masked_coords.x)) / masked_coords.dy,
+            )
             submodel = self.fit
         else:
             fs = self.fit
@@ -916,18 +953,18 @@ class LWindow(SpecData):
             ))
             waves = [f.wave for f in valid_lines]
 
-            z = abs((y - self.fit(x)) / dy)
+            z = abs((masked_coords.y - self.fit(masked_coords.x)) / masked_coords.dy)
             z_convolved = convolve(
                 z, 
                 exp(-linspace(-3, 3, w)**2), 
                 mode='valid',
             )
-            z_interp = interp(waves, x[h:-h], z_convolved)
+            z_interp = interp(waves, masked_coords.x[h:-h], z_convolved)
 
             submodel: GaussianModel = valid_lines[argmax(z_interp).flatten()[0]]
             (lb, ub) = self.i_bounds[submodel.pure_name]
-            mask = (lb <= x) & (x < ub)
-            data = (x[mask], dy[mask], z[mask])
+            mask = (lb <= masked_coords.x) & (masked_coords.x < ub)
+            data = (masked_coords.x[mask], masked_coords.dy[mask], z[mask])
 
         # Check if submodel is a 'master' model in a multiplet
         return (
@@ -1672,22 +1709,26 @@ class LWindow(SpecData):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            covered = True,
-            valid = True,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            line = line,
-            limited = limited,
-            v_sep = v_sep,
-        )[:3]
+            mode=None,
+            covered=True,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
+            line=line,
+            limited=limited,
+            v_sep=v_sep,
+        )
         under = Under(
-            *coords,
-            fit = self.fits[n],
-            snr = self.info.lines['snr'],       #! Changing snr has not effect on model!
+            masked_coords.x,
+            masked_coords.y,
+            masked_coords.dy,
+            fit=self.fits[n],
+            snr=self.info.lines.snr, #! Changing snr has not effect on model!
         )
         return under(), under.getFeatures(as_dict=True)
     
@@ -1713,23 +1754,27 @@ class LWindow(SpecData):
 
         assert n < m
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            covered = True,
-            valid = True,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            line = line,
-            limited = limited,
-            v_sep = v_sep,
-        )[:3]
+            mode=None,
+            covered=True,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
+            line=line,
+            limited=limited,
+            v_sep=v_sep,
+        )
         over = Over(
-            *coords,
-            fit_initial = self.fits[n],
-            fit_final = self.fits[m],
-            snr = self.info.lines['snr'],       #! Changing snr has not effect on model!
+            masked_coords.x,
+            masked_coords.y,
+            masked_coords.dy,
+            fit_initial=self.fits[n],
+            fit_final=self.fits[m],
+            snr=self.info.lines.snr, #! Changing snr has not effect on model!
         )
         return over(), over.getFeatures(as_dict=True)
 

@@ -6,7 +6,6 @@ from numpy import isfinite
 from scipy.ndimage import binary_fill_holes
 from itertools import repeat
 from dataclasses import dataclass, field
-from scipy.optimize import OptimizeResult
 
 from quasar_typing.numpy import FloatVector
 from quasar_typing.bounds import CoordBounds, AstropyBounds
@@ -28,17 +27,13 @@ from ..utils.general import stopwatch
 
 logger = getLogger(__name__)
 
-@dataclass(init=False)
+@dataclass
 class IronWindows(SpecList[IWindow]):
-    templates: dict[str, IronTemplate] = field(default_factory=dict, init=False)
-    template_models: dict[str, IronModel] = field(default_factory=dict, init=False)
-    fit_info: FitInfo | None = field(default=None, init=False)
+    templates: dict[str, IronTemplate] = field(default_factory=dict, kw_only=True)
+    template_models: dict[str, IronModel] = field(default_factory=dict, kw_only=True)
+    fit_info: FitInfo | None = field(default=None, kw_only=True)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'fe'})
-
-    def __post_init__(self):
-        self.templates = {}
-        self.template_models = {}
 
     @property
     def sample(self) -> IronSampleList | None:
@@ -60,30 +55,38 @@ class IronWindows(SpecList[IWindow]):
         """
         kwargs = {}
         if self.spectrum is None:
-            coords_or_spectrum = self._coords
-            kwargs['info'] = self.info
+            kwargs['x'] = self._x
+            kwargs['y'] = self._y
+            kwargs['dy'] = self._dy
+            kwargs['dx'] = self._dx
+
             kwargs['y_smooth'] = self._y_smooth
             kwargs['y_pl'] = self._y_pl
             kwargs['y_fe'] = self._y_fe
             kwargs['y_ba'] = self._y_ba
             kwargs['y_hg'] = self._y_hg
             kwargs['y_em'] = self._y_em
+
             kwargs['rejected_pixels'] = self._rejected_pixels
             kwargs['absorbed_pixels'] = self._absorbed_pixels
             kwargs['valid_pixels'] = self._valid_pixels
             kwargs['log_valid_pixels'] = self._log_valid_pixels
             kwargs['p_absorbed'] = self._p_absorbed
+
             kwargs['x0'] = self.x0
             kwargs['y0'] = self.y0
             kwargs['x_log'] = self._x_log
             kwargs['y_log'] = self._y_log
             kwargs['dy_log'] = self._dy_log
+
+            kwargs['info'] = self.info
             kwargs['get_mask'] = self.get_mask
         else:
-            coords_or_spectrum = self.spectrum
+            kwargs['spectrum'] = self.spectrum
 
         for x_bounds in windows:
-            iwindow = IWindow(coords_or_spectrum, x_bounds=x_bounds, **kwargs)
+            kwargs['x_bounds'] = x_bounds
+            iwindow = IWindow.create.__wrapped__(IWindow, **kwargs)
             if iwindow.size > 0:
                 self.append(iwindow)
 
@@ -182,15 +185,13 @@ class IronWindows(SpecList[IWindow]):
         allow_interp_fitting: bool | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Loads all templates:
         >   which are specified by the user.
         >   which are covered by the iron windows.
 
         Should adapt the templates to the current spectrum covered by the 
         respective templates. 
-        """        
+        """
         if template_files is None:
             f = self.info.iron.or_default(locals())
             template_files = list(map(Path, f('template_files')))
@@ -229,7 +230,7 @@ class IronWindows(SpecList[IWindow]):
                 "of any IronTemplate!".format(mask.sum())
             logger.warning(msg)
             return self
-
+        
         x = self._x[mask]
         for template_file, s, b, r in zip(
             template_files, split, bias, ratio,
@@ -353,16 +354,18 @@ class IronWindows(SpecList[IWindow]):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c', # c: contiguous
             covered=covered,
-            valid=True,
-            bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
         )
-        n_pix = coords[0].size
 
+        n_pix = masked_coords.size
         if n_pix <= 2:
             msg = "cancelling raster fit due to insufficient no. of data " \
                 f"points (n_pix={n_pix} <= n_free_params=2)!"
@@ -370,7 +373,12 @@ class IronWindows(SpecList[IWindow]):
             return self
         
         for model in self.template_models.values():
-            model.rasterFit(*coords, inplace=True)
+            model.rasterFit(
+                masked_coords.x, 
+                masked_coords.y,
+                masked_coords.dy, 
+                inplace=True,
+            )
 
         self.updateIronEmission.__wrapped__(self, self.getModel())
         return self
@@ -419,7 +427,6 @@ class IronWindows(SpecList[IWindow]):
         
         self.fit_info = fit_info
         for template_model in ((fit,) if fit.n_submodels == 1 else fit):
-            key = template_model.name
             self.template_models[template_model.name] = template_model
 
         if update_emission:
@@ -441,8 +448,6 @@ class IronWindows(SpecList[IWindow]):
         fitter: FitterInstance | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Fits the available templates using a nonlinear optimiser. 
         """
         s = self.__str__(simple=True).removesuffix('.')
@@ -456,21 +461,24 @@ class IronWindows(SpecList[IWindow]):
             logger.warning(msg)
             covered = False
 
-        coords = self.getMaskedCoords.__wrapped__(
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            mode='c', # c: contiguous
             covered=covered,
-            valid=True,
-            bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
+            valid=True,
+            log_valid=False,
+            bg_flux=bg_flux,
         )
+
         model = self.getModel()
         if model is None:
             msg += "tried to fine-tune IronModels, but none are available!"
             logger.critical(msg)
             return self
 
-        n_pix = coords[0].size
+        n_pix = masked_coords.size
         n_free_params = sum(get_free_params(model).values())
 
         if n_pix <= n_free_params:
@@ -486,7 +494,13 @@ class IronWindows(SpecList[IWindow]):
 
         try:
             with stopwatch() as watch:
-                fit, fit_info = fitter(model, *coords, inplace=False)
+                fit, fit_info = fitter(
+                    model, 
+                    masked_coords.x, 
+                    masked_coords.y, 
+                    masked_coords.dy, 
+                    inplace=False,
+                )
             msg += "Successfully performed fine-tuning in {:.1f} ms." \
                 .format(1e3 * watch.elapsed)
             logger.debug(msg)
