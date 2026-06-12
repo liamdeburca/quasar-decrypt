@@ -11,16 +11,15 @@ from dataclasses import dataclass, field
 
 from .lwindow import LWindow
 from .graph_utils import Graph
-from ..utils import SpecList, get_log
+from ..utils import SpecList
 
 from quasar_typing.numpy import FloatVector, BoolVector
 from quasar_typing.pathlib import AbsoluteFilePath
-from quasar_typing.pandas import LineList
 from quasar_typing.astropy import CompoundModel_, FitInfo
 from quasar_typing.misc import BackgroundFlux
 
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
-from quasar_utils.pipeline.linelist import read_linelist
+from quasar_utils.pipeline.linelist import LineList
 from quasar_utils.fitting import FitterInstance
 
 from quasar_models.line import GaussianModel, _VProfileCopy
@@ -136,18 +135,18 @@ class LineWindows(SpecList[LWindow]):
         success = self.applyLineList.__wrapped__(
             self,
             linelist,
-            sigma_res = sigma_res,
-            v_sep = v_sep,
-            forced_splits = forced_splits,
-            min_fittable_total = min_fittable_total,
-            min_fittable_ratio = min_fittable_ratio,
+            sigma_res=sigma_res,
+            v_sep=v_sep,
+            forced_splits=forced_splits,
+            min_fittable_total=min_fittable_total,
+            min_fittable_ratio=min_fittable_ratio,
         )
         if success:
             logger.debug(msg + "success!")
         if not success: 
             logger.warning(msg + "failed!")
             return False
-        
+                
         if template_model is not None:
             logger.debug("Applying template model.")
             self.applyFit.__wrapped__(
@@ -331,7 +330,11 @@ class LineWindows(SpecList[LWindow]):
             kwargs['spectrum'] = self.spectrum
         
         if isinstance(linelist, Path):
-            linelist = read_linelist.__wrapped__(path=linelist, info=self.info)
+            linelist = LineList.read_csv.__wrapped__(
+                LineList,
+                path=linelist,
+                info=self.info,
+            )
 
         df = linelist.sort_values('line', inplace=False)
         if self.x_bounds[0] is not None:
@@ -363,6 +366,7 @@ class LineWindows(SpecList[LWindow]):
             _ = self[-1].add.__wrapped__(
                 self[-1],
                 row['name'],
+                row['complex'],
                 row['line'],
                 row['n_max'],
 
@@ -402,11 +406,12 @@ class LineWindows(SpecList[LWindow]):
         self, 
         linelist: AbsoluteFilePath | LineList,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if isinstance(linelist, Path):
-            linelist = read_linelist.__wrapped__(path=linelist, info=self.info)
+            linelist = LineList.read_csv.__wrapped__(
+                LineList,
+                path=linelist,
+                info=self.info,
+            )
 
         all_added_lines: set[str] = set()
         for lwindow in self:
@@ -452,9 +457,9 @@ class LineWindows(SpecList[LWindow]):
                 lwindow.add.__wrapped__(
                     lwindow,
                     row['name'],
+                    row['complex'],
                     row['line'],
                     row['n_max'],
-
                     needs_line=row['needs_line'],
                     strength_bounds=get_bounds('strength'),
                     v_off_bounds=get_bounds('v_off'),

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from numpy import (
-    inf, array, empty, invert, interp, exp, linspace, convolve, argmax, 
+    fromiter, empty, invert, interp, exp, linspace, convolve, argmax, 
     isfinite, unique, zeros_like, float64,
 )
 from scipy.ndimage import binary_dilation
@@ -56,6 +56,8 @@ type LineModel = GaussianModel | CompoundModel_[GaussianModel]
 @dataclass(kw_only=True)
 class LWindow(SpecData):
     names: set[str] = field(default_factory=set, kw_only=True)
+
+    complexes: dict[str, str] = field(default_factory=dict, kw_only=True)
     
     lines: dict[str, float] = field(default_factory=dict, kw_only=True)
     n_maxs: dict[str, int] = field(default_factory=dict, kw_only=True)
@@ -126,9 +128,6 @@ class LWindow(SpecData):
         reverse: bool | None = None,
         fitter: FitterInstance | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
         
@@ -226,35 +225,37 @@ class LWindow(SpecData):
         valid: bool = False,
         log_valid: bool = False,
         line: str | float | None = None,
+        complex_name: str | None = None,
         limited: bool = True,
         v_sep: float | None = None,
     ) -> BoolVector:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         mask = super().getMask.__wrapped__(
             self,
-            covered = covered,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            valid = valid,
-            log_valid = log_valid,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=valid,
+            log_valid=log_valid,
         )
         if with_neighbours and self.neighbours != (None, None):
             for cwindow in filter(lambda w: w is not None, self.neighbours):
                 mask |= cwindow.__wrapped__.getMask(
                     cwindow,
-                    covered = covered,
-                    without_rejections = without_rejections,
-                    without_absorption = without_absorption,
-                    valid = valid,
-                    log_valid = log_valid,
+                    covered=covered,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    valid=valid,
+                    log_valid=log_valid,
                 )
 
-        if line is not None:
+        if complex_name is not None:
+            bounds = self.i_bounds[complex_name]
+
+        elif line is not None:
             if isinstance(line, str):
                 if limited:
-                    bounds = self.i_bounds.get(line, (-inf, inf))
+                    # Based on 'i_bounds' -> find complex name
+                    bounds = self.i_bounds[self.complexes[line]]
                 else:
                     _line = self.lines[line]
                     bounds = (_line * (1 - v_sep), _line * (1 + v_sep))
@@ -284,6 +285,7 @@ class LWindow(SpecData):
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
         line: float | str | None = None,
+        complex_name: str | None = None,
         limited: bool = True,
         v_sep: float | None = None,
     ) -> MaskedCoords | ReadOnlyMaskedCoords | ContiguousMaskedCoords:
@@ -299,6 +301,7 @@ class LWindow(SpecData):
             valid=valid,
             log_valid=log_valid,
             line=line,
+            complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
         )
@@ -314,6 +317,7 @@ class LWindow(SpecData):
     def add(
         self, 
         name: str,
+        complex_name: str,
         line: float, 
         n_max: int,
         needs_line: str | None = None,
@@ -347,6 +351,7 @@ class LWindow(SpecData):
         if     ((self.x_bounds[0] < line) and (line < self.x_bounds[1])) \
             or force_add:
             self.names.add(name)
+            self.complexes[name] = complex_name
             
             self.lines           [name] = line
             self.n_maxs          [name] = n_max
@@ -384,6 +389,7 @@ class LWindow(SpecData):
     ) -> None:
         success = self.add.__wrapped__(
             self,
+            new_model.pure_name,
             new_model.pure_name,
             new_model.wave,
             1,
@@ -468,30 +474,67 @@ class LWindow(SpecData):
                 max(self.x_bounds[0], line * (1 - v_sep)),
                 min(self.x_bounds[1], line * (1 + v_sep)),
             )
-            self.i_bounds[name] = self.x_bounds
+
+            self.i_bounds[self.complexes[name]] = self.x_bounds
             self.v_off_bounds[name] = (
                 max(lower, self.x_bounds[0] / line - 1),
                 min(upper, self.x_bounds[1] / line - 1)
             )
 
         else:
-            # Sorted array of unique lines
-            _lines = unique(list(self.lines.values()))
+            # Create dictionary of complexes' bluest and reddest lines
 
-            # Multiple lines to consider. 
-            # Adjust integration bounds
-            _i_bounds = empty(_lines.size+1)
-            _i_bounds[0] = max(self.x_bounds[0], _lines[0] * (1 - v_sep))
-            _i_bounds[1:-1] = common_middle(
-                _lines[:-1], _lines[1:],
-                v_sep, v_sep,
+            complex_to_lines: dict[str, set[str]] = defaultdict(set)
+            for name, complex_name in self.complexes.items():
+                complex_to_lines[complex_name].add(name)
+
+            complex_bounds: dict[str, list[float]] = {}
+            for complex_name, names in complex_to_lines.items():
+                lines = sorted(self.lines[name] for name in names)
+                complex_bounds[complex_name] = [lines[0], lines[-1]]
+
+            del complex_to_lines
+
+            # Validate that complexes do not overlap
+            complex_bounds = dict(sorted(
+                complex_bounds.items(),
+                key=lambda item: item[1][0],
+            ))
+            complex_lbs = fromiter(
+                (val[0] for val in complex_bounds.values()),
+                float64,
             )
-            _i_bounds[-1] = min(self.x_bounds[1], _lines[-1] * (1 + v_sep))
+            complex_ubs = fromiter(
+                (val[1] for val in complex_bounds.values()),
+                float64,
+            )
+            if not (complex_lbs[1:] >= complex_ubs[:-1]).all():
+                msg = f"Complexes overlap: {complex_bounds=}"
+                logger.critical(msg)
+                raise ValueError(msg)
+            
+            n_complexes = len(complex_bounds)
+            _i_bounds = empty(n_complexes+1)
 
-            _dict = dict(zip(_lines, zip(_i_bounds[:-1], _i_bounds[1:])))
-            for name, line in self.lines.items():
-                self.i_bounds[name] = _dict[line]
+            _i_bounds[0] = max(
+                complex_lbs[0] * (1 - v_sep),
+                self.x_bounds[0],
+            )
+            _i_bounds[-1] = min(
+                complex_ubs[-1] * (1 + v_sep),
+                self.x_bounds[1],
+            )
+            if n_complexes > 1:
+                _i_bounds[1:-1] = [
+                    common_middle(ub_left, lb_right, v_sep, v_sep)
+                    for ub_left, lb_right
+                    in zip(complex_ubs[:-1], complex_lbs[1:])
+                ]
 
+            self.i_bounds = dict(zip(
+                complex_bounds.keys(),
+                zip(_i_bounds[:-1], _i_bounds[1:]),
+            ))
             self.x_bounds = (_i_bounds[0], _i_bounds[-1])
 
             # Update velocity offset bounds
@@ -508,8 +551,15 @@ class LWindow(SpecData):
                 else:
                     v_off_bounds[line] = b
 
-            lower_bounds = array([v_off_bounds[line][0] for line in _lines])
-            upper_bounds = array([v_off_bounds[line][1] for line in _lines])
+            _lines = unique(list(self.lines.values()))
+            lower_bounds = fromiter(
+                (v_off_bounds[line][0] for line in _lines),
+                float64,
+            )
+            upper_bounds = fromiter(
+                (v_off_bounds[line][1] for line in _lines),
+                float64,
+            )
 
             _x = empty(_lines.size+1)
             _x[0] = max(self.x_bounds[0], _lines[0] * (1 + lower_bounds[0]))
@@ -612,9 +662,6 @@ class LWindow(SpecData):
         min_fittable_ratio: float | None = None,
         v_sep: float | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         logger.debug(f"Grading lines in {self.__str__(simple=True)}:")
 
         lines_to_remove: set[str] = set()
@@ -623,11 +670,12 @@ class LWindow(SpecData):
             if (name in self.is_copy_of) or (name in self.is_multiplet_of):
                 continue
 
+            complex_name = self.complexes[name]
             mask = self.getMask.__wrapped__(
                 self,
                 with_neighbours=with_neighbours,
                 covered=True,
-                line=line,
+                complex_name=complex_name,
                 limited=True,
                 v_sep=v_sep,
             )
@@ -641,7 +689,7 @@ class LWindow(SpecData):
 
             msg = ">>> [{:.1f} <-> {:.1f}] w/ {}/{n} (fit.)," \
                 "{}/{n} (abs.), {}/{n} (inv.): " \
-                .format(*self.i_bounds[name], f, a, i, n=n)
+                .format(*self.i_bounds[complex_name], f, a, i, n=n)
             
             if f == 0:
                 msg += "No valid data -> removing line '{}' at {:.1f}!" \
@@ -676,8 +724,6 @@ class LWindow(SpecData):
         v_sep: float | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Quickly instantiates each submodel using the data in its nearest
         vicinity. The amgorithm is described in my thesis (steps 1 and 2 prefer
         smoothed flux density values, step 3 does not.):
@@ -714,7 +760,7 @@ class LWindow(SpecData):
 
         models: dict[str, GaussianModel] = {}
         for name, line in self.sortLines():
-            if line in self.cropped:
+            if name in self.cropped:
                 continue
 
             if name in self.is_multiplet_of:
@@ -739,7 +785,7 @@ class LWindow(SpecData):
                 valid=True,
                 log_valid=False,
                 bg_flux=bg_flux,
-                line=name,
+                complex_name=self.complexes[name], # Integrate over the complex, not the individual line
                 limited=True,
                 v_sep=v_sep,
             )
@@ -962,7 +1008,11 @@ class LWindow(SpecData):
             z_interp = interp(waves, masked_coords.x[h:-h], z_convolved)
 
             submodel: GaussianModel = valid_lines[argmax(z_interp).flatten()[0]]
-            (lb, ub) = self.i_bounds[submodel.pure_name]
+
+            name = submodel.pure_name
+            complex_name = self.complexes[name]
+
+            (lb, ub) = self.i_bounds[complex_name]
             mask = (lb <= masked_coords.x) & (masked_coords.x < ub)
             data = (masked_coords.x[mask], masked_coords.dy[mask], z[mask])
 
@@ -1001,12 +1051,12 @@ class LWindow(SpecData):
         if self.fit is None:
             self.makeInitialFit.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                evaluate_initial = evaluate_initial,
-                fitter = fitter,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                evaluate_initial=evaluate_initial,
+                fitter=fitter,
             )
 
         continue_fitting: bool = True
@@ -1124,12 +1174,12 @@ class LWindow(SpecData):
                     self.model = sum(submodels[1:], start=submodels[0])
                     self.fitModel.__wrapped__(
                         self,
-                        update_flux = False,
-                        bg_flux = bg_flux,
-                        without_rejections = without_rejections,
-                        without_absorption = without_absorption,
-                        with_neighbours = with_neighbours,
-                        fitter = fitter,
+                        update_flux=False,
+                        bg_flux=bg_flux,
+                        without_rejections=without_rejections,
+                        without_absorption=without_absorption,
+                        with_neighbours=with_neighbours,
+                        fitter=fitter,
                     )
 
                 else:
@@ -1265,12 +1315,12 @@ class LWindow(SpecData):
 
         success = self.fitModel.__wrapped__(
             self,
-            update_flux = False,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours, 
-            fitter = fitter, 
+            update_flux=False,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours, 
+            fitter=fitter, 
         )
         if not success:
             msg += "Fitting the cropped model failed -> skipping cropping!"
@@ -1280,13 +1330,13 @@ class LWindow(SpecData):
             self,
             self.fit.n_submodels,       #? Cropped fit
             self.fit.n_submodels + 1,   #? Previous fit
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            line = removed_line.wave,
-            limited = limited,
-            v_sep = v_sep,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            line=removed_line.wave,
+            limited=limited,
+            v_sep=v_sep,
         )
         if is_over or False: #? 'False' is placeholder for VETO function
             #* Removing the single line had no significant impact
@@ -1296,15 +1346,15 @@ class LWindow(SpecData):
             self.cropped.add(removed_line.pure_name)
             return self.cropFit.__wrapped__(
                 self,
-                bg_flux = bg_flux,
-                without_rejections = without_rejections,
-                without_absorption = without_absorption,
-                with_neighbours = with_neighbours,
-                limited = limited,
-                v_sep = v_sep,
-                measure = measure,
-                reverse = reverse,
-                fitter = fitter,
+                bg_flux=bg_flux,
+                without_rejections=without_rejections,
+                without_absorption=without_absorption,
+                with_neighbours=with_neighbours,
+                limited=limited,
+                v_sep=v_sep,
+                measure=measure,
+                reverse=reverse,
+                fitter=fitter,
             )
         else:
             #* Recursion ends -> update 'fit' and 'fit_info' attributes
@@ -1618,6 +1668,7 @@ class LWindow(SpecData):
             raise ValueError(f"line '{name}' not in 'self.names'!")
         
         self.names.remove(name)
+        self.complexes.pop(name)
         
         del self.lines [name]
         del self.n_maxs[name]
@@ -1670,6 +1721,7 @@ class LWindow(SpecData):
         return self
 
     def reformatFit(self) -> Self:
+        #! Make this method inplace, i.e. no final 'sum'?
         assert self.fit is not None
 
         if self.fit.n_submodels == 1:
@@ -1700,6 +1752,7 @@ class LWindow(SpecData):
         without_absorption: bool = False,
         with_neighbours: bool = False,
         line: str | float | None = None,
+        complex_name: str | None = None,
         limited: bool = False,
         v_sep: float | None = None,
     ) -> tuple[bool, FloatVector]:
@@ -1720,6 +1773,7 @@ class LWindow(SpecData):
             log_valid=False,
             bg_flux=bg_flux,
             line=line,
+            complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
         )
@@ -1743,6 +1797,7 @@ class LWindow(SpecData):
         without_absorption: bool = False,
         with_neighbours: bool = False,
         line: str | float | None = None,
+        complex_name: str | None = None,
         limited: bool = False,
         v_sep: float | None = None,
     ) -> tuple[bool, FloatVector]:
@@ -1765,6 +1820,7 @@ class LWindow(SpecData):
             log_valid=False,
             bg_flux=bg_flux,
             line=line,
+            complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
         )

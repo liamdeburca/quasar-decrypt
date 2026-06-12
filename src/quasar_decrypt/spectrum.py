@@ -14,7 +14,6 @@ from quasar_errors.bootstrapping import BaseBootstrapper
 from quasar_errors.nested_sampling import BaseNestedSampler, UniformNestedSampler
 from quasar_errors.spectrum_utils import (
     format_bootstrapping_kwargs_for_spectrum,
-    format_nested_sampling_kwargs_for_spectrum,
 )
 from quasar_errors.error_result import ErrorResult
 from quasar_errors.model_samples import (
@@ -26,10 +25,11 @@ from quasar_utils.fitting import FitterInstance
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.absorption import remove_absorption, smooth_spectrum
 from quasar_utils.continuum_fit_result import ContinuumFitResult
+from quasar_utils.pipeline.linelist import LineList
 
 from quasar_typing.numpy import FloatVector, BoolVector, RandomState_
 from quasar_typing.bounds import CoordBounds, AstropyBounds
-from quasar_typing.pandas import LineList
+
 from quasar_typing.pathlib import (
     AbsoluteFilePath, AbsoluteDirPath, RelativeFilePath, AbsoluteFITSPath,
 )
