@@ -1,7 +1,7 @@
 __all__ = ['LWindow']
 
 from logging import getLogger
-from typing import Self, Iterable, ClassVar, Literal
+from typing import Self, Iterable, ClassVar, Literal, Union, Optional
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from matplotlib.figure import Figure
@@ -37,9 +37,16 @@ from quasar_utils.decorators import validate_call, validated_apply_info_to_metho
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 from quasar_utils.fitting import FitterInstance
 
-from quasar_models import PowerLawModel, GaussianModel, IronModel, BalmerModel
+from quasar_models import (
+    PowerLawModel, 
+    GaussianModel, 
+    IronModel, 
+    BalmerModel,
+    HostGalaxyModel,
+)
 from quasar_models.line import _VProfileCopy, VProfileCopyDict, VProfileCopy1G
 from quasar_models.utils.astropy import apply_bounds, order_submodels
+from quasar_models.utils.prepare_model import PrepareModel
 
 from quasar_plotting import quickplot, absorptionplot, fitplot
 from quasar_plotting.utils import get_coords
@@ -51,7 +58,7 @@ from ..utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, Contiguous
 
 logger = getLogger(__name__)
 
-type LineModel = GaussianModel | CompoundModel_[GaussianModel]
+type LineModel = Union[GaussianModel, CompoundModel_[GaussianModel]]
 
 @dataclass(kw_only=True)
 class LWindow(SpecData):
@@ -262,6 +269,7 @@ class LWindow(SpecData):
             else:
                 bounds = (line * (1 - v_sep), line * (1 + v_sep))
 
+        if 'bounds' in locals():
             idx_left, idx_right = get_bounds_indices(self._x, bounds)
 
             lmask = mask.copy()
@@ -625,7 +633,7 @@ class LWindow(SpecData):
                 neighbours!"
             logger.critical(msg)
             raise ValueError(msg)
-        elif self.spectrum['pl'] is None:
+        elif self.spectrum.pl is None:
             msg = "LWindow's `spectrum` must have a `continuum_windows` \
                 attribute to prepare neighbours!"
             logger.critical(msg)
@@ -840,8 +848,6 @@ class LWindow(SpecData):
         fitter: FitterInstance | None = None,
     ) -> bool:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Fits the available model using the specified non-linear fitting 
         algorithm. The resultant fit is assigned to the 'fit' attribute, and 
         saved in the 'fits' (dict) attribute whereafter in can be accessed using 
@@ -868,13 +874,14 @@ class LWindow(SpecData):
         msg += f"no. of Gaussians: {self.model.n_submodels}, "
         msg += f"no. of data points: {masked_coords.size}. "
         
-        with stopwatch() as watch:
-            fit, fit_info = fitter(
-                self.model,
+        with stopwatch() as watch, \
+            PrepareModel(x=masked_coords.x, model=self.model, copy=True) as fit:
+            _, fit_info = fitter(
+                fit,
                 masked_coords.x,
                 masked_coords.y,
                 masked_coords.dy,
-                False,
+                inplace=True,
             )
         
         msg += "Finished fitting in {:.1f} ms." \
@@ -942,7 +949,7 @@ class LWindow(SpecData):
                 bg_flux=bg_flux,
             )
 
-            fs = (self.fits,) if self.fit.n_submodels == 1 else self.fit
+            fs = (self.fit,) if self.fit.n_submodels == 1 else self.fit
             for f in filter(
                 lambda f: not self.blacklist[f.pure_name], 
                 fs,
@@ -1116,6 +1123,7 @@ class LWindow(SpecData):
                         strength_scale_value=self.scale_init[mimic],
                         strength_scale_bounds=self.scale_bounds[mimic],
                         strength_scale_fixed=self.scale_fixed[mimic],
+                        adapt=True,
                         freeze=False,
                     )
 
@@ -1367,7 +1375,7 @@ class LWindow(SpecData):
             return True
 
     @validate_call
-    def getModel(self, thaw: bool = False) -> CompoundModel_ | None:
+    def getModel(self, thaw: bool = False) -> Optional[CompoundModel_]:
         """
         Retrieves this 'LWindow's current fit/model if available. 
 
@@ -1555,7 +1563,7 @@ class LWindow(SpecData):
     @validate_call
     def adoptFit(
         self,
-        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        fit: Union[GaussianModel, type[_VProfileCopy], CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
         *,
         fit_info: FitInfo | None = None,
         update_emission: bool = False,
@@ -1600,7 +1608,7 @@ class LWindow(SpecData):
     @validate_call
     def applyFit(
         self,
-        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        fit: Union[GaussianModel, type[_VProfileCopy], CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
         *,
         fit_info: FitInfo | None = None,
         freeze: bool = False,
@@ -1632,7 +1640,7 @@ class LWindow(SpecData):
     @validate_call
     def updateLinesEmission(
         self,
-        model: GaussianModel | CompoundModel_[GaussianModel] | None,
+        model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]],
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -1697,7 +1705,7 @@ class LWindow(SpecData):
     def getConfiguration(
         self,
         *,
-        model: CompoundModel_ | None = None,
+        model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]] = None,
     ) -> dict[str, int]:
         """
         Counts the number of submodels with the same `pure_name` attribute in 
@@ -1840,10 +1848,10 @@ class LWindow(SpecData):
     def instantiateBootstrapper(
         self,
         *,
-        pl: PowerLawModel | None = None,
-        fe: IronModel | None = None,
-        ba: BalmerModel | None = None,
-        hg: None = None,
+        pl: Optional[PowerLawModel] = None,
+        fe: Optional[IronModel] = None,
+        ba: Optional[BalmerModel] = None,
+        hg: Optional[HostGalaxyModel] = None,
 
         model_types: ModelTypes | None = None,
 
@@ -1929,9 +1937,9 @@ class LWindow(SpecData):
         without_absorption: bool = False,
         cfit: ContinuumFitResult | None = None,
         pool: Pool_ | None = None,
-        pl_model: PowerLawModel | None = None,
-        fe_model: IronModel | None = None,
-        ba_model: BalmerModel | None = None,
+        pl_model: Optional[PowerLawModel] = None,
+        fe_model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        ba_model: Optional[BalmerModel] = None,
 
         fitter: FitterInstance | None = None,
         scale: Scale | None = None,
@@ -2276,6 +2284,7 @@ class LWindow(SpecData):
     ) -> tuple[Figure, list[Axes, Axes]]:
         xlim = xlim or self.x_bounds
         model = (self.spectrum or self).getModel() if plot_components else None
+        coords = get_coords(self, x_bounds=xlim, replace_with_nan=False)
         if model is not None:
             ms = (model,) if model.n_submodels == 1 else model
             submodels = []
@@ -2285,15 +2294,12 @@ class LWindow(SpecData):
 
             model = sum(submodels[1:], start=submodels[0]) if submodels else None
 
-        return fitplot(
-            get_coords(self, x_bounds=xlim, replace_with_nan=False),
-            self.info,
-            model=model,
+        kwargs = dict(
             plot_type=plot_type,
             figure=figure,
             figsize=figsize,
             dpi=dpi,
-            title=title or self.__str__(simple=True).removesuffix('.'),
+            title=title or self.__str__(),
             height_ratio=height_ratio,
             n_sigma=n_sigma,
             xlabel=xlabel or 'auto',
@@ -2319,4 +2325,28 @@ class LWindow(SpecData):
             logy=logy,
             cmap_name=cmap_name,
             distinguish_narrow=distinguish_narrow,
+        )
+
+        if plot_components:
+            model = (self.spectrum or self).getModel()
+            submodels = [
+                m for m in ((model,) if model.n_submodels == 1 else model)
+                if (m.model_type in {'pl', 'fe', 'ba', 'hg'}) 
+                    or (m.pure_name in self.names)
+            ]
+            model = sum(submodels[1:], start=submodels[0]) if submodels else None
+
+            with PrepareModel(x=coords.x, model=model):
+                return fitplot(
+                    coords,
+                    self.info,
+                    model=model,
+                    **kwargs,
+                )
+
+        return fitplot(
+            coords,
+            self.info,
+            model=None,
+            **kwargs,
         )

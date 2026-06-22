@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Self, ClassVar
+from typing import Self, ClassVar, Optional
 from dataclasses import dataclass, field
 from numpy import dot
 
@@ -18,9 +18,9 @@ logger = getLogger(__name__)
 @dataclass(init=False)
 class CWindow(SpecData):
     fit_info: FitInfo | None = field(default=None, init=False)
-    fit: PowerLawModel | None = field(default=None, init=False)
-    fit_raw: PowerLawModel | None = field(default=None, init=False)
-    fit_sc: PowerLawModel | None = field(default=None, init=False)
+    fit: Optional[PowerLawModel] = field(default=None, init=False)
+    fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
+    fit_sc: Optional[PowerLawModel] = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'pl'})
 

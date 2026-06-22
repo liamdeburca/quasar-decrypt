@@ -1,7 +1,7 @@
 __all__ = ['ContinuumWindows']
 
 from logging import getLogger
-from typing import Self, ClassVar, Iterable
+from typing import Self, ClassVar, Iterable, Optional
 from dataclasses import dataclass, field
 from numpy import zeros_like
 
@@ -21,6 +21,7 @@ from quasar_utils.fitting import FitterInstance
 
 from quasar_models.continuum import PowerLawModel
 from quasar_models.utils.astropy import apply_bounds, get_free_params
+from quasar_models.utils.prepare_model import PrepareModel
 
 from quasar_errors.model_samples import PowerLawSample
 
@@ -29,9 +30,10 @@ logger = getLogger(__name__)
 @dataclass(init=False)
 class ContinuumWindows(SpecList[CWindow]):
     fit_info: FitInfo | None = field(default=None, init=False)
-    fit_raw: PowerLawModel | None = field(default=None, init=False)
-    fit_sc: PowerLawModel | None = field(default=None, init=False)
-    fit: PowerLawModel | None = field(default=None, init=False)
+
+    fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
+    fit_sc: Optional[PowerLawModel] = field(default=None, init=False)
+    fit: Optional[PowerLawModel] = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'pl'})
 
@@ -50,9 +52,6 @@ class ContinuumWindows(SpecList[CWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD // INFO APPLIED TO METHOD **
-        """
         kwargs = {}
         if self.spectrum is None:
             kwargs['x'] = self._x
@@ -96,7 +95,7 @@ class ContinuumWindows(SpecList[CWindow]):
     def __call__(
         self,
         *,
-        template_model: PowerLawModel | None = None,
+        template_model: Optional[PowerLawModel] = None,
         bg_flux: BackgroundFlux | None = None,
 
         sigmas: list[float] | None = None,
@@ -104,9 +103,6 @@ class ContinuumWindows(SpecList[CWindow]):
         alpha_bounds: AstropyBounds | None = None,
         fitter: FitterInstance | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
         
         if bg_flux is None:
@@ -200,12 +196,13 @@ class ContinuumWindows(SpecList[CWindow]):
         msg += f" No. of data points: {masked_coords.size}."
 
         if self.fit_raw is None:
-            prev_model = PowerLawModel(
-                self.x0, 
-                self.y0, 
+            prev_model = PowerLawModel.create(
+                self.x0,
+                self.y0,
                 apply_bounds.__wrapped__(masked_coords.y.mean(), flux_bounds),
                 apply_bounds.__wrapped__(0, alpha_bounds),
                 name='powerlaw_model',
+                
             )
             prev_model.flux.bounds = flux_bounds
             prev_model.alpha.bounds = alpha_bounds
@@ -403,12 +400,16 @@ class ContinuumWindows(SpecList[CWindow]):
             return False
         
         try:
-            with stopwatch() as watch:
-                fit, fit_info = fitter(
-                    model, 
-                    masked_coords.x, masked_coords.y, masked_coords.dy, 
-                    inplace=False,
+            with stopwatch() as watch, \
+                PrepareModel(x=masked_coords.x, model=model, copy=True) as fit:
+                _, fit_info = fitter(
+                    fit, 
+                    masked_coords.x, 
+                    masked_coords.y, 
+                    masked_coords.dy, 
+                    inplace=True,
                 )
+
             msg += "Successfully performed fine-tuning in {:.1f} ms: " \
                 "flux={:.1f} ({:.1f},{:.1f}), " \
                 "alpha={:.2f} ({:.2f},{:.2f})" \
@@ -427,6 +428,7 @@ class ContinuumWindows(SpecList[CWindow]):
         except Exception as e:
             msg += f"failed fitting due to an unexpected error: {e}"
             logger.warning(msg)
+            raise e
             self.applyFit.__wrapped__(self, self.getModel())
             return False
 

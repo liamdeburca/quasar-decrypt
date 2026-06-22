@@ -1,7 +1,7 @@
 __all__ = ['_SpecData']
 
 from logging import getLogger
-from typing import Self, Callable, Literal, Any
+from typing import Self, Callable, Literal, Optional, Union
 from dataclasses import field
 from pydantic.dataclasses import dataclass
 from numpy import invert, zeros_like, isfinite, ones_like, float64, bool_, ascontiguousarray, inf
@@ -11,6 +11,7 @@ from quasar_models.iron import IronModel
 from quasar_models.balmer import BalmerModel
 from quasar_models.line import GaussianModel
 from quasar_models.host import HostGalaxyModel
+from quasar_models.utils.prepare_model import PrepareModel
 
 from quasar_utils.setup import Info
 from quasar_utils.decorators import validate_call
@@ -158,7 +159,7 @@ class _SpecData:
         info: Info = None,
         x_bounds: CoordBounds | None = None,
         get_mask: Callable[[float, float], BoolVector] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict:
         kwargs = {
             '_x': x,
             '_y': y,
@@ -294,12 +295,12 @@ class _SpecData:
             
         return s + '.'
 
-    def __getstate__(self) -> dict[str, Any]:
+    def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state.pop('get_mask', None)
         return state
 
-    def __setstate__(self, state) -> None:
+    def __setstate__(self, state: dict) -> None:
         state['get_mask'] = create_cached_get_mask(state['_x'], maxsize=1)
         self.__dict__.update(state)
 
@@ -570,7 +571,7 @@ class _SpecData:
     @validate_call
     def updateContinuumEmission(
         self,
-        model: PowerLawModel | None = None,
+        model: Optional[PowerLawModel] = None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -584,18 +585,20 @@ class _SpecData:
     @validate_call
     def updateIronEmission(
         self,
-        model: IronModel | CompoundModel_[IronModel] | None = None,
+        model: Union[IronModel, CompoundModel_[IronModel], None] = None,
     ) -> Self:
         self._y_fe[:] = 0
         if model is not None:
             mask = isfinite(self._x)
-            self._y_fe[mask] = model(self._x[mask])
+            x = self._x[mask]
+            with PrepareModel(x=x, model=model):
+                self._y_fe[mask] = model(x)
         return self
 
     @validate_call
     def updateBalmerEmission(
         self,
-        model: BalmerModel | None = None,
+        model: Optional[BalmerModel] = None,
     ) -> Self:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -603,24 +606,28 @@ class _SpecData:
         self._y_ba[:] = 0
         if model is not None:
             mask = isfinite(self._x)
-            self._y_ba[mask] = model(self._x[mask])
+            x = self._x[mask]
+            with PrepareModel(x=x, model=model):
+                self._y_ba[mask] = model(x)
         return self
 
     @validate_call
     def updateHostGalaxyEmission(
         self,
-        model: HostGalaxyModel | None = None,
+        model: Optional[HostGalaxyModel] = None,
     ) -> Self:
         self._y_hg[:] = 0
         if model is not None:
             mask = isfinite(self._x)
-            self._y_hg[mask] = model(self._x[mask])
+            x = self._x[mask]
+            with PrepareModel(x=x, model=model):
+                self._y_hg[mask] = model(x)
         return self
 
     @validate_call
     def updateLinesEmission(
         self,
-        model: GaussianModel | CompoundModel_[GaussianModel] | None = None,
+        model: Union[GaussianModel, CompoundModel_[GaussianModel], None] = None,
     ) -> Self:
         self._y_em[:] = 0
         if model is not None:

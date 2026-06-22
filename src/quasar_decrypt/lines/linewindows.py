@@ -1,7 +1,7 @@
 __all__ = ['LineWindows']
 
 from logging import getLogger
-from typing import Self, ClassVar, Literal
+from typing import Self, ClassVar, Literal, Union, Optional
 from numpy import zeros_like
 from pathlib import Path
 from itertools import product
@@ -97,7 +97,7 @@ class LineWindows(SpecList[LWindow]):
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
-        template_model: GaussianModel | CompoundModel_[GaussianModel] | None = None,
+        template_model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]] = None,
 
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
@@ -152,7 +152,7 @@ class LineWindows(SpecList[LWindow]):
             self.applyFit.__wrapped__(
                 self,
                 template_model,
-                adopt_as_template=True,
+                update_emission=True,
             )
             for lwindow in self:
                 lwindow.fitModel.__wrapped__(
@@ -394,10 +394,11 @@ class LineWindows(SpecList[LWindow]):
                 min_fittable_total=min_fittable_total,
                 min_fittable_ratio=min_fittable_ratio,
             )
-            lwindow.prepareNeighbours.__wrapped__(
-                lwindow,
-                sigma_res=sigma_res,
-            )
+            if self.spectrum is not None and self.spectrum.pl is not None:
+                lwindow.prepareNeighbours.__wrapped__(
+                    lwindow,
+                    sigma_res=sigma_res,
+                )
 
         return True
     
@@ -523,7 +524,7 @@ class LineWindows(SpecList[LWindow]):
                 return list(range(len(self)))
         return self.graph.expand(inplace=True).createChain()
 
-    def getModel(self) -> GaussianModel | CompoundModel_[GaussianModel] | None:
+    def getModel(self) -> Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]]:
         """
         Retrieves and combines each 'LWindow's current fit/model, combining them
         into a single model. 
@@ -545,7 +546,7 @@ class LineWindows(SpecList[LWindow]):
     @validate_call
     def adoptFit(
         self,
-        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        fit: Union[GaussianModel, _VProfileCopy, CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
         *,
         fit_info: FitInfo | None = None,
         update_emission: bool = False,
@@ -592,7 +593,7 @@ class LineWindows(SpecList[LWindow]):
     @validate_call
     def applyFit(
         self,
-        fit: GaussianModel | _VProfileCopy | CompoundModel_[GaussianModel | _VProfileCopy],
+        fit: Union[GaussianModel, _VProfileCopy, CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
         *,
         fit_info: FitInfo | None = None,
         freeze: bool = False,

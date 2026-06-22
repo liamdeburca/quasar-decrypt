@@ -3,7 +3,7 @@ __all__ = ['Over']
 from logging import getLogger
 from pathlib import Path
 from pickle import load
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, Union
 from scipy.stats import chi2
 from numpy import float64, dot, zeros_like, log, minimum, maximum, nan_to_num, inf, empty
 from functools import lru_cache, cached_property
@@ -32,7 +32,7 @@ def _get_classifiers() -> dict[int, Callable]:
 
 ###
 
-def _number_of_free_params(model: Model_ | CompoundModel_) -> int:
+def _number_of_free_params(model: Union[Model_, CompoundModel_]) -> int:
     n = 0
     ms = (model,) if model.n_submodels == 1 else model
     for m in ms:

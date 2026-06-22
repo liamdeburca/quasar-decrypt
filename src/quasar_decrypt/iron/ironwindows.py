@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Self, Literal, ClassVar, Iterable
+from typing import Self, Literal, ClassVar, Iterable, Optional, Union
 from pathlib import Path
 from pydantic import ValidationError
 from numpy import isfinite
@@ -15,6 +15,7 @@ from quasar_typing.misc import BackgroundFlux
 
 from quasar_models.iron import IronModel, IronTemplate
 from quasar_models.utils.astropy import apply_bounds, get_free_params
+from quasar_models.utils.prepare_model import PrepareModel
 
 from quasar_utils.decorators import validate_call, validated_apply_info_to_method
 from quasar_utils.fitting import FitterInstance
@@ -50,9 +51,6 @@ class IronWindows(SpecList[IWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         kwargs = {}
         if self.spectrum is None:
             kwargs['x'] = self._x
@@ -96,12 +94,12 @@ class IronWindows(SpecList[IWindow]):
     def __call__(
         self,
         *,
-        template_model: IronModel | CompoundModel_[IronModel] | None = None,
+        template_model: Optional[Union[IronModel, CompoundModel_[IronModel]]] = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = True,
         without_absorption: bool = True,
 
-        template_files: list[AbsoluteFITSPath] | None = None, 
+        template_files: list[AbsoluteFITSPath | str] | None = None, 
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -125,7 +123,7 @@ class IronWindows(SpecList[IWindow]):
             self.applyFit.__wrapped__(
                 self,
                 template_model,
-                adopt_as_template=True,
+                update_emission=True,
             )
             self.performFineTuning.__wrapped__(
                 self, 
@@ -173,7 +171,7 @@ class IronWindows(SpecList[IWindow]):
     def loadTemplates(
         self,
         *,
-        template_files: list[AbsoluteFITSPath] | None = None, 
+        template_files: list[AbsoluteFITSPath | str] | None = None, 
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -228,7 +226,7 @@ class IronWindows(SpecList[IWindow]):
         if mask.sum() < 2:
             msg = "Not enough valid pixels ({}) available to check coverage " \
                 "of any IronTemplate!".format(mask.sum())
-            logger.warning(msg)
+            logger.info(msg)
             return self
         
         x = self._x[mask]
@@ -236,14 +234,14 @@ class IronWindows(SpecList[IWindow]):
             template_files, split, bias, ratio,
         ):
             try:
-                template: IronTemplate = IronTemplate.load_from_cache(
-                    template_file, 
+                template = IronTemplate.load_from_cache(
+                    name=template_file, 
                     info=self.info,
                 ).copy(with_matrices=True)
             except FileNotFoundError:
                 msg = f"Could not find template file '{template_file}' -> "\
                     "Skipping."
-                logger.warning(msg)
+                logger.info(msg)
                 continue
 
             # Check template-coverage
@@ -287,13 +285,17 @@ class IronWindows(SpecList[IWindow]):
                 msg = f"IronTemplate @ {template_file} will be transformed to "\
                     "logspace, which may be inefficient for pipelines. "\
                     "Consider caching a logspace-equivalent of this IronTemplate."
-                logger.warning(msg)
+                logger.info(msg)
 
                 tx_wide = template.x[binary_fill_holes(template.data[-1] > 0)]
                 mask = isfinite(self._x) \
                     & (tx_wide[0] <= self._x) & (self._x <= tx_wide[-1])
                 
-                template.createLogspace(self._x[mask], inplace=True, keep_x=True)
+                template = template.createLogspace(
+                    sigma_res=self.info.loading.sigma_res,
+                    xr=self._x[mask], 
+                    keep_x=True,
+                )
 
             # Resample template if necessary
             if resample:
@@ -314,20 +316,19 @@ class IronWindows(SpecList[IWindow]):
 
             self.templates[template.name] = template
 
-            model: IronModel = IronModel(
+            model = IronModel.create(
                 apply_bounds.__wrapped__(1.0, flux_bounds),
                 apply_bounds.__wrapped__(template.fwhm[0], fwhm_bounds),
-                info=self.info,
+                scale=self.info.iron.scale,
                 template=template, 
                 split=s,
                 left=1.0,
                 right=1.0,
                 allow_interp_fitting=allow_interp_fitting, 
-                name=template.name,
             )
             model.flux.bounds = flux_bounds
             model.fwhm.bounds = fwhm_bounds
-
+            
             self.template_models[model.name] = model
 
         return self
@@ -342,13 +343,11 @@ class IronWindows(SpecList[IWindow]):
         bg_flux: BackgroundFlux | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Fits the available templates using rasterisation.
         """
         if covered and self.is_empty:
             msg = f"Setting {covered=} to False due to empty IronWindows!"
-            logger.warning(msg)
+            logger.info(msg)
             covered = False
 
         if bg_flux is None:
@@ -369,11 +368,12 @@ class IronWindows(SpecList[IWindow]):
         if n_pix <= 2:
             msg = "cancelling raster fit due to insufficient no. of data " \
                 f"points (n_pix={n_pix} <= n_free_params=2)!"
-            logger.warning(msg)
+            logger.info(msg)
             return self
         
         for model in self.template_models.values():
-            model.rasterFit(
+            model.rasterFit.__wrapped__(
+                model,
                 masked_coords.x, 
                 masked_coords.y,
                 masked_coords.dy, 
@@ -383,7 +383,7 @@ class IronWindows(SpecList[IWindow]):
         self.updateIronEmission.__wrapped__(self, self.getModel())
         return self
 
-    def getModel(self) -> IronModel | CompoundModel_[IronModel] | None:
+    def getModel(self) -> Optional[Union[IronModel, CompoundModel_[IronModel]]]:
         """
         Combines the available templates into a single (Split) TemplateModel or
         AstroPy compound model.
@@ -394,7 +394,7 @@ class IronWindows(SpecList[IWindow]):
     @validate_call
     def adoptFit(
         self,
-        fit: IronModel | CompoundModel_[IronModel],
+        fit: Union[IronModel, CompoundModel_[IronModel]],
         *,
         fit_info: FitInfo | None = None,
         update_emission: bool = False,
@@ -419,19 +419,17 @@ class IronWindows(SpecList[IWindow]):
     @validate_call
     def applyFit(
         self,
-        fit: IronModel | CompoundModel_[IronModel],
+        fit: Union[IronModel, CompoundModel_[IronModel]],
         *,
         fit_info: FitInfo | None = None,
         update_emission: bool = False,
     ) -> Self:
-        
         self.fit_info = fit_info
         for template_model in ((fit,) if fit.n_submodels == 1 else fit):
             self.template_models[template_model.name] = template_model
 
         if update_emission:
             self.updateIronEmission.__wrapped__(self, fit)
-
             for iwindow in filter(lambda w: w._y_fe is not self._y_fe, self):
                 iwindow.updateIronEmission.__wrapped__(iwindow, fit)
 
@@ -458,7 +456,7 @@ class IronWindows(SpecList[IWindow]):
 
         if covered and self.is_empty:
             msg += f"setting {covered=} to False due to missing iron windows, "
-            logger.warning(msg)
+            logger.info(msg)
             covered = False
 
         masked_coords = self.getMaskedCoords.__wrapped__(
@@ -484,23 +482,20 @@ class IronWindows(SpecList[IWindow]):
         if n_pix <= n_free_params:
             msg += f"cancelling fine-tuning due to insufficient no. of data " \
                 f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
-            self.applyFit.__wrapped__(
-                self, 
-                model,
-                update_emission=False,
-            )
-            logger.warning(msg)
+            logger.info(msg)
             return self
 
         try:
-            with stopwatch() as watch:
-                fit, fit_info = fitter(
-                    model, 
+            with stopwatch() as watch, \
+                PrepareModel(x=masked_coords.x, model=model, copy=True) as fit:
+                _, fit_info = fitter(
+                    fit,
                     masked_coords.x, 
                     masked_coords.y, 
                     masked_coords.dy, 
-                    inplace=False,
+                    inplace=True,
                 )
+
             msg += "Successfully performed fine-tuning in {:.1f} ms." \
                 .format(1e3 * watch.elapsed)
             logger.debug(msg)
@@ -514,9 +509,9 @@ class IronWindows(SpecList[IWindow]):
             return self
         
         self.applyFit.__wrapped__(
-            self, 
+            self,
             fit,
             fit_info=fit_info,
             update_emission=True,
-        )                
+        )
         return self

@@ -1,8 +1,8 @@
 from logging import getLogger
-from typing import Self, ClassVar, Iterable, Literal
+from typing import Self, ClassVar, Iterable, Literal, Optional
 from numpy import dot, inf
-from scipy.optimize import OptimizeResult
-from dataclasses import dataclass, field
+from dataclasses import field
+from pydantic.dataclasses import dataclass
 
 from pydantic import ValidationError
 
@@ -21,26 +21,26 @@ from quasar_models.host import (
     HostGalaxyTemplate, 
     HostGalaxyModel,
 )
+from quasar_models.host.io import convert_params_to_name
 from quasar_models.utils.astropy import get_free_params
+from quasar_models.utils.prepare_model import PrepareModel
 
 logger = getLogger(__name__)
 
 @dataclass(init=False)
 class HostWindows(SpecList[HWindow]):
-    templates: dict[str, HostGalaxyTemplate] = field(default_factory=dict, init=False)
-    models: dict[str, HostGalaxyModel] = field(default_factory=dict, init=False)
+    templates: dict[str, HostGalaxyTemplate] = field(default_factory=dict, kw_only=True)
+    models: dict[str, HostGalaxyModel] = field(default_factory=dict, kw_only=True)
 
-    model: HostGalaxyModel | None = field(default=None, init=False)
-    fit: HostGalaxyModel | None = field(default=None, init=False)
+    model: Optional[HostGalaxyModel] = field(default=None, init=False)
+    fit: Optional[HostGalaxyModel] = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'hg'})
 
     @property
     def sample(self) -> None:
-        if (model := self.getModel()) is None:
-            return None
-        return None
+        raise NotImplementedError
 
     @validated_apply_info_to_method(
         subjects=('host',), 
@@ -94,27 +94,32 @@ class HostWindows(SpecList[HWindow]):
     def __call__(
         self,
         *,
-        template_model: HostGalaxyModel | None = None,
+        template_model: Optional[HostGalaxyModel] = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
 
-        covered: bool = True,
+        covered: bool = False,
 
-        template_file: str | AbsoluteFITSPath | None = None,
+        template_files: list[str | AbsoluteFITSPath] | None = None,
+        sources: list[Literal['bc2003']] | None = None,
+        ages: list[int] | None = None,
+
         flux: float | None = None,
         fwhm: float | None = None,
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
+
+        raster: bool = True,
+        fine_tune: bool = True,
+        only_model: bool = False,
+
         min_fittable_ratio: float | None = None,
         min_fittable_total: int | None = None,
         fitter: FitterInstance | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -124,7 +129,49 @@ class HostWindows(SpecList[HWindow]):
                 template_model,
             )
         else:
-            pass
+            self.loadHostGalaxyTemplates.__wrapped__(
+                self,
+                sources=sources,
+                ages=ages,
+                template_files=template_files,
+            )
+            self.instantiateModels.__wrapped__(
+                self,
+                flux=flux,
+                fwhm=fwhm,
+                allow_interp_fitting=allow_interp_fitting,
+                fixed=fixed,
+                flux_bounds=flux_bounds,
+                fwhm_bounds=fwhm_bounds,
+            )
+
+        if raster:
+            try:
+                self.getRasterFit.__wrapped__(
+                    self,
+                    without_absorption=without_absorption,
+                    without_rejections=without_rejections,
+                    covered=covered,
+                    bg_flux=bg_flux,
+                )
+            except Exception:
+                return False
+        
+        if fine_tune:
+            try:
+                self.performFineTuning.__wrapped__(
+                    self,
+                    only_model=only_model,
+                    covered=covered,
+                    without_rejections=without_rejections,
+                    without_absorption=without_absorption,
+                    bg_flux=bg_flux,
+                    fitter=fitter,
+                )
+            except Exception:
+                return False
+
+        return True
 
     @validate_call
     def loadHostGalaxyTemplate(
@@ -132,25 +179,25 @@ class HostWindows(SpecList[HWindow]):
         *,
         source: Literal['bc2003'] | None = None,
         age: float | None = None,
-        path: str | AbsoluteFITSPath | None = None,
+        template_file: str | AbsoluteFITSPath | None = None,
     ) -> HostGalaxyTemplate:
         """
         Loads a HostGalaxyTemplate instance.
         """
-        if path is None:
+        if template_file is None:
             if source is None:
-                msg = "Must specify a 'source' when 'path' is not provided!"
+                msg = "Must specify a 'source' when 'template_file' is not provided!"
                 logger.critical(msg)
                 raise ValueError(msg)
             if age is None:
-                msg = "Must speficy an 'age' when 'path' is not provided!"
+                msg = "Must speficy an 'age' when 'template_file' is not provided!"
                 logger.critical(msg)
                 raise ValueError(msg)
             
             try:
                 template = HostGalaxyTemplate.load_from_cache(
-                    source, 
-                    age, 
+                    name=source, 
+                    age=age, 
                     info=self.info,
                 )
             except Exception as e:
@@ -161,11 +208,11 @@ class HostWindows(SpecList[HWindow]):
         else:
             try:
                 template = HostGalaxyTemplate.load(
-                    path,
+                    path=template_file,
                     info=self.info,
                 )
             except Exception as e:
-                msg = f"Could not load HostGalaxyTemplate from {path=} due "\
+                msg = f"Could not load HostGalaxyTemplate from {template_file=} due "\
                     f"to: {e}"
                 logger.critical(msg)
                 raise FileNotFoundError(msg)
@@ -173,58 +220,51 @@ class HostWindows(SpecList[HWindow]):
         return template
 
     @validated_apply_info_to_method(subjects=('balmer',))
-    def instantiateModel(
+    def loadHostGalaxyTemplates(
         self,
         *,
         sources: Iterable[Literal['bc2003']] | None = None,
-        ages: Iterable[float] | None = None,
-        paths: Iterable[str | AbsoluteFITSPath] | None = None,
+        ages: Iterable[int] | None = None,
+        template_files: Iterable[str | AbsoluteFITSPath] | None = None,
     ) -> dict[str, HostGalaxyTemplate]:
         """
         Loads all HostGalaxyTemplate instances and adds them to the 
         'templates' dict attribute.
         """
         self.templates.clear()
-        if paths is None:
-            if sources is None:
-                msg = "Must specify 'sources' when 'paths' is not provided!"
-                logger.critical(msg)
-                raise ValueError(msg)
-            if ages is None:
-                msg = "Must specify 'ages' when 'paths' is not provided!"
-                logger.critical(msg)
-                raise ValueError(msg)
-            
-            for source, age in zip(sources, ages):
-                try:
-                    template = self.loadHostGalaxyTemplate.__wrapped__(
-                        self,
-                        source=source,
-                        age=age,
-                    )
-                except Exception:
-                    pass
 
-                key = template.path.stem
+        if not template_files and not (sources and ages):
+            msg = "Must specify either 'template_files' or both 'sources' and "\
+                "'ages' to load HostGalaxyTemplates!"
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        if template_files:
+            for template_file in template_files:
+                template = self.loadHostGalaxyTemplate.__wrapped__(
+                    self,
+                    template_file=template_file,
+                )
+                key = convert_params_to_name(template.name, template.age)
+
                 if key in self.templates:
-                    msg = f"Duplicate HostGalaxyTemplate with key '{key}'." 
+                    msg = f"Duplicate HostGalaxyTemplate: '{template.name}'." 
                     logger.warning(msg)
                     continue
 
                 self.templates[key] = template
-        else:
-            for path in paths:
-                try:
-                    template = self.loadHostGalaxyTemplate.__wrapped__(
-                        self,
-                        path=path,
-                    )
-                except Exception:
-                    pass
 
-                key = template.path.stem
+        if sources and ages:
+            for source, age in zip(sources, ages):
+                template = self.loadHostGalaxyTemplate.__wrapped__(
+                    self,
+                    source=source,
+                    age=age,
+                )
+                key = convert_params_to_name(template.name, template.age)
+
                 if key in self.templates:
-                    msg = f"Duplicate HostGalaxyTemplate with key '{key}'." 
+                    msg = f"Duplicate HostGalaxyTemplate: '{template.name}'." 
                     logger.warning(msg)
                     continue
 
@@ -251,12 +291,11 @@ class HostWindows(SpecList[HWindow]):
         """
         self.models.clear()
         for name, template in self.templates.items():
-            model = HostGalaxyModel(
+            model = HostGalaxyModel.create(
                 flux, fwhm,
-                info=self.info,
                 template=template,
                 allow_interp_fitting=allow_interp_fitting,
-                name=name,
+                name='host_galaxy',
             )
             model.flux.fixed = fixed.get('flux', False)
             model.flux.bounds = flux_bounds
@@ -268,6 +307,27 @@ class HostWindows(SpecList[HWindow]):
 
         return self.models
     
+    @validate_call
+    def chooseModel(
+        self,
+        name: str,
+    ) -> HostGalaxyModel:
+        """
+        Choose a HostGalaxyModel from the 'models' dict by name and set it as 
+        the current model.
+        """
+        if name not in self.models:
+            msg = f"No HostGalaxyModel named '{name}' found in 'models'!"
+            logger.critical(msg)
+            raise ValueError(msg)
+        elif self.model is not None and name == self.model.name:
+            msg = f"HostGalaxyModel '{name}' is already the current model!"
+            logger.debug(msg)
+            return self.model
+
+        self.model = self.models[name]
+        return self.model
+
     @validate_call
     def getRasterFit(
         self,
@@ -284,6 +344,11 @@ class HostWindows(SpecList[HWindow]):
             if bg_flux is None:
                 bg_flux = self.default_bg
 
+            if covered and self.is_empty:
+                msg = f"Setting {covered=} to False due to missing host windows!"
+                logger.warning(msg)
+                covered = False
+
             masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
                 mode='c', # c: continuum
@@ -294,7 +359,6 @@ class HostWindows(SpecList[HWindow]):
                 log_valid=False,
                 bg_flux=bg_flux,
             )
-
             chi2s: dict[str, float] = {}
             for name, model in self.models.items():
                 model.rasterFit.__wrapped__(
@@ -315,19 +379,27 @@ class HostWindows(SpecList[HWindow]):
             )
             logger.debug(msg)
 
-            self.model = self.models[best_model_name]
-            self.applyFit(self.model)
+            self.chooseModel.__wrapped__(
+                self, 
+                best_model_name,
+            )
+            self.applyFit.__wrapped__(
+                self,
+                self.model, 
+                update_emission=True,
+            )
             
         return self
 
     @validated_apply_info_to_method(subjects=('nonlinear',))
     def performFineTuning(
         self,
+        *,
         only_model: bool = False,
+        covered: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
         bg_flux: BackgroundFlux | None = None,
-        *,
         fitter: FitterInstance | None = None,
     ) -> Self:
         s = self.__str__(simple=True).removesuffix('.')
@@ -344,10 +416,15 @@ class HostWindows(SpecList[HWindow]):
             logger.warning(msg)
             only_model = False
 
+        if covered and self.is_empty:
+            msg += f"setting {covered=} to False due to missing host windows, "
+            logger.warning(msg)
+            covered = False
+
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
             mode='c', # c: contiguous
-            covered=not self.is_empty,
+            covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=True,
@@ -355,7 +432,7 @@ class HostWindows(SpecList[HWindow]):
             bg_flux=bg_flux,
         )
         
-        _model = next(self.models.values())
+        _model = next(iter(self.models.values()))
         n_pix = masked_coords.x.size
         n_free_params = sum(get_free_params(_model).values())
         if n_pix <= n_free_params:
@@ -366,13 +443,14 @@ class HostWindows(SpecList[HWindow]):
         
         if only_model:
             try:
-                fit, fit_info = fitter(
-                    self.model, 
-                    masked_coords.x, 
-                    masked_coords.y, 
-                    masked_coords.dy, 
-                    False,
-                )
+                with PrepareModel(x=masked_coords.x, model=self.model, copy=True) as fit:
+                    _, fit_info = fitter(
+                        fit, 
+                        masked_coords.x, 
+                        masked_coords.y, 
+                        masked_coords.dy, 
+                        inplace=False,
+                    )
             except ValidationError as e:
                 msg += f"failed fitting due to validation error: {e}"
                 logger.warning(msg)
@@ -386,20 +464,21 @@ class HostWindows(SpecList[HWindow]):
             was_successful_once = False
             for name, model in self.models.items():
                 try:
-                    _, fit_info = fitter(
-                        model, 
-                        masked_coords.x, 
-                        masked_coords.y, 
-                        masked_coords.dy, 
-                        True,
-                    )
+                    with PrepareModel(x=masked_coords.x, model=model):
+                        _, fit_info = fitter(
+                            model, 
+                            masked_coords.x, 
+                            masked_coords.y, 
+                            masked_coords.dy, 
+                            inplace=True,
+                        )
                     was_successful_once = True
+                    chi2 = dot(fit_info.fun, fit_info.fun)
                 except Exception:
                     msg += f"failed fitting model '{name}', "
-                    chi2s[name] = inf
+                    chi2 = inf
 
-                z = (masked_coords.y - model(masked_coords.x)) / masked_coords.dy
-                chi2s[name] = dot(z, z)
+                chi2s[name] = chi2
 
             if not was_successful_once:
                 msg += "failed fitting all models!"
@@ -409,18 +488,18 @@ class HostWindows(SpecList[HWindow]):
             best_model_name: str = min(chi2s.keys(), key=chi2s.get)
             best_chi2 = chi2s[best_model_name]
 
-            msg += "best-fit HostGalaxyModel is '{}' with chi2={:.2f}.".format(
-                best_model_name, best_chi2,
-            )
+            msg += "best-fit HostGalaxyModel is '{}' with chi2={:.2f}."\
+                .format(best_model_name, best_chi2)
             logger.debug(msg)
 
             self.model = fit = self.models[best_model_name]
 
-        self.applyFit.__wrapped__(self, fit, fit_info)
+        self.applyFit.__wrapped__(self, fit, fit_info=fit_info)
         self.updateHostGalaxyEmission.__wrapped__(self, fit)
+        
         return self
 
-    def getModel(self) -> HostGalaxyModel | None:
+    def getModel(self) -> Optional[HostGalaxyModel]:
         """
         Retrieves the Balmer pseudo-continuum model if available.
 
@@ -465,11 +544,7 @@ class HostWindows(SpecList[HWindow]):
 
         if update_emission:
             self.updateHostGalaxyEmission.__wrapped__(self, fit)
-
             for hwindow in filter(lambda w: w._y_hg is not self._y_hg, self):
-                hwindow.updateHostGalaxyEmission.__wrapped__(
-                    hwindow,
-                    fit,
-                )
+                hwindow.updateHostGalaxyEmission.__wrapped__(hwindow, fit)
 
         return self

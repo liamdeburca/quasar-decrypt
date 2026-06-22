@@ -12,9 +12,12 @@ dependencies = [
     "astropy>=7.0",
     "pydantic>=2.12",
     "numba",
+    "scikit-learn==1.6.1",
     "quasar-typing",
     "quasar-models",
     "quasar-utils",
+    "quasar-plotting",
+    "quasar-errors",
 ]
 
 [project.urls]
