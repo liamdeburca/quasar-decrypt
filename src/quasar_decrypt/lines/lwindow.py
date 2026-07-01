@@ -71,7 +71,7 @@ class LWindow(SpecData):
     needs_line: dict[str, str] = field(default_factory=dict, kw_only=True)
     
     strength_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
-    sigma_v_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    fwhm_v_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
     v_off_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
     
     is_copy_of: dict[str, str] = field(default_factory=dict, kw_only=True)
@@ -333,7 +333,7 @@ class LWindow(SpecData):
         *,
         strength_bounds: AstropyBounds | None = None,
         v_off_bounds: AstropyBounds | None = None,
-        sigma_v_bounds: AstropyBounds | None = None,
+        fwhm_v_bounds: AstropyBounds | None = None,
         scale_init: float | None = None,
         scale_bounds: AstropyBounds | None = None,
         scale_fixed: bool | None = None,
@@ -365,7 +365,7 @@ class LWindow(SpecData):
             self.n_maxs          [name] = n_max
 
             self.strength_bounds [name] = strength_bounds
-            self.sigma_v_bounds  [name] = sigma_v_bounds
+            self.fwhm_v_bounds   [name] = fwhm_v_bounds
             self.v_off_bounds    [name] = v_off_bounds
 
             if bool(needs_line):
@@ -404,7 +404,7 @@ class LWindow(SpecData):
             None,
             None,
             strength_bounds=new_model.strength.bounds,
-            sigma_v_bounds=new_model.sigma_v.bounds,
+            fwhm_v_bounds=new_model.fwhm_v.bounds,
             v_off_bounds=new_model.v_off.bounds,
             scale_init=None,
             scale_bounds=None,
@@ -806,7 +806,7 @@ class LWindow(SpecData):
                     name=name,
                     strength_bounds=self.strength_bounds[name],
                     v_off_bounds=self.v_off_bounds[name],
-                    sigma_v_bounds=self.sigma_v_bounds[name],
+                    fwhm_v_bounds=self.fwhm_v_bounds[name],
                     sigma_res=self.info.loading['sigma_res'],
                     logger=logger,
                 )
@@ -1581,7 +1581,7 @@ class LWindow(SpecData):
 
             if isinstance(f, GaussianModel):
                 self.strength_bounds[pure_name] = f.strength.bounds
-                self.sigma_v_bounds[pure_name] = f.sigma_v.bounds
+                self.fwhm_v_bounds[pure_name] = f.fwhm_v.bounds
                 self.v_off_bounds[pure_name] = f.v_off.bounds
 
             if isinstance(f, _VProfileCopy):
@@ -1682,7 +1682,7 @@ class LWindow(SpecData):
         del self.n_maxs[name]
         
         del self.strength_bounds[name]
-        del self.sigma_v_bounds [name]
+        del self.fwhm_v_bounds  [name]
         del self.v_off_bounds   [name]
 
         if name in self.i_bounds:

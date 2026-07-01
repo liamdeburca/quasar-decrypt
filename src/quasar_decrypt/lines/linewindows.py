@@ -375,7 +375,7 @@ class LineWindows(SpecList[LWindow]):
 
                 strength_bounds = (row['strength_lower'], row['strength_upper']),
                 v_off_bounds    = (row['v_off_lower'], row['v_off_upper']),
-                sigma_v_bounds  = (row['sigma_v_lower'], row['sigma_v_upper']),
+                fwhm_v_bounds  = (row['fwhm_v_lower'], row['fwhm_v_upper']),
                 
                 scale_init      = row['scale_init'],
                 scale_bounds    = (row['scale_lower'], row['scale_upper']),
@@ -464,7 +464,7 @@ class LineWindows(SpecList[LWindow]):
                     needs_line=row['needs_line'],
                     strength_bounds=get_bounds('strength'),
                     v_off_bounds=get_bounds('v_off'),
-                    sigma_v_bounds=get_bounds('sigma_v'),
+                    fwhm_v_bounds=get_bounds('fwhm_v'),
                     is_copy_of=row['is_copy_of'],
                     scale_init=row['scale_init'],
                     scale_bounds=get_bounds('scale'),
