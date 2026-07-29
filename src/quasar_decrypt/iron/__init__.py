@@ -1,4 +1,4 @@
-__all__ = ['IWindow', 'IronWindows']
+__all__ = ["IWindow", "IronWindows"]
 
-from .iwindow import IWindow
 from .ironwindows import IronWindows
+from .iwindow import IWindow

@@ -1,4 +1,4 @@
-__all__ = ['CWindow', 'ContinuumWindows']
+__all__ = ["CWindow", "ContinuumWindows"]
 
-from .cwindow import CWindow
 from .contwindows import ContinuumWindows
+from .cwindow import CWindow

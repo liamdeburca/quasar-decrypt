@@ -1,31 +1,44 @@
-__all__ = ['Under']
+__all__ = ["Under"]
 
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
 from pathlib import Path
 from pickle import load
-from functools import lru_cache, cached_property
-from typing import Callable, ClassVar
-from numpy import dot, zeros_like, minimum, maximum, nan_to_num, nan, float64, empty
-from scipy.stats import chi2
+from typing import ClassVar
 
+from numpy import (
+    dot,
+    empty,
+    float64,
+    maximum,
+    minimum,
+    nan,
+    nan_to_num,
+    zeros_like,
+)
 from quasar_typing.numpy import FloatVector
 from quasar_utils.absorption.absorption import fft
-from dataclasses import dataclass, field
+from scipy.stats import chi2
 
 ### Load 'is under-fitted models'
 
 _this_file: Path = Path(__file__).resolve()
-PATH_TO_MODELS = _this_file.parents[0] / 'models'
+PATH_TO_MODELS = _this_file.parents[0] / "models"
+
 
 @lru_cache(maxsize=1)
 def _get_classifiers() -> dict[int, Callable]:
     classifiers = {}
-    for fname in PATH_TO_MODELS.glob('under_*.pkl'):
-        n = int(fname.name.removesuffix('.pkl').split('_')[1])
-        with open(fname, 'rb') as f:
+    for fname in PATH_TO_MODELS.glob("under_*.pkl"):
+        n = int(fname.name.removesuffix(".pkl").split("_")[1])
+        with open(fname, "rb") as f:
             classifiers[n] = load(f)
     return classifiers
 
+
 ###
+
 
 @dataclass
 class Under:
@@ -47,16 +60,24 @@ class Under:
     z: FloatVector = field(init=False)
     chi2: float = field(init=False)
 
-    measures: ClassVar[frozenset[str]] = frozenset({
-        'snr', 'llh', 'chi2', 'fft', 'cov',
-    })
-    feature_names: ClassVar[frozenset[str]] = frozenset({
-        r"$SNR$",
-        r"$LLH_{\text{mod.}}$",
-        r"$p(\chi^2)$",
-        r"$p(\text{FFT})$",
-        r"$r_{\text{cov.}}$",
-    })
+    measures: ClassVar[frozenset[str]] = frozenset(
+        {
+            "snr",
+            "llh",
+            "chi2",
+            "fft",
+            "cov",
+        }
+    )
+    feature_names: ClassVar[frozenset[str]] = frozenset(
+        {
+            r"$SNR$",
+            r"$LLH_{\text{mod.}}$",
+            r"$p(\chi^2)$",
+            r"$p(\text{FFT})$",
+            r"$r_{\text{cov.}}$",
+        }
+    )
     classifiers: ClassVar[dict[int, Callable]] = _get_classifiers()
 
     def __post_init__(self):
@@ -74,7 +95,7 @@ class Under:
     @cached_property
     def llh(self) -> float:
         return (1 - self.chi2 / self.n_pix) / 2
-    
+
     @cached_property
     def chi2_sf(self) -> float:
         return chi2(self.n_pix).sf(self.chi2)
@@ -94,19 +115,18 @@ class Under:
 
         features = empty(len(self.measures), dtype=float64)
         for i, measure in enumerate(self.measures):
-            if measure == 'snr':
+            if measure == "snr":
                 features[i] = self.snr
-            elif measure == 'chi2':
+            elif measure == "chi2":
                 features[i] = self.chi2_sf
             else:
                 features[i] = getattr(self, measure)
 
-        return nan_to_num(features, neginf=-1e8, posinf=1e8)[None,:]
+        return nan_to_num(features, neginf=-1e8, posinf=1e8)[None, :]
 
     def __call__(self, n: int | None = None, n_default: int = 1) -> bool:
         classifier = self.classifiers.get(
-            n or self.n,
-            self.classifiers[n_default]
+            n or self.n, self.classifiers[n_default]
         )
         X = self.getFeatures(as_dict=False)
         y = classifier.predict(X)[0]

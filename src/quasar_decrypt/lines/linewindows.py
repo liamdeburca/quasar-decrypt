@@ -1,49 +1,54 @@
-__all__ = ['LineWindows']
+__all__ = ["LineWindows"]
 
-from logging import getLogger
-from typing import Self, ClassVar, Literal, Union, Optional
-from numpy import zeros_like
-from pathlib import Path
-from itertools import product
-from scipy.optimize import OptimizeResult
 from dataclasses import dataclass, field
+from itertools import product
+from logging import getLogger
+from pathlib import Path
+from typing import ClassVar, Literal, Optional, Self, Union
 
-
-from .lwindow import LWindow
-from .graph_utils import Graph
-from ..utils import SpecList
-
-from quasar_typing.numpy import FloatVector, BoolVector
-from quasar_typing.pathlib import AbsoluteFilePath
-from quasar_typing.astropy import CompoundModel_, FitInfo
-from quasar_typing.misc import BackgroundFlux
-
-from quasar_utils.decorators import validate_call, validated_apply_info_to_method
-from quasar_utils.pipeline.linelist import LineList
-from quasar_utils.fitting import FitterInstance
-
+from numpy import zeros_like
+from quasar_errors.model_samples import GaussianSampleList
 from quasar_models.line import GaussianModel, _VProfileCopy
 from quasar_models.utils.astropy import get_free_params
+from quasar_typing.astropy import CompoundModel_, FitInfo
+from quasar_typing.misc import BackgroundFlux
+from quasar_typing.numpy import BoolVector, FloatVector
+from quasar_typing.pathlib import AbsoluteFilePath
+from quasar_utils.decorators import (
+    validate_call,
+    validated_apply_info_to_method,
+)
+from quasar_utils.pipeline import LineList
+from quasar_utils.setup import FitterKwargs
+from scipy.optimize import OptimizeResult
 
-from quasar_errors.model_samples import GaussianSampleList
-
-from ..utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, ContiguousMaskedCoords
+from ..utils import SpecList
+from ..utils.masked_coords import (
+    ContiguousMaskedCoords,
+    MaskedCoords,
+    ReadOnlyMaskedCoords,
+)
+from .graph_utils import Graph
+from .lwindow import LWindow
 
 logger = getLogger(__name__)
+
 
 @dataclass(init=False)
 class LineWindows(SpecList[LWindow]):
     graph: Graph | None = field(default=None, init=False)
-    
-    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'em'})
+
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "em"})
 
     @property
     def sample(self) -> GaussianSampleList | None:
         if (model := self.getModel()) is None:
             return None
         return GaussianSampleList.fromGaussianModels(model)
-    
-    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
+
+    @validated_apply_info_to_method(
+        subjects=("lines",), specific_kwargs={"v_sep"}
+    )
     def getMask(
         self,
         *,
@@ -54,14 +59,13 @@ class LineWindows(SpecList[LWindow]):
         valid: bool = False,
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
-
         line: float | None = None,
         limited: bool = True,
         v_sep: float | None = None,
     ) -> BoolVector:
         """
         ** PYDANTIC VALIDATED METHOD **
-        """        
+        """
         if line is None:
             mask = zeros_like(self._x, dtype=bool)
             for lwindow in self:
@@ -91,42 +95,40 @@ class LineWindows(SpecList[LWindow]):
                 break
 
         return mask
-    
-    @validated_apply_info_to_method(subjects=('loading', 'lines', 'nonlinear'))
+
+    @validated_apply_info_to_method(subjects=("loading", "lines", "nonlinear"))
     def __call__(
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
-        template_model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]] = None,
-
+        template_model: Optional[
+            Union[GaussianModel, CompoundModel_[GaussianModel]]
+        ] = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
         limited: bool = False,
-
         sigma_res: float | None = None,
-
         v_sep: float | None = None,
         forced_splits: FloatVector | None = None,
         w: int | None = None,
         min_fittable_total: int | None = None,
         min_fittable_ratio: float | None = None,
-        evaluate_initial: float | int | None = None,
+        evaluate_initial: float | None = None,
         aggressive: bool | None = None,
         crop: bool | None = None,
         measure: str | None = None,
         reverse: bool | None = None,
         make_copies: bool | None = None,
-
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
         if bg_flux is None:
             bg_flux = self.default_bg
-        
+
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
         self.updateLinesEmission()
 
@@ -143,10 +145,10 @@ class LineWindows(SpecList[LWindow]):
         )
         if success:
             logger.debug(msg + "success!")
-        if not success: 
+        if not success:
             logger.warning(msg + "failed!")
             return False
-                
+
         if template_model is not None:
             logger.debug("Applying template model.")
             self.applyFit.__wrapped__(
@@ -162,7 +164,7 @@ class LineWindows(SpecList[LWindow]):
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
                     with_neighbours=with_neighbours,
-                    fitter=fitter,
+                    fitter_kwargs=fitter_kwargs,
                 )
         else:
             ### 'instantiateModels'
@@ -185,14 +187,16 @@ class LineWindows(SpecList[LWindow]):
             fitting_sequence = self.getFittingSequence()
             try:
                 logger.debug(msg + "success!")
-            except Exception:
+            except Exception as _:
                 logger.warning(msg + "failed!")
                 return False
-            
+
             if make_copies:
                 msg = "Applying velocity profile copies: "
                 if self.graph.is_circular:
-                    logger.warning(msg + "Circular graph detected -> continuing.")
+                    logger.warning(
+                        msg + "Circular graph detected -> continuing."
+                    )
                     make_copies = False
                 else:
                     logger.debug(msg + f"success: {fitting_sequence=}!")
@@ -208,14 +212,15 @@ class LineWindows(SpecList[LWindow]):
                     without_absorption=without_absorption,
                     with_neighbours=with_neighbours,
                     evaluate_initial=evaluate_initial,
-                    fitter=fitter,
+                    fitter_kwargs=fitter_kwargs,
                 )
                 if not success:
-                    msg += "failed during 'makeInitialFit' on LWindow no. "\
-                        f"{idx}!"
+                    msg += (
+                        f"failed during 'makeInitialFit' on LWindow no. {idx}!"
+                    )
                     logger.warning(msg)
                     return False
-                
+
                 success = lwindow.makeFinalFit.__wrapped__(
                     lwindow,
                     bg_flux=bg_flux,
@@ -230,27 +235,30 @@ class LineWindows(SpecList[LWindow]):
                     reverse=reverse,
                     evaluate_initial=evaluate_initial,
                     v_sep=v_sep,
-                    fitter=fitter,
+                    fitter_kwargs=fitter_kwargs,
                 )
                 if not success:
-                    msg += "failed during 'makeFinalFit' on LWindow no. "\
-                        f"{idx}!"
+                    msg += (
+                        f"failed during 'makeFinalFit' on LWindow no. {idx}!"
+                    )
                     logger.warning(msg)
                     return False
-                
+
                 if make_copies:
                     lwindow.applyMyself.__wrapped__(lwindow)
             logger.debug(msg + "success!")
 
         return True
-    
-    @validated_apply_info_to_method(subjects=('lines',), specific_kwargs={'v_sep'})
+
+    @validated_apply_info_to_method(
+        subjects=("lines",), specific_kwargs={"v_sep"}
+    )
     def getMaskedCoords(
-        self, 
+        self,
         *,
-        mode: Literal['c', 'r'] | None = None,
+        mode: Literal["c", "r"] | None = None,
         covered: bool = False,
-        without_rejections: bool = False, 
+        without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
         valid: bool = False,
@@ -273,17 +281,17 @@ class LineWindows(SpecList[LWindow]):
             log_valid=log_valid,
             line=line,
             limited=limited,
-            v_sep=v_sep
+            v_sep=v_sep,
         )
         match mode:
-            case 'c': 
+            case "c":
                 return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
-            case 'r':
+            case "r":
                 return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
             case None:
                 return MaskedCoords(self, mask, bg_flux=bg_flux)
-    
-    @validated_apply_info_to_method(subjects=('loading', 'lines'))
+
+    @validated_apply_info_to_method(subjects=("loading", "lines"))
     def applyLineList(
         self,
         linelist: AbsoluteFilePath | LineList,
@@ -298,37 +306,37 @@ class LineWindows(SpecList[LWindow]):
         ** PYDANTIC VALIDATED METHOD **
         !!! Ensuring Lyman-alpha?
         """
-        kwargs = {'x_bounds': self.x_bounds}
+        kwargs = {"x_bounds": self.x_bounds}
         if self.spectrum is None:
-            kwargs['x'] = self._x
-            kwargs['y'] = self._y
-            kwargs['dy'] = self._dy
-            kwargs['dx'] = self._dx
+            kwargs["x"] = self._x
+            kwargs["y"] = self._y
+            kwargs["dy"] = self._dy
+            kwargs["dx"] = self._dx
 
-            kwargs['y_smooth'] = self._y_smooth
-            kwargs['y_pl'] = self._y_pl
-            kwargs['y_fe'] = self._y_fe
-            kwargs['y_ba'] = self._y_ba
-            kwargs['y_hg'] = self._y_hg
-            kwargs['y_em'] = self._y_em
+            kwargs["y_smooth"] = self._y_smooth
+            kwargs["y_pl"] = self._y_pl
+            kwargs["y_fe"] = self._y_fe
+            kwargs["y_ba"] = self._y_ba
+            kwargs["y_hg"] = self._y_hg
+            kwargs["y_em"] = self._y_em
 
-            kwargs['rejected_pixels'] = self._rejected_pixels
-            kwargs['absorbed_pixels'] = self._absorbed_pixels
-            kwargs['valid_pixels'] = self._valid_pixels
-            kwargs['log_valid_pixels'] = self._log_valid_pixels
-            kwargs['p_absorbed'] = self._p_absorbed
+            kwargs["rejected_pixels"] = self._rejected_pixels
+            kwargs["absorbed_pixels"] = self._absorbed_pixels
+            kwargs["valid_pixels"] = self._valid_pixels
+            kwargs["log_valid_pixels"] = self._log_valid_pixels
+            kwargs["p_absorbed"] = self._p_absorbed
 
-            kwargs['x0'] = self.x0
-            kwargs['y0'] = self.y0
-            kwargs['x_log'] = self._x_log
-            kwargs['y_log'] = self._y_log
-            kwargs['dy_log'] = self._dy_log
+            kwargs["x0"] = self.x0
+            kwargs["y0"] = self.y0
+            kwargs["x_log"] = self._x_log
+            kwargs["y_log"] = self._y_log
+            kwargs["dy_log"] = self._dy_log
 
-            kwargs['info'] = self.info
-            kwargs['get_mask'] = self.get_mask
+            kwargs["info"] = self.info
+            kwargs["get_mask"] = self.get_mask
         else:
-            kwargs['spectrum'] = self.spectrum
-        
+            kwargs["spectrum"] = self.spectrum
+
         if isinstance(linelist, Path):
             linelist = LineList.read_csv.__wrapped__(
                 LineList,
@@ -336,25 +344,24 @@ class LineWindows(SpecList[LWindow]):
                 info=self.info,
             )
 
-        df = linelist.sort_values('line', inplace=False)
+        df = linelist.sort_values("line", inplace=False)
         if self.x_bounds[0] is not None:
-            df.drop(df[df['line'] < self.x_bounds[0]].index, inplace=True)
+            df.drop(df[df["line"] < self.x_bounds[0]].index, inplace=True)
         if self.x_bounds[1] is not None:
-            df.drop(df[df['line'] >= self.x_bounds[1]].index, inplace=True)
+            df.drop(df[df["line"] >= self.x_bounds[1]].index, inplace=True)
         df = df.reset_index(drop=True)
-                
+
         prev_line: float = None
         for idx, row in df.iterrows():
-            line = row['line']
+            line = row["line"]
 
-            cond = (idx == 0)
+            cond = idx == 0
             if not cond:
                 _line = prev_line
 
-                cond = \
-                    ((_line < forced_splits) & (forced_splits < line)).any() \
-                    or \
-                    (line - _line) > (_line + line) * v_sep
+                cond = (
+                    (_line < forced_splits) & (forced_splits < line)
+                ).any() or (line - _line) > (_line + line) * v_sep
 
             if cond:
                 lwindow = LWindow.create.__wrapped__(
@@ -365,23 +372,20 @@ class LineWindows(SpecList[LWindow]):
 
             _ = self[-1].add.__wrapped__(
                 self[-1],
-                row['name'],
-                row['complex'],
-                row['line'],
-                row['n_max'],
-
-                needs_line      = row['needs_line'],
-                is_copy_of      = row['is_copy_of'],
-
-                strength_bounds = (row['strength_lower'], row['strength_upper']),
-                v_off_bounds    = (row['v_off_lower'], row['v_off_upper']),
-                fwhm_v_bounds  = (row['fwhm_v_lower'], row['fwhm_v_upper']),
-                
-                scale_init      = row['scale_init'],
-                scale_bounds    = (row['scale_lower'], row['scale_upper']),
-                scale_fixed     = row['scale_fixed'],
+                row["name"],
+                row["complex"],
+                row["line"],
+                row["n_max"],
+                needs_line=row["needs_line"],
+                is_copy_of=row["is_copy_of"],
+                strength_bounds=(row["strength_lower"], row["strength_upper"]),
+                v_off_bounds=(row["v_off_lower"], row["v_off_upper"]),
+                fwhm_v_bounds=(row["fwhm_v_lower"], row["fwhm_v_upper"]),
+                scale_init=row["scale_init"],
+                scale_bounds=(row["scale_lower"], row["scale_upper"]),
+                scale_fixed=row["scale_fixed"],
             )
-            
+
             prev_line = line
 
         # Check for line dependencies!
@@ -401,10 +405,10 @@ class LineWindows(SpecList[LWindow]):
                 )
 
         return True
-    
+
     @validate_call
     def checkLineDependencies(
-        self, 
+        self,
         linelist: AbsoluteFilePath | LineList,
     ) -> bool:
         if isinstance(linelist, Path):
@@ -435,8 +439,8 @@ class LineWindows(SpecList[LWindow]):
                         "'LWindow'?"
                     )
                     return False
-                
-                ser = linelist[linelist['name'] == needed_line]
+
+                ser = linelist[linelist["name"] == needed_line]
                 if len(ser) == 0:
                     logger.warning(
                         f"Needed line '{needed_line}' could not be found in "
@@ -452,47 +456,48 @@ class LineWindows(SpecList[LWindow]):
                     continue
 
                 row = next(ser.iterrows())[1]
-                def get_bounds(s: str) -> tuple[float, float]:
-                    return (row[f'{s}_lower'], row[f'{s}_upper'])
+
+                def get_bounds(s: str, row=row) -> tuple[float, float]:
+                    return (row[f"{s}_lower"], row[f"{s}_upper"])
 
                 lwindow.add.__wrapped__(
                     lwindow,
-                    row['name'],
-                    row['complex'],
-                    row['line'],
-                    row['n_max'],
-                    needs_line=row['needs_line'],
-                    strength_bounds=get_bounds('strength'),
-                    v_off_bounds=get_bounds('v_off'),
-                    fwhm_v_bounds=get_bounds('fwhm_v'),
-                    is_copy_of=row['is_copy_of'],
-                    scale_init=row['scale_init'],
-                    scale_bounds=get_bounds('scale'),
+                    row["name"],
+                    row["complex"],
+                    row["line"],
+                    row["n_max"],
+                    needs_line=row["needs_line"],
+                    strength_bounds=get_bounds("strength"),
+                    v_off_bounds=get_bounds("v_off"),
+                    fwhm_v_bounds=get_bounds("fwhm_v"),
+                    is_copy_of=row["is_copy_of"],
+                    scale_init=row["scale_init"],
+                    scale_bounds=get_bounds("scale"),
                     force_add=True,
                 )
                 all_added_lines.add(needed_line)
 
-                repeat_call |= bool(row['needs_line'])
+                repeat_call |= bool(row["needs_line"])
 
         if repeat_call:
             return self.checkLineDependencies.__wrapped__(self, linelist)
         return True
-    
+
     def checkVelocityProfileCopies(self) -> bool:
         """
         This method is supposed to do the following:
 
         Loop through the created 'LWindow' classes:
-        1.  If a 'LWindow' has a non-empty 'is_copy_of' dictionary, finds the 
+        1.  If a 'LWindow' has a non-empty 'is_copy_of' dictionary, finds the
             'LWindow' class with the corresponding model to copy from, i.e.
-            the 'LWindow' whose 'names' set contains the value of the 
-            'is_copy_of' item. 
+            the 'LWindow' whose 'names' set contains the value of the
+            'is_copy_of' item.
 
             ! FOR NOW the model to copy from must not be covered by the same
-            ! 'LWindow' class. 
+            ! 'LWindow' class.
             ! We can therefore skip everything if: len(self) <= 1
 
-        2.  Once the other 'LWindow' class has been found, update its 
+        2.  Once the other 'LWindow' class has been found, update its
             'copies_to' dictionary. Update the 'graph_edges' dictionary to
             represent this new connection.
         """
@@ -506,17 +511,17 @@ class LineWindows(SpecList[LWindow]):
             filter(lambda tup: tup[1].is_copy_of, enumerate(self)),
         ):
             for mimic, master in filter(
-                lambda item: item[1] in orig.names, 
+                lambda item: item[1] in orig.names,
                 dest.is_copy_of.items(),
             ):
-                if idx_o == idx_d: 
+                if idx_o == idx_d:
                     continue
                 # Checks for velocity profile copies
                 self.graph[idx_o].add(idx_d)
                 orig.copies_to[master].append((idx_d, mimic))
 
         return True
-    
+
     def getFittingSequence(self) -> list[int]:
         if self.graph is None:
             success = self.checkVelocityProfileCopies()
@@ -524,29 +529,35 @@ class LineWindows(SpecList[LWindow]):
                 return list(range(len(self)))
         return self.graph.expand(inplace=True).createChain()
 
-    def getModel(self) -> Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]]:
+    def getModel(
+        self,
+    ) -> Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]]:
         """
         Retrieves and combines each 'LWindow's current fit/model, combining them
-        into a single model. 
+        into a single model.
 
         NOTES
         -----
-        The keyword argument 'thaw' is set to True when retrieving models, 
-        meaning that copies of models are retrieved, and that any models copying 
+        The keyword argument 'thaw' is set to True when retrieving models,
+        meaning that copies of models are retrieved, and that any models copying
         other models' velocity profiles will have their parameters unfrozen and
-        their 'tie' attributes enabled. 
+        their 'tie' attributes enabled.
         """
         models = [
-            mod 
+            mod
             for lwindow in self
             if (mod := lwindow.getModel(thaw=True)) is not None
         ]
         return sum(models[1:], start=models[0]) if models else None
-    
+
     @validate_call
     def adoptFit(
         self,
-        fit: Union[GaussianModel, _VProfileCopy, CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
+        fit: Union[
+            GaussianModel,
+            _VProfileCopy,
+            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
+        ],
         *,
         fit_info: FitInfo | None = None,
         update_emission: bool = False,
@@ -555,27 +566,29 @@ class LineWindows(SpecList[LWindow]):
 
         count: int = 0
         for lwindow in self:
-            fs = list(filter(lambda f: f.pure_name in lwindow.names, submodels))
+            fs = list(
+                filter(lambda f: f.pure_name in lwindow.names, submodels)
+            )
             if not fs:
                 continue
 
             local_fit = sum(fs[1:], start=fs[0])
             if fit_info is not None:
                 n_free = sum(get_free_params.__wrapped__(local_fit).values())
-                sel = slice(count, count+n_free)
+                sel = slice(count, count + n_free)
                 local_fit_info = OptimizeResult(
-                    message =    fit_info.message,
-                    success =    fit_info.success,
-                    status =     fit_info.status,
-                    fun =        fit_info.fun,
-                    x =          fit_info.x[sel],
-                    cost =       fit_info.cost,
-                    jac =        fit_info.jac[sel,sel],
-                    grad =       fit_info.grad[sel],
-                    optimality = fit_info.optimality,
-                    nfev =       fit_info.nfev,
-                    njev =       fit_info.njev,
-                    param_cov =  fit_info.param_cov[sel,sel]
+                    message=fit_info.message,
+                    success=fit_info.success,
+                    status=fit_info.status,
+                    fun=fit_info.fun,
+                    x=fit_info.x[sel],
+                    cost=fit_info.cost,
+                    jac=fit_info.jac[sel, sel],
+                    grad=fit_info.grad[sel],
+                    optimality=fit_info.optimality,
+                    nfev=fit_info.nfev,
+                    njev=fit_info.njev,
+                    param_cov=fit_info.param_cov[sel, sel],
                 )
                 count += n_free
             else:
@@ -589,11 +602,15 @@ class LineWindows(SpecList[LWindow]):
             )
 
         return self
-    
+
     @validate_call
     def applyFit(
         self,
-        fit: Union[GaussianModel, _VProfileCopy, CompoundModel_[Union[GaussianModel, _VProfileCopy]]],
+        fit: Union[
+            GaussianModel,
+            _VProfileCopy,
+            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
+        ],
         *,
         fit_info: FitInfo | None = None,
         freeze: bool = False,
@@ -613,27 +630,29 @@ class LineWindows(SpecList[LWindow]):
 
         count: int = 0
         for lwindow in self:
-            fs = list(filter(lambda f: f.pure_name in lwindow.names, submodels))
+            fs = list(
+                filter(lambda f: f.pure_name in lwindow.names, submodels)
+            )
             if not fs:
                 continue
 
             local_fit = sum(fs[1:], start=fs[0])
             if fit_info is not None:
                 n_free = sum(get_free_params.__wrapped__(local_fit).values())
-                sel = slice(count, count+n_free)
+                sel = slice(count, count + n_free)
                 local_fit_info = OptimizeResult(
-                    message =    fit_info.message,
-                    success =    fit_info.success,
-                    status =     fit_info.status,
-                    fun =        fit_info.fun,
-                    x =          fit_info.x[sel],
-                    cost =       fit_info.cost,
-                    jac =        fit_info.jac[sel,sel],
-                    grad =       fit_info.grad[sel],
-                    optimality = fit_info.optimality,
-                    nfev =       fit_info.nfev,
-                    njev =       fit_info.njev,
-                    param_cov =  fit_info.param_cov[sel,sel]
+                    message=fit_info.message,
+                    success=fit_info.success,
+                    status=fit_info.status,
+                    fun=fit_info.fun,
+                    x=fit_info.x[sel],
+                    cost=fit_info.cost,
+                    jac=fit_info.jac[sel, sel],
+                    grad=fit_info.grad[sel],
+                    optimality=fit_info.optimality,
+                    nfev=fit_info.nfev,
+                    njev=fit_info.njev,
+                    param_cov=fit_info.param_cov[sel, sel],
                 )
                 count += n_free
             else:

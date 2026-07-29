@@ -1,32 +1,32 @@
-def _round(n:int) -> callable:
+def _round(n: int) -> callable:
     from numpy import round
-    
-    func = lambda val: '{}'.format(round(val, n))
+
+    func = lambda val: f"{round(val, n)}"
 
     return func
 
-def _scientific(n:int) -> callable:
-    
+
+def _scientific(n: int) -> callable:
+
     match n:
         case 1:
-            func = lambda val: '{:.1e}'.format(val)
+            func = lambda val: f"{val:.1e}"
         case 2:
-            func = lambda val: '{:.2e}'.format(val)
+            func = lambda val: f"{val:.2e}"
         case 3:
-            func = lambda val: '{:.3e}'.format(val)
+            func = lambda val: f"{val:.3e}"
         case 4:
-            func = lambda val: '{:.4e}'.format(val)
-        case 5: 
-            func = lambda val: '{:.5e}'.format(val)
+            func = lambda val: f"{val:.4e}"
+        case 5:
+            func = lambda val: f"{val:.5e}"
         case 6:
-            func = lambda val: '{:.6e}'.format(val)
+            func = lambda val: f"{val:.6e}"
 
     return func
 
-def format_float_to_str(val, 
-                        n_commas,
-                        scientific:bool=False):
-    
+
+def format_float_to_str(val, n_commas, scientific: bool = False):
+
     if scientific:
         func = _scientific(n_commas)
     else:
@@ -38,23 +38,25 @@ def format_float_to_str(val,
         out = list(map(func, val))
 
     return out
-    
+
+
 ###
 
-def _pad_string(length:int, filler:str, where:str) -> callable:
+
+def _pad_string(length: int, filler: str, where: str) -> callable:
     match where:
-        case 'left':
+        case "left":
             func = lambda string: string.ljust(length, filler)
-        case 'right':
+        case "right":
             func = lambda string: string.rjust(length, filler)
 
     return func
-    
-def format_string_to_length(string, 
-                            length:int,
-                            filler:str=' ', 
-                            where:str='left'):
-    
+
+
+def format_string_to_length(
+    string, length: int, filler: str = " ", where: str = "left"
+):
+
     func = _pad_string(length, filler, where)
 
     if isinstance(string, str):
@@ -63,34 +65,38 @@ def format_string_to_length(string,
         out = list(map(func, string))
     else:
         out = format_string_to_length(
-            str(string), 
-            length, 
-            filler=filler, 
+            str(string),
+            length,
+            filler=filler,
             where=where,
         )
 
     return out
 
+
 ###
 
-def get_column_minwidth(column:list, mode:str='tab'):
+
+def get_column_minwidth(column: list, mode: str = "tab"):
     from numpy import max
 
     max_length = max(list(map(len, column)))
 
     match mode:
-        case 'tab':
+        case "tab":
             w = 4 * (max_length // 4 + 1)
         case _:
             w = max_length
 
     return w
 
+
 from numpy import ndarray
 
-def format_column(x:ndarray, header:str, n_commas:int=2):
+
+def format_column(x: ndarray, header: str, n_commas: int = 2):
     x_str = format_float_to_str(list(x), n_commas)
-    
+
     column = [header] + x_str
     w = get_column_minwidth(column)
     column = format_string_to_length(column, w)

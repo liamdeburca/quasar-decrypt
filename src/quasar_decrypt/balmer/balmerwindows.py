@@ -1,33 +1,34 @@
-from logging import getLogger
-from typing import Self, ClassVar, Iterable, Literal, Optional
-from numpy import invert
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from logging import getLogger
+from typing import ClassVar, Literal, Optional, Self
 
+from numpy import invert
 from pydantic import ValidationError
+from quasar_errors.model_samples import BalmerSample
+from quasar_models.balmer import (
+    BalmerContinuumTemplate,
+    BalmerModel,
+    BalmerSeriesTemplate,
+)
+from quasar_models.modeling import Fitter, PrepareModel
+from quasar_models.utils.astropy import apply_bounds
+from quasar_typing.astropy import FitInfo
+from quasar_typing.bounds import AstropyBounds, CoordBounds
+from quasar_typing.misc import BackgroundFlux
+from quasar_typing.pathlib import AbsoluteFITSPath
+from quasar_utils.decorators import (
+    validate_call,
+    validated_apply_info_to_method,
+)
+from quasar_utils.setup import FitterKwargs
 
-from quasar_decrypt.utils.speclist import SpecList
 from quasar_decrypt.balmer.bwindow import BWindow
 from quasar_decrypt.utils.general import stopwatch
-
-from quasar_utils.decorators import validate_call, validated_apply_info_to_method
-from quasar_utils.fitting import FitterInstance
-
-from quasar_typing.bounds import CoordBounds, AstropyBounds
-from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_typing.astropy import FitInfo
-from quasar_typing.misc import BackgroundFlux
-
-from quasar_models.balmer import (
-    BalmerSeriesTemplate, 
-    BalmerContinuumTemplate, 
-    BalmerModel,
-)
-from quasar_models.utils.astropy import apply_bounds
-from quasar_models.utils.prepare_model import PrepareModel
-
-from quasar_errors.model_samples import BalmerSample
+from quasar_decrypt.utils.speclist import SpecList
 
 logger = getLogger(__name__)
+
 
 @dataclass(init=False)
 class BalmerWindows(SpecList[BWindow]):
@@ -35,7 +36,7 @@ class BalmerWindows(SpecList[BWindow]):
     fit: Optional[BalmerModel] = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
 
-    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'ba'})
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "ba"})
 
     @property
     def sample(self) -> BalmerSample | None:
@@ -44,8 +45,8 @@ class BalmerWindows(SpecList[BWindow]):
         return BalmerSample.fromBalmerModel(model)
 
     @validated_apply_info_to_method(
-        subjects=('balmer',), 
-        specific_kwargs={'windows'},
+        subjects=("balmer",),
+        specific_kwargs={"windows"},
     )
     def populate(
         self,
@@ -54,44 +55,44 @@ class BalmerWindows(SpecList[BWindow]):
     ) -> Self:
         kwargs = {}
         if self.spectrum is None:
-            kwargs['x'] = self._x
-            kwargs['y'] = self._y
-            kwargs['dy'] = self._dy
-            kwargs['dx'] = self._dx
+            kwargs["x"] = self._x
+            kwargs["y"] = self._y
+            kwargs["dy"] = self._dy
+            kwargs["dx"] = self._dx
 
-            kwargs['y_smooth'] = self._y_smooth
-            kwargs['y_pl'] = self._y_pl
-            kwargs['y_fe'] = self._y_fe
-            kwargs['y_ba'] = self._y_ba
-            kwargs['y_hg'] = self._y_hg
-            kwargs['y_em'] = self._y_em
+            kwargs["y_smooth"] = self._y_smooth
+            kwargs["y_pl"] = self._y_pl
+            kwargs["y_fe"] = self._y_fe
+            kwargs["y_ba"] = self._y_ba
+            kwargs["y_hg"] = self._y_hg
+            kwargs["y_em"] = self._y_em
 
-            kwargs['rejected_pixels'] = self._rejected_pixels
-            kwargs['absorbed_pixels'] = self._absorbed_pixels
-            kwargs['valid_pixels'] = self._valid_pixels
-            kwargs['log_valid_pixels'] = self._log_valid_pixels
-            kwargs['p_absorbed'] = self._p_absorbed
+            kwargs["rejected_pixels"] = self._rejected_pixels
+            kwargs["absorbed_pixels"] = self._absorbed_pixels
+            kwargs["valid_pixels"] = self._valid_pixels
+            kwargs["log_valid_pixels"] = self._log_valid_pixels
+            kwargs["p_absorbed"] = self._p_absorbed
 
-            kwargs['x0'] = self.x0
-            kwargs['y0'] = self.y0
-            kwargs['x_log'] = self._x_log
-            kwargs['y_log'] = self._y_log
-            kwargs['dy_log'] = self._dy_log
+            kwargs["x0"] = self.x0
+            kwargs["y0"] = self.y0
+            kwargs["x_log"] = self._x_log
+            kwargs["y_log"] = self._y_log
+            kwargs["dy_log"] = self._dy_log
 
-            kwargs['info'] = self.info
-            kwargs['get_mask'] = self.get_mask
+            kwargs["info"] = self.info
+            kwargs["get_mask"] = self.get_mask
         else:
-            kwargs['spectrum'] = self.spectrum
+            kwargs["spectrum"] = self.spectrum
 
         for x_bounds in windows:
-            kwargs['x_bounds'] = x_bounds
+            kwargs["x_bounds"] = x_bounds
             bwindow = BWindow.create.__wrapped__(BWindow, **kwargs)
             if bwindow.size > 0:
                 self.append(bwindow)
 
         return self
 
-    @validated_apply_info_to_method(subjects=('balmer', 'nonlinear'))
+    @validated_apply_info_to_method(subjects=("balmer", "nonlinear"))
     def __call__(
         self,
         *,
@@ -99,13 +100,11 @@ class BalmerWindows(SpecList[BWindow]):
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        
         covered: bool = True,
-
         flux: float | None = None,
         fwhm: float | None = None,
         ratio: float | None = None,
-        source: Literal['sh1995'] | None = None,
+        source: Literal["sh1995"] | None = None,
         temp: float | None = None,
         dens: float | None = None,
         n_u_min: int | None = None,
@@ -114,18 +113,14 @@ class BalmerWindows(SpecList[BWindow]):
         scale: float | None = None,
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
-
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
         ratio_bounds: AstropyBounds | None = None,
-
         min_fittable_ratio: float | None = None,
         min_fittable_total: int | None = None,
-
         raster: bool | None = None,
         fine_tune: bool | None = None,
-
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
         if bg_flux is None:
             bg_flux = self.default_bg
@@ -173,9 +168,11 @@ class BalmerWindows(SpecList[BWindow]):
                     covered=covered,
                     bg_flux=bg_flux,
                 )
-            except Exception:
+            except Exception as e:
+                msg = f"Raster fit failed due to error: {e}"
+                logger.warning(msg)
                 return False
-            
+
         if fine_tune:
             try:
                 self.performFineTuning.__wrapped__(
@@ -184,18 +181,20 @@ class BalmerWindows(SpecList[BWindow]):
                     without_absorption=without_absorption,
                     covered=covered,
                     bg_flux=bg_flux,
-                    fitter=fitter,
+                    fitter_kwargs=fitter_kwargs,
                 )
-            except Exception:
+            except Exception as e:
+                msg = f"Fine-tuning failed due to error: {e}"
+                logger.warning(msg)
                 return False
-    
+
         return True
 
     @validate_call
     def loadBalmerSeriesTemplate(
         self,
         *,
-        source: Literal['sh1995'] | None = None,
+        source: Literal["sh1995"] | None = None,
         temp: float | None = None,
         dens: float | None = None,
         n_u_min: int | None = None,
@@ -207,7 +206,9 @@ class BalmerWindows(SpecList[BWindow]):
         """
         if template_file is None:
             if source is None:
-                msg = "Must specify 'source' if 'template_file' is not provided!"
+                msg = (
+                    "Must specify 'source' if 'template_file' is not provided!"
+                )
                 logger.critical(msg)
                 raise ValueError(msg)
             if temp is None:
@@ -226,19 +227,21 @@ class BalmerWindows(SpecList[BWindow]):
                 msg = "Must specify 'n_u_max' if 'template_file' is not provided!"
                 logger.critical(msg)
                 raise ValueError(msg)
-            
-            return BalmerSeriesTemplate.load_from_cache(
-                name=source, 
-                temp=temp, 
-                dens=dens, 
+
+            template = BalmerSeriesTemplate.load_from_cache(
+                name=source,
+                temp=temp,
+                dens=dens,
                 n_u_range=(n_u_min, n_u_max),
                 info=self.info,
             )
-        
-        return BalmerSeriesTemplate.load(
-            path=template_file, 
-            info=self.info,
-        )
+        else:
+            template = BalmerSeriesTemplate.load(
+                path=template_file,
+                info=self.info,
+            )
+
+        return template
 
     @validate_call
     def loadBalmerContinuumTemplate(
@@ -266,33 +269,31 @@ class BalmerWindows(SpecList[BWindow]):
                 logger.critical(msg)
                 raise ValueError(msg)
             return BalmerContinuumTemplate.load_from_cache(
-                temp=temp, 
-                tau=tau, 
+                temp=temp,
+                tau=tau,
                 scale=scale,
                 info=self.info,
             )
-            
+
         return BalmerContinuumTemplate.load(
-            path=template_file, 
+            path=template_file,
             info=self.info,
         )
 
-    @validated_apply_info_to_method(subjects=('balmer',))
+    @validated_apply_info_to_method(subjects=("balmer",))
     def instantiateModel(
         self,
         *,
         flux: float | None = None,
         fwhm: float | None = None,
         ratio: float | None = None,
-
-        source: Literal['sh1995'] | None = None,
+        source: Literal["sh1995"] | None = None,
         temp: float | None = None,
         dens: float | None = None,
         n_u_min: int | None = None,
         n_u_max: int | None = None,
         tau: float | None = None,
         scale: float | None = None,
-
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -300,9 +301,12 @@ class BalmerWindows(SpecList[BWindow]):
         ratio_bounds: AstropyBounds | None = None,
     ) -> BalmerModel:
         """
-        Instantiates a BalmerModel instance using the given parameters and 
+        Instantiates a BalmerModel instance using the given parameters and
         bounds.
         """
+        x_norm: float = self.info.balmer.edge
+        renormalise: bool = (x_norm < self._x[0]) or (self._x[-1] < x_norm)
+
         series_template = self.loadBalmerSeriesTemplate.__wrapped__(
             self,
             source=source,
@@ -326,32 +330,38 @@ class BalmerWindows(SpecList[BWindow]):
             xr=self._x,
             keep_x=True,
         )
-        
+
+        if renormalise:
+            series_template._calculate_normalisation()
+            continuum_template._calculate_normalisation()
+
         self.model = BalmerModel.create(
-            flux, fwhm, ratio,
+            flux,
+            fwhm,
+            ratio,
             edge=self.info.balmer.edge,
             continuum_template=continuum_template,
             series_template=series_template,
             allow_interp_fitting=allow_interp_fitting,
-            name='balmer',
+            name="balmer",
         )
-        
+
         # flux
         self.model.flux.value = apply_bounds.__wrapped__(flux, flux_bounds)
         self.model.flux.bounds = flux_bounds
-        self.model.flux.fixed = fixed.get('flux', False)
+        self.model.flux.fixed = fixed.get("flux", False)
         # fwhm
         self.model.fwhm.value = apply_bounds.__wrapped__(fwhm, fwhm_bounds)
         self.model.fwhm.bounds = fwhm_bounds
-        self.model.fwhm.fixed = fixed.get('fwhm', False)
+        self.model.fwhm.fixed = fixed.get("fwhm", False)
         # ratio
         self.model.ratio.value = apply_bounds.__wrapped__(ratio, ratio_bounds)
         self.model.ratio.bounds = ratio_bounds
-        self.model.ratio.fixed = fixed.get('ratio', False)
+        self.model.ratio.fixed = fixed.get("ratio", False)
 
         return self.model
 
-    @validated_apply_info_to_method(subjects=('balmer',))
+    @validated_apply_info_to_method(subjects=("balmer",))
     def checkModelCoverage(
         self,
         *,
@@ -362,7 +372,7 @@ class BalmerWindows(SpecList[BWindow]):
         covered: bool = False,
     ) -> bool:
         """
-        Checks the degree of coverage of each side of the Balmer 
+        Checks the degree of coverage of each side of the Balmer
         pseudo-continuum.
         """
         model = self.getModel()
@@ -378,7 +388,7 @@ class BalmerWindows(SpecList[BWindow]):
         )
 
         # The blue side: Balmer continuum + attenuation contribution
-        is_blue = (self._x <= model.edge)
+        is_blue = self._x <= model.edge
         n_blue: int = fittable_pixels[is_blue].sum()
         r_blue: float = fittable_pixels[is_blue].mean() if n_blue > 0 else 0.0
         cond1 = (r_blue < min_fittable_ratio) or (n_blue < min_fittable_total)
@@ -390,21 +400,29 @@ class BalmerWindows(SpecList[BWindow]):
         cond2 = (r_red < min_fittable_ratio) or (n_red < min_fittable_total)
 
         if cond1 and cond2:
-            msg = "Insufficient coverage on both sides of the Balmer "\
+            msg = (
+                "Insufficient coverage on both sides of the Balmer "
                 "pseudo-continuum: removing model!"
+            )
             logger.debug(msg)
-            return False        
+            return False
         elif cond1:
-            msg = "Insufficient coverage on the blue side of the Balmer "\
+            msg = (
+                "Insufficient coverage on the blue side of the Balmer "
                 "pseudo-continuum: freezing 'ratio' parameter!"
+            )
             logger.debug(msg)
         elif cond2:
-            msg = "Insufficient coverage on the red side of the Balmer "\
+            msg = (
+                "Insufficient coverage on the red side of the Balmer "
                 "pseudo-continuum: freezing 'ratio' parameter!"
+            )
             logger.debug(msg)
         else:
-            msg = "Sufficient coverage on both sides of the Balmer "\
+            msg = (
+                "Sufficient coverage on both sides of the Balmer "
                 "pseudo-continuum: proceeding with fitting!"
+            )
             logger.debug(msg)
             return True
 
@@ -416,7 +434,7 @@ class BalmerWindows(SpecList[BWindow]):
         model.ratio.fixed = True
 
         return True
-    
+
     @validate_call
     def getRasterFit(
         self,
@@ -441,7 +459,7 @@ class BalmerWindows(SpecList[BWindow]):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            mode='c', # c: contiguous
+            mode="c",  # c: contiguous
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -458,7 +476,7 @@ class BalmerWindows(SpecList[BWindow]):
         )
         return self
 
-    @validated_apply_info_to_method(subjects=('nonlinear',))
+    @validated_apply_info_to_method(subjects=("nonlinear",))
     def performFineTuning(
         self,
         *,
@@ -466,7 +484,7 @@ class BalmerWindows(SpecList[BWindow]):
         without_absorption: bool = False,
         covered: bool = False,
         bg_flux: BackgroundFlux | None = None,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> Self:
         msg = f"Performing fine-tuning fit on {self.__str__(True)}: "
 
@@ -477,15 +495,15 @@ class BalmerWindows(SpecList[BWindow]):
         if model is None:
             msg = "No BalmerModel instance available!"
             raise ValueError(msg)
-        
+
         if covered and self.is_empty:
             msg += f"setting {covered=} to False due to missing host windows, "
             logger.warning(msg)
             covered = False
-        
+
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            mode='c', # c: contiguous
+            mode="c",  # c: contiguous
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -494,21 +512,27 @@ class BalmerWindows(SpecList[BWindow]):
             bg_flux=bg_flux,
         )
         try:
-            with stopwatch() as watch, \
-                PrepareModel(x=masked_coords.x, model=model, copy=True) as fit:
-                _, fit_info = fitter(
-                    fit,
+            with (
+                stopwatch() as watch,
+                PrepareModel(x=masked_coords.x, model=model),
+            ):
+                fitter = Fitter()
+                fit = fitter(
+                    model,
                     masked_coords.x,
                     masked_coords.y,
-                    masked_coords.dy,
-                    inplace=True,
+                    dy=masked_coords.dy,
+                    get_model=True,
+                    inplace=False,
+                    **(fitter_kwargs or {}),
                 )
-                
-            msg += f"Finished fine-tuning in {1e3*watch.elapsed:.1f} ms."
+                fit_info = fitter.fit_info
+
+            msg += f"Finished fine-tuning in {1e3 * watch.elapsed:.1f} ms."
             self.applyFit.__wrapped__(
-                self, 
-                fit, 
-                fit_info=fit_info, 
+                self,
+                fit,
+                fit_info=fit_info,
                 update_emission=True,
             )
 
@@ -516,7 +540,7 @@ class BalmerWindows(SpecList[BWindow]):
             msg += f"Failed fitting due to validation error: {e}"
             logger.critical(msg)
 
-        return self        
+        return self
 
     def getModel(self) -> Optional[BalmerModel]:
         """
@@ -528,7 +552,7 @@ class BalmerWindows(SpecList[BWindow]):
         returned. Otherwise an instantiated model is returned, if available.
         """
         return self.fit or self.model
-    
+
     @validate_call
     def adoptFit(
         self,
@@ -560,7 +584,7 @@ class BalmerWindows(SpecList[BWindow]):
         """
         self.fit = fit
         self.fit_info = fit_info
-        
+
         if update_emission:
             self.updateBalmerEmission.__wrapped__(self, fit)
 

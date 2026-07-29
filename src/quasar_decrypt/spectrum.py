@@ -1,70 +1,92 @@
-from logging import getLogger
-from typing import Iterable, Literal, Self, Callable, overload, Optional, Union
-from pydantic.dataclasses import dataclass
+from collections.abc import Callable, Iterable
 from dataclasses import field
-from numpy import isfinite, invert, argwhere, nanargmax, zeros_like, array_equal
-from scipy.optimize import OptimizeResult
+from logging import getLogger
+from typing import Literal, Optional, Self, Union, overload
 
-from matplotlib.figure import Figure
 from matplotlib.axes import Axes
-
+from matplotlib.figure import Figure
+from numpy import (
+    argwhere,
+    array_equal,
+    invert,
+    isfinite,
+    nanargmax,
+    zeros_like,
+)
+from pydantic.dataclasses import dataclass
 from pydantic_core import ValidationError
-
 from quasar_errors.bootstrapping import BaseBootstrapper
-from quasar_errors.nested_sampling import BaseNestedSampler, UniformNestedSampler
+from quasar_errors.error_result import ErrorResult
+from quasar_errors.model_samples import (
+    BalmerSample,
+    GaussianSampleList,
+    IronSampleList,
+    PowerLawSample,
+    Sample,
+)
+from quasar_errors.nested_sampling import (
+    BaseNestedSampler,
+    UniformNestedSampler,
+)
 from quasar_errors.spectrum_utils import (
     format_bootstrapping_kwargs_for_spectrum,
 )
-from quasar_errors.error_result import ErrorResult
-from quasar_errors.model_samples import (
-    PowerLawSample, IronSampleList, BalmerSample, GaussianSampleList, Sample,
+from quasar_models import (
+    BalmerModel,
+    GaussianModel,
+    HostGalaxyModel,
+    IronModel,
+    PowerLawModel,
 )
-
-from quasar_utils.setup import Info
-from quasar_utils.fitting import FitterInstance
-from quasar_utils.decorators import validate_call, validated_apply_info_to_method
+from quasar_models.modeling import Fitter, PrepareModel
+from quasar_models.utils.astropy import get_free_params, get_model_parts
+from quasar_plotting import absorptionplot, fitplot, quickplot
+from quasar_plotting.colors import DEFAULT_COLORS
+from quasar_plotting.utils import get_coords
+from quasar_typing.astropy import CompoundModel_, FitInfo, Model_, QTable_
+from quasar_typing.bounds import AstropyBounds, CoordBounds
+from quasar_typing.misc import (
+    BackgroundFlux,
+    BootstrapType,
+    DataTypes,
+    ModelTypes,
+    Pool_,
+    Scale,
+    Variant,
+    VaryLines,
+)
+from quasar_typing.numpy import BoolVector, FloatVector, RandomState_
+from quasar_typing.pathlib import (
+    AbsoluteDirPath,
+    AbsoluteFilePath,
+    AbsoluteFITSPath,
+    RelativeFilePath,
+)
 from quasar_utils.absorption import remove_absorption, smooth_spectrum
 from quasar_utils.continuum_fit_result import ContinuumFitResult
-from quasar_utils.pipeline.linelist import LineList
-
-from quasar_typing.numpy import FloatVector, BoolVector, RandomState_
-from quasar_typing.bounds import CoordBounds, AstropyBounds
-
-from quasar_typing.pathlib import (
-    AbsoluteFilePath, AbsoluteDirPath, RelativeFilePath, AbsoluteFITSPath,
+from quasar_utils.decorators import (
+    validate_call,
+    validated_apply_info_to_method,
 )
-from quasar_typing.astropy import Model_, FitInfo, QTable_, CompoundModel_
-from quasar_typing.misc import (
-    Pool_, 
-    BackgroundFlux, ModelTypes, DataTypes,
-    Scale, Variant, BootstrapType, VaryLines,
-)
+from quasar_utils.pipeline import LineList
+from quasar_utils.setup import FitterKwargs, Info
+from scipy.optimize import OptimizeResult
 
-from quasar_models import (
-    PowerLawModel, 
-    IronModel,
-    BalmerModel,
-    HostGalaxyModel,
-    GaussianModel,
-)
-from quasar_models.utils.astropy import get_model_parts, get_free_params
-from quasar_models.utils.prepare_model import PrepareModel
-
-from quasar_plotting import quickplot, absorptionplot, fitplot
-from quasar_plotting.utils import get_coords
-from quasar_plotting.colors import DEFAULT_COLORS
-
-from .utils import _SpecData, SpecList
-from .utils.masked_coords import MaskedCoords, ReadOnlyMaskedCoords, ContiguousMaskedCoords
-from .utils.general import stopwatch
-
-from .continuum import ContinuumWindows
-from .iron import IronWindows
 from .balmer import BalmerWindows
+from .continuum import ContinuumWindows
 from .host import HostWindows
+from .iron import IronWindows
 from .lines import LineWindows
+from .utils import SpecList, _SpecData
+from .utils.general import stopwatch
+from .utils.masked_coords import (
+    ContiguousMaskedCoords,
+    MaskedCoords,
+    ReadOnlyMaskedCoords,
+)
 
 logger = getLogger(__name__)
+
 
 @dataclass
 class Spectrum(_SpecData):
@@ -73,7 +95,9 @@ class Spectrum(_SpecData):
 
     _is_preprocessed: bool = field(default=False, init=False)
 
-    continuum_windows: ContinuumWindows | None = field(default=None, init=False)
+    continuum_windows: ContinuumWindows | None = field(
+        default=None, init=False
+    )
     iron_windows: IronWindows | None = field(default=None, init=False)
     balmer_windows: BalmerWindows | None = field(default=None, init=False)
     host_windows: HostWindows | None = field(default=None, init=False)
@@ -94,26 +118,22 @@ class Spectrum(_SpecData):
         y: FloatVector,
         dy: FloatVector,
         dx: FloatVector | None = None,
-
         y_smooth: FloatVector | None = None,
         y_pl: FloatVector | None = None,
         y_fe: FloatVector | None = None,
         y_ba: FloatVector | None = None,
         y_hg: FloatVector | None = None,
         y_em: FloatVector | None = None,
-
         rejected_pixels: BoolVector | None = None,
         absorbed_pixels: BoolVector | None = None,
         valid_pixels: BoolVector | None = None,
         log_valid_pixels: BoolVector | None = None,
         p_absorbed: FloatVector | None = None,
-
         x0: float | None = None,
         y0: float | None = None,
         x_log: FloatVector | None = None,
         y_log: FloatVector | None = None,
         dy_log: FloatVector | None = None,
-
         x_bounds: CoordBounds | None = None,
         info: Info = None,
         get_mask: Callable[[float, float], BoolVector] | None = None,
@@ -126,26 +146,22 @@ class Spectrum(_SpecData):
             y=y,
             dy=dy,
             dx=dx,
-            
             y_smooth=y_smooth,
             y_pl=y_pl,
             y_fe=y_fe,
             y_ba=y_ba,
             y_hg=y_hg,
             y_em=y_em,
-
             rejected_pixels=rejected_pixels,
             absorbed_pixels=absorbed_pixels,
             valid_pixels=valid_pixels,
             log_valid_pixels=log_valid_pixels,
             p_absorbed=p_absorbed,
-
             x0=x0,
             y0=y0,
             x_log=x_log,
             y_log=y_log,
             dy_log=dy_log,
-
             x_bounds=x_bounds,
             info=info,
             get_mask=get_mask,
@@ -163,89 +179,86 @@ class Spectrum(_SpecData):
         y: FloatVector,
         dy: FloatVector,
         dx: FloatVector | None = None,
-
         y_smooth: FloatVector | None = None,
         y_pl: FloatVector | None = None,
         y_fe: FloatVector | None = None,
         y_ba: FloatVector | None = None,
         y_hg: FloatVector | None = None,
         y_em: FloatVector | None = None,
-
         rejected_pixels: BoolVector | None = None,
         absorbed_pixels: BoolVector | None = None,
         valid_pixels: BoolVector | None = None,
         log_valid_pixels: BoolVector | None = None,
         p_absorbed: FloatVector | None = None,
-
         x0: float | None = None,
         y0: float | None = None,
         x_log: FloatVector | None = None,
         y_log: FloatVector | None = None,
         dy_log: FloatVector | None = None,
-
         x_bounds: CoordBounds | None = None,
         info: Info = None,
         get_mask: Callable[[float, float], BoolVector] | None = None,
     ) -> dict:
-        kwargs = {'path': path, 'title': title}
-        kwargs.update(super().get_kwargs.__wrapped__(
-            cls,
-            x=x,
-            y=y,
-            dy=dy,
-            dx=dx,
-
-            y_smooth=y_smooth,
-            y_pl=y_pl,
-            y_fe=y_fe,
-            y_ba=y_ba,
-            y_hg=y_hg,
-            y_em=y_em,
-
-            rejected_pixels=rejected_pixels,
-            absorbed_pixels=absorbed_pixels,
-            valid_pixels=valid_pixels,
-            log_valid_pixels=log_valid_pixels,
-            p_absorbed=p_absorbed,
-
-            x0=x0,
-            y0=y0,
-            x_log=x_log,
-            y_log=y_log,
-            dy_log=dy_log,
-
-            x_bounds=x_bounds,
-            info=info,
-            get_mask=get_mask,
-        ))
+        kwargs = {"path": path, "title": title}
+        kwargs.update(
+            super().get_kwargs.__wrapped__(
+                cls,
+                x=x,
+                y=y,
+                dy=dy,
+                dx=dx,
+                y_smooth=y_smooth,
+                y_pl=y_pl,
+                y_fe=y_fe,
+                y_ba=y_ba,
+                y_hg=y_hg,
+                y_em=y_em,
+                rejected_pixels=rejected_pixels,
+                absorbed_pixels=absorbed_pixels,
+                valid_pixels=valid_pixels,
+                log_valid_pixels=log_valid_pixels,
+                p_absorbed=p_absorbed,
+                x0=x0,
+                y0=y0,
+                x_log=x_log,
+                y_log=y_log,
+                dy_log=dy_log,
+                x_bounds=x_bounds,
+                info=info,
+                get_mask=get_mask,
+            )
+        )
         return kwargs
-    
+
     def __post_init__(self) -> None:
         self.preprocess()
 
     @property
-    def pl(self) -> ContinuumWindows | None: return self.continuum_windows
+    def pl(self) -> ContinuumWindows | None:
+        return self.continuum_windows
 
     @property
-    def pl_sample(self) -> PowerLawSample | None: 
+    def pl_sample(self) -> PowerLawSample | None:
         return None if self.pl is None else self.pl.sample
 
     @property
-    def fe(self) -> IronWindows | None: return self.iron_windows
+    def fe(self) -> IronWindows | None:
+        return self.iron_windows
 
     @property
     def fe_sample(self) -> IronSampleList | None:
         return None if self.fe is None else self.fe.sample
-    
+
     @property
-    def ba(self) -> BalmerWindows | None: return self.balmer_windows
+    def ba(self) -> BalmerWindows | None:
+        return self.balmer_windows
 
     @property
     def ba_sample(self) -> BalmerSample | None:
         return None if self.ba is None else self.ba.sample
 
     @property
-    def hg(self) -> HostWindows | None: 
+    def hg(self) -> HostWindows | None:
         return self.host_windows
 
     @property
@@ -253,34 +266,32 @@ class Spectrum(_SpecData):
         return None
 
     @property
-    def em(self) -> LineWindows | None: return self.line_windows
+    def em(self) -> LineWindows | None:
+        return self.line_windows
 
     @property
     def em_sample(self) -> GaussianSampleList | None:
         return None if self.em is None else self.em.sample
-    
+
     @property
     def basic_sample(self) -> Sample:
         if (model := self.getModel()) is None:
             return Sample.fromSpectrumSample(self.x, self.y, self.dy)
         return Sample.fromModelSample(self.x, self.y, self.dy, model)
-    
+
     @property
     def basic_error_result(self) -> ErrorResult:
         return ErrorResult((self.basic_sample,), (1.0,))
 
     def __str__(self, simple: bool = False):
         s = "'Spectrum' class [{:.1f} <-> {:.1f}]".format(*self.x_bounds)
-
         if not simple:
             i = int((~self.valid_pixels).sum())
             n = len(self.x)
-
-            s += " w/ {}/{} (invalid).".format(i, n)
-        
+            s += f" w/ {i}/{n} (invalid)."
         return s
-    
-    @validated_apply_info_to_method(subjects=('absorption', 'lines'))
+
+    @validated_apply_info_to_method(subjects=("absorption", "lines"))
     def __call__(
         self,
         linelist: AbsoluteFilePath | LineList,
@@ -289,9 +300,10 @@ class Spectrum(_SpecData):
         x_limit: float | None = None,
     ) -> None:
         logger.debug("Running 'Spectrum' pipeline...")
-        
+
         self.cropLymanAlphaForest.__wrapped__(
-            self, x_limit=x_limit,
+            self,
+            x_limit=x_limit,
         )
         self.fitContinuum.__wrapped__(self)
 
@@ -308,34 +320,34 @@ class Spectrum(_SpecData):
         logger.debug("... finished running 'Spectrum' pipeline!")
 
     @overload
-    def __getitem__(self, key: Literal['pl']) -> ContinuumWindows | None: ...
+    def __getitem__(self, key: Literal["pl"]) -> ContinuumWindows | None: ...
 
     @overload
-    def __getitem__(self, key: Literal['fe']) -> IronWindows | None: ...
+    def __getitem__(self, key: Literal["fe"]) -> IronWindows | None: ...
 
     @overload
-    def __getitem__(self, key: Literal['ba']) -> BalmerWindows | None: ...
+    def __getitem__(self, key: Literal["ba"]) -> BalmerWindows | None: ...
 
     @overload
-    def __getitem__(self, key: Literal['hg']) -> HostWindows | None: ...
+    def __getitem__(self, key: Literal["hg"]) -> HostWindows | None: ...
 
     @overload
-    def __getitem__(self, key: Literal['em']) -> LineWindows | None: ...
-    
+    def __getitem__(self, key: Literal["em"]) -> LineWindows | None: ...
+
     def __getitem__(
         self,
-        key: Literal['pl', 'fe', 'ba', 'hg', 'em'],
+        key: Literal["pl", "fe", "ba", "hg", "em"],
     ) -> SpecList | None:
         match key:
-            case 'pl':
+            case "pl":
                 return self.continuum_windows
-            case 'fe':
+            case "fe":
                 return self.iron_windows
-            case 'ba':
+            case "ba":
                 return self.balmer_windows
-            case 'hg':
+            case "hg":
                 return self.host_windows
-            case 'em':
+            case "em":
                 return self.line_windows
 
     def preprocess(self) -> None:
@@ -344,12 +356,12 @@ class Spectrum(_SpecData):
             self.findAnomalies()
             self.truncateSpectrum()
             logger.debug(f"Preprocessed: {self}")
-            
+
             self._is_preprocessed = True
 
     def findAnomalies(self) -> None:
         """
-        Identifies anomalous pixels, and replaces them with NaN. Anomalous 
+        Identifies anomalous pixels, and replaces them with NaN. Anomalous
         pixels have: non-positive flux densities OR non-positive flux density
         uncertainties.
         """
@@ -360,10 +372,10 @@ class Spectrum(_SpecData):
 
         mask = cond_1 | cond_2 | cond_3
 
-        msg = ">>> Found {}/{} anomalous pixels: ".format(mask.sum(), n) \
-            + "{}/{} (invalid wave), ".format(cond_1.sum(), n) \
-            + "{}/{} (invalid flux), ".format(cond_2.sum(), n) \
-            + "{}/{} (invalid flux unc.).".format(cond_3.sum(), n)
+        msg = f">>> Found {mask.sum()}/{n} anomalous pixels: "
+        msg += f"{cond_1.sum()}/{n} (invalid wave), "
+        msg += f"{cond_2.sum()}/{n} (invalid flux), "
+        msg += f"{cond_3.sum()}/{n} (invalid flux unc.)."
         logger.debug(msg)
 
         self._valid_pixels = invert(mask)
@@ -372,34 +384,39 @@ class Spectrum(_SpecData):
         if sel.step not in (None, 1):
             raise ValueError("Only contiguous truncation is supported.")
 
-        def f(arr): return arr[sel]
+        def f(arr):
+            return arr[sel]
 
-        for key, value in super().get_kwargs.__wrapped__(
-            self.__class__,
-            x=f(self._x),
-            y=f(self._y),
-            dy=f(self._dy),
-            dx=f(self._dx),
-            x_bounds=None,
-            info=self.info,
-            y_smooth=f(self._y_smooth),
-            y_pl=f(self._y_pl),
-            y_fe=f(self._y_fe),
-            y_ba=f(self._y_ba),
-            y_hg=f(self._y_hg),
-            y_em=f(self._y_em),
-            rejected_pixels=f(self._rejected_pixels),
-            absorbed_pixels=f(self._absorbed_pixels),
-            valid_pixels=f(self._valid_pixels),
-            log_valid_pixels=f(self._log_valid_pixels),
-            p_absorbed=f(self._p_absorbed),
-            x0=self.x0,
-            y0=self.y0,
-            x_log=f(self._x_log),
-            y_log=f(self._y_log),
-            dy_log=f(self._dy_log),
-            get_mask=None,
-        ).items():
+        for key, value in (
+            super()
+            .get_kwargs.__wrapped__(
+                self.__class__,
+                x=f(self._x),
+                y=f(self._y),
+                dy=f(self._dy),
+                dx=f(self._dx),
+                x_bounds=None,
+                info=self.info,
+                y_smooth=f(self._y_smooth),
+                y_pl=f(self._y_pl),
+                y_fe=f(self._y_fe),
+                y_ba=f(self._y_ba),
+                y_hg=f(self._y_hg),
+                y_em=f(self._y_em),
+                rejected_pixels=f(self._rejected_pixels),
+                absorbed_pixels=f(self._absorbed_pixels),
+                valid_pixels=f(self._valid_pixels),
+                log_valid_pixels=f(self._log_valid_pixels),
+                p_absorbed=f(self._p_absorbed),
+                x0=self.x0,
+                y0=self.y0,
+                x_log=f(self._x_log),
+                y_log=f(self._y_log),
+                dy_log=f(self._dy_log),
+                get_mask=None,
+            )
+            .items()
+        ):
             setattr(self, key, value)
 
     def truncateSpectrum(self) -> None:
@@ -419,7 +436,7 @@ class Spectrum(_SpecData):
             valid_indices = argwhere(mask).flatten()
             idx_start = valid_indices[0]
             idx_end = valid_indices[-1]
-            sel = slice(valid_indices[0], valid_indices[-1]+1)
+            sel = slice(valid_indices[0], valid_indices[-1] + 1)
 
             n = len(mask)
             n_blue = idx_start
@@ -430,12 +447,17 @@ class Spectrum(_SpecData):
 
             logger.debug(
                 "Cutting %d/%d pixel(s): %d/%d (blue edge), %d/%d (red edge)",
-                n_tot, n, n_blue, n, n_red, n,
+                n_tot,
+                n,
+                n_blue,
+                n,
+                n_red,
+                n,
             )
-                        
-    @validated_apply_info_to_method(subjects=('lines',))
+
+    @validated_apply_info_to_method(subjects=("lines",))
     def cropLymanAlphaForest(
-        self, 
+        self,
         *,
         x_limit: float | None = None,
     ) -> None:
@@ -443,30 +465,23 @@ class Spectrum(_SpecData):
 
         indices = argwhere(self._x < x_limit).flatten()
         if (len(indices) != 0) and ((edge_idx := indices[-1]) >= 1):
-            _y = self._y[:edge_idx+1]
+            _y = self._y[: edge_idx + 1]
             idx_max = nanargmax(_y).flatten()[0]
 
             x_max = self._x[idx_max]
             y_max = self._y[idx_max]
 
-            logger.debug(
-                ">>> Peak found at ({:.1f}, {:.1f}) ".format(x_max, y_max) \
-                + "under the condition: x < {:.1f}.".format(self._x[edge_idx])
-            )
+            msg = f">>> Peak found at ({x_max:.1f}, {y_max:.1f}) under the condition: x < {self._x[edge_idx]:.1f}."
+            logger.debug(msg)
 
             self._valid_pixels[:idx_max] = False
             self.truncateSpectrum()
-
-            # self.x_bounds = (
-            #     self._x[idx_max] - self._dx[idx_max] / 2,
-            #     self.x_bounds[1]
-            # )
 
             logger.debug(f">>> Cropping {idx_max} pixel(s).")
 
         logger.debug(f"Cropped Lyman-alpha forest: {self}")
 
-    @validated_apply_info_to_method(subjects=('absorption',))
+    @validated_apply_info_to_method(subjects=("absorption",))
     def smoothSpectrum(
         self,
         *,
@@ -480,16 +495,16 @@ class Spectrum(_SpecData):
         self._y_smooth[:] = smooth_spectrum.__wrapped__(
             *self._coords,
             self._valid_pixels,
-            w, 
+            w,
             p,
             logspace,
         )
 
-    @validated_apply_info_to_method(subjects=('absorption',))
+    @validated_apply_info_to_method(subjects=("absorption",))
     def removeAbsorption(
         self,
         *,
-        bg_flux: BackgroundFlux = BackgroundFlux({'all'}),
+        bg_flux: BackgroundFlux | None = None,
         w: int | None = None,
         p: int | None = None,
         p_crit: float | None = None,
@@ -498,9 +513,15 @@ class Spectrum(_SpecData):
         refine: bool | None = None,
         logspace: bool | None = None,
     ) -> None:
+        if bg_flux is None:
+            bg_flux = BackgroundFlux({"all"})
+
         if array_equal(self._y, self._y_smooth):
             self.smoothSpectrum.__wrapped__(
-                self, w=w, p=p, logspace=logspace,
+                self,
+                w=w,
+                p=p,
+                logspace=logspace,
             )
 
         result = remove_absorption.__wrapped__(
@@ -517,8 +538,8 @@ class Spectrum(_SpecData):
         self._p_absorbed[:] = result[0]
         self._absorbed_pixels[:] = result[1]
         self._y_smooth[:] = result[2]
-        
-    @validated_apply_info_to_method(subjects=('continuum',))
+
+    @validated_apply_info_to_method(subjects=("continuum",))
     def instantiateContinuum(
         self,
         *,
@@ -537,7 +558,9 @@ class Spectrum(_SpecData):
         )
         return self
 
-    @validated_apply_info_to_method(subjects=('iron',), specific_kwargs={'windows'})
+    @validated_apply_info_to_method(
+        subjects=("iron",), specific_kwargs={"windows"}
+    )
     def instantiateIron(
         self,
         *,
@@ -548,12 +571,14 @@ class Spectrum(_SpecData):
             spectrum=self,
         )
         self.iron_windows.populate.__wrapped__(
-            self.iron_windows, 
+            self.iron_windows,
             windows=windows,
         )
         return self
-    
-    @validated_apply_info_to_method(subjects=('balmer',), specific_kwargs={'windows'})
+
+    @validated_apply_info_to_method(
+        subjects=("balmer",), specific_kwargs={"windows"}
+    )
     def instantiateBalmer(
         self,
         *,
@@ -568,8 +593,10 @@ class Spectrum(_SpecData):
             windows=windows,
         )
         return self
-    
-    @validated_apply_info_to_method(subjects=('host',), specific_kwargs={'windows'})
+
+    @validated_apply_info_to_method(
+        subjects=("host",), specific_kwargs={"windows"}
+    )
     def instantiateHost(
         self,
         *,
@@ -593,10 +620,13 @@ class Spectrum(_SpecData):
         return self
 
     @validated_apply_info_to_method(
-        subjects=('lines',),
+        subjects=("lines",),
         specific_kwargs={
-            'sigma_res', 'v_sep', 'forced_splits', 'min_fittable_total', 
-            'min_fittable_ratio',
+            "sigma_res",
+            "v_sep",
+            "forced_splits",
+            "min_fittable_total",
+            "min_fittable_ratio",
         },
     )
     def instantiateFromTemplateModel(
@@ -604,42 +634,44 @@ class Spectrum(_SpecData):
         template_model: Model_,
         *,
         linelist: AbsoluteFilePath | LineList,
-
         continuum_windows: list[CoordBounds] | None = None,
         iron_windows: list[CoordBounds] | None = None,
         balmer_windows: list[CoordBounds] | None = None,
         host_windows: list[CoordBounds] | None = None,
-
         sigma_res: float | None = None,
         v_sep: float | None = None,
         forced_splits: FloatVector | None = None,
         min_fittable_total: int | None = None,
         min_fittable_ratio: float | None = None,
     ) -> Self:
-        fs = (template_model,) if template_model.n_submodels == 1 else template_model
-        model_components = set(f.model_type for f in fs)
+        fs = (
+            (template_model,)
+            if template_model.n_submodels == 1
+            else template_model
+        )
+        model_components = {f.model_type for f in fs}
 
-        if 'pl' in model_components:
+        if "pl" in model_components:
             self.instantiateContinuum.__unvalidated__(
                 self,
                 windows=continuum_windows,
             )
-        if 'fe' in model_components:
+        if "fe" in model_components:
             self.instantiateIron.__unvalidated__(
                 self,
                 windows=iron_windows,
             )
-        if 'ba' in model_components:
+        if "ba" in model_components:
             self.instantiateBalmer.__unvalidated__(
                 self,
                 windows=balmer_windows,
             )
-        if 'hg' in model_components:
+        if "hg" in model_components:
             self.instantiateHost.__unvalidated__(
                 self,
                 windows=host_windows,
             )
-        if 'em' in model_components:
+        if "em" in model_components:
             self.instantiateLines()
             self.line_windows.applyLineList.__unvalidated__(
                 self.line_windows,
@@ -657,45 +689,44 @@ class Spectrum(_SpecData):
             update_emission=True,
         )
         return self
-        
-    @validated_apply_info_to_method(subjects=('continuum', 'nonlinear'))
+
+    @validated_apply_info_to_method(subjects=("continuum", "nonlinear"))
     def fitContinuum(
         self,
         *,
         template_model: Optional[PowerLawModel] = None,
         bg_flux: BackgroundFlux | None = None,
-
         windows: list[CoordBounds] | None = None,
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         """
-        Fits the continuum and creates a 'CSSpectrum' class. 
+        Fits the continuum and creates a 'CSSpectrum' class.
         Takes the following steps:
 
-        1.  Creates a 'ContinuumWindows' class, makes a preliminary power law 
-            fit (using linear methods), and refines it using sigma-clipping and 
-            non-linear optimisation. 
+        1.  Creates a 'ContinuumWindows' class, makes a preliminary power law
+            fit (using linear methods), and refines it using sigma-clipping and
+            non-linear optimisation.
         2.  Using the continuum fit, creates a 'CSSpectrum'
-            class. 
+            class.
 
         Parameters
         ----------
         sigmas : list[float], None
-            List of critical residual values used for sigma-clipping. If None, 
+            List of critical residual values used for sigma-clipping. If None,
             defaults to the values given by the 'ContinuumInfo' class.
         fitter : Callable, None
-            Function which performs non-linear optimisation through 'astropy'. 
+            Function which performs non-linear optimisation through 'astropy'.
             If None, defaults to the function given by the 'NonLinearInfo' class
-            via the 'ContinuumInfo' class.  
+            via the 'ContinuumInfo' class.
 
         Notes
         -----
-        The instantiated classes are accessed using (self is the 'Spectrum' 
+        The instantiated classes are accessed using (self is the 'Spectrum'
         class):
-        
+
             ContinuumWindows ->             self.continuum_windows
             CSSpectrum ->  self.cs_spectrum
         """
@@ -705,27 +736,26 @@ class Spectrum(_SpecData):
         )
         self.continuum_windows.__call__.__wrapped__(
             self.continuum_windows,
-
             template_model=template_model,
             bg_flux=bg_flux,
-
             sigmas=sigmas,
             flux_bounds=flux_bounds,
             alpha_bounds=alpha_bounds,
-            fitter=fitter,
+            fitter_kwargs=fitter_kwargs,
         )
 
-    @validated_apply_info_to_method(subjects=('iron', 'nonlinear'))
+    @validated_apply_info_to_method(subjects=("iron", "nonlinear"))
     def fitIron(
         self,
         *,
-        template_model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        template_model: Union[
+            IronModel, CompoundModel_[IronModel], None
+        ] = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-
         windows: list[CoordBounds] | None = None,
-        template_files: list[AbsoluteFITSPath | str] | None = None, 
+        template_files: list[AbsoluteFITSPath | str] | None = None,
         resample: bool | None = None,
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
@@ -737,23 +767,21 @@ class Spectrum(_SpecData):
         allow_interp_fitting: bool | None = None,
         raster: bool | None = None,
         fine_tune: bool | None = None,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
         self.instantiateIron.__wrapped__(
-            self, 
+            self,
             windows=windows,
         )
         self.iron_windows.__call__.__wrapped__(
             self.iron_windows,
-
             template_model=template_model,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-
             template_files=template_files,
             resample=resample,
             flux_bounds=flux_bounds,
@@ -766,10 +794,10 @@ class Spectrum(_SpecData):
             allow_interp_fitting=allow_interp_fitting,
             raster=raster,
             fine_tune=fine_tune,
-            fitter=fitter,
+            fitter_kwargs=fitter_kwargs,
         )
-        
-    @validated_apply_info_to_method(subjects=('balmer', 'nonlinear'))
+
+    @validated_apply_info_to_method(subjects=("balmer", "nonlinear"))
     def fitBalmer(
         self,
         *,
@@ -777,13 +805,11 @@ class Spectrum(_SpecData):
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-
         windows: list[CoordBounds] | None = None,
-
         flux: float | None = None,
         fwhm: float | None = None,
         ratio: float | None = None,
-        source: Literal['sh1995'] | None = None,
+        source: Literal["sh1995"] | None = None,
         temp: float | None = None,
         dens: float | None = None,
         n_u_min: int | None = None,
@@ -792,32 +818,26 @@ class Spectrum(_SpecData):
         scale: float | None = None,
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
-
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
         ratio_bounds: AstropyBounds | None = None,
-
         min_fittable_ratio: float | None = None,
         min_fittable_total: int | None = None,
-        
         raster: bool | None = None,
         fine_tune: bool | None = None,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         self.instantiateBalmer.__wrapped__(
-            self, 
+            self,
             windows=windows,
         )
         self.balmer_windows.__call__.__wrapped__(
             self.balmer_windows,
-
             template_model=template_model,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-
             covered=not self.ba.is_empty,
-
             flux=flux,
             fwhm=fwhm,
             ratio=ratio,
@@ -830,48 +850,40 @@ class Spectrum(_SpecData):
             scale=scale,
             allow_interp_fitting=allow_interp_fitting,
             fixed=fixed,
-
             flux_bounds=flux_bounds,
             fwhm_bounds=fwhm_bounds,
             ratio_bounds=ratio_bounds,
-
             min_fittable_ratio=min_fittable_ratio,
             min_fittable_total=min_fittable_total,
-
             raster=raster,
             fine_tune=fine_tune,
-            fitter=fitter,
+            fitter_kwargs=fitter_kwargs,
         )
 
-    @validated_apply_info_to_method(subjects=('host', 'nonlinear'))
+    @validated_apply_info_to_method(subjects=("host", "nonlinear"))
     def fitHost(
         self,
         *,
         windows: list[CoordBounds] | None = None,
-
         template_model: Optional[HostGalaxyModel] = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-
         template_files: list[str | AbsoluteFITSPath] | None = None,
-        sources: list[Literal['bc2003']] | None = None,
+        sources: list[Literal["bc2003"]] | None = None,
         ages: list[int] | None = None,
-
         flux: float | None = None,
         fwhm: float | None = None,
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
         allow_interp_fitting: bool | None = None,
         fixed: dict[str, bool] | None = None,
-
         raster: bool = True,
         fine_tune: bool = True,
         only_model: bool = False,
-
         min_fittable_ratio: float | None = None,
         min_fittable_total: int | None = None,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         self.instantiateHost.__wrapped__(
             self,
@@ -898,36 +910,35 @@ class Spectrum(_SpecData):
             only_model=only_model,
             min_fittable_total=min_fittable_total,
             min_fittable_ratio=min_fittable_ratio,
-            fitter=fitter,
+            fitter_kwargs=fitter_kwargs,
         )
 
-    @validated_apply_info_to_method(subjects=('loading', 'lines', 'nonlinear'))
+    @validated_apply_info_to_method(subjects=("loading", "lines", "nonlinear"))
     def fitLines(
         self,
         linelist: AbsoluteFilePath | LineList,
         *,
-        template_model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]] = None,
-
-        bg_flux: BackgroundFlux = BackgroundFlux({'pl', 'fe', 'ba', 'hg'}),
+        template_model: Optional[
+            Union[GaussianModel, CompoundModel_[GaussianModel]]
+        ] = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
         limited: bool = False,
-
         sigma_res: float | None = None,
         v_sep: float | None = None,
         forced_splits: FloatVector | None = None,
         w: int | None = None,
         min_fittable_total: int | None = None,
         min_fittable_ratio: float | None = None,
-        evaluate_initial: float | int | None = None,
+        evaluate_initial: float | None = None,
         aggressive: bool | None = None,
         crop: bool | None = None,
         measure: str | None = None,
         reverse: bool | None = None,
         make_copies: bool | None = None,
-
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -935,95 +946,93 @@ class Spectrum(_SpecData):
         Calls the 'CSSpectrum' class, performing the following:
 
         1.  Smooths the flux density array, and identifies and removes pixels
-            possibly affected by narrow absorption lines. 
-        2.  Creates 'SpecSlice' classes between 'Window' classes (used for 
-            continuum fitting). 
-        3.  Creates 'SubSlice' classes from 'SpecSlice' classes using the given 
+            possibly affected by narrow absorption lines.
+        2.  Creates 'SpecSlice' classes between 'Window' classes (used for
+            continuum fitting).
+        3.  Creates 'SubSlice' classes from 'SpecSlice' classes using the given
             list of emission lines. If a 'SpecSlice' is empty (i.e. doesn't
-            contain any emission lines, it is discarded). 
+            contain any emission lines, it is discarded).
         4.  Fits emission lines within each 'SubSlice' instance, increasing
-            model complexity accordingly.  
+            model complexity accordingly.
 
         Parameters
         ----------
         See '__call__()' method of the 'CSSpectrum' class.
         """
+        if bg_flux is None:
+            bg_flux = BackgroundFlux({"pl", "fe", "ba", "hg"})
+
         self.instantiateLines()
         self.line_windows.__call__.__wrapped__(
             self.line_windows,
             linelist,
-
-            template_model = template_model,
-            bg_flux = bg_flux,
-            without_rejections = without_rejections,
-            without_absorption = without_absorption,
-            with_neighbours = with_neighbours,
-            limited = limited,
-
-            v_sep = v_sep,
-            forced_splits = forced_splits,
-
-            w = w,
-            sigma_res = sigma_res,
-            min_fittable_total = min_fittable_total,
-            min_fittable_ratio = min_fittable_ratio,
-            evaluate_initial = evaluate_initial,
-            aggressive = aggressive,
-            crop = crop,
-            measure = measure,
-            reverse = reverse,
-            make_copies = make_copies,
-            
-            fitter = fitter,
+            template_model=template_model,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            with_neighbours=with_neighbours,
+            limited=limited,
+            v_sep=v_sep,
+            forced_splits=forced_splits,
+            w=w,
+            sigma_res=sigma_res,
+            min_fittable_total=min_fittable_total,
+            min_fittable_ratio=min_fittable_ratio,
+            evaluate_initial=evaluate_initial,
+            aggressive=aggressive,
+            crop=crop,
+            measure=measure,
+            reverse=reverse,
+            make_copies=make_copies,
+            fitter_kwargs=fitter_kwargs,
         )
 
-    @validated_apply_info_to_method(subjects=('nonlinear',))
+    @validated_apply_info_to_method(subjects=("nonlinear",))
     def finaliseFit(
         self,
         model_types: ModelTypes | None = None,
         data_types: DataTypes | None = None,
         bg_flux: BackgroundFlux | None = None,
-        without_rejections: bool = False, 
+        without_rejections: bool = False,
         without_absorption: bool = False,
         *,
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
         """
         Notes
         -----
-        If 'model_types' and 'data_types' are both None, they default to all 
-        types. If only one of them is None, it default to the other. 
+        If 'model_types' and 'data_types' are both None, they default to all
+        types. If only one of them is None, it default to the other.
 
-        If 'bg_flux' is None, is default to all types not specified in 
+        If 'bg_flux' is None, is default to all types not specified in
         'model_types'.
 
         """
-        s = self.__str__(simple=True).removesuffix('.')
+        s = self.__str__(simple=True).removesuffix(".")
         msg = f"Finalising fit for {s}: "
 
         if model_types is None:
             model_types = (
-                ModelTypes({'all'}) 
-                if data_types is None 
+                ModelTypes({"all"})
+                if data_types is None
                 else data_types.copy()
             )
 
-        if data_types is not None:
-            if not any(self[dt] is not None for dt in data_types):
-                msg += f"no data types found for {data_types}. "
-                logger.warning(msg)
-                return False
-        
+        if data_types is not None and not any(self[dt] is not None for dt in data_types):
+            msg += f"no data types found for {data_types}. "
+            logger.warning(msg)
+            return False
+
         if bg_flux is None:
             _bg_flux = set(model_types)
-            _bg_flux.add('all')
+            _bg_flux.add("all")
             bg_flux = BackgroundFlux(_bg_flux)
 
         msg += f"{model_types=}, {data_types=}, {bg_flux=} -> "
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            mode='c', # c: contiguous
+            mode="c",  # c: contiguous
             data_types=data_types,
             bg_flux=bg_flux,
             covered=True,
@@ -1043,55 +1052,56 @@ class Spectrum(_SpecData):
         n_free_params = sum(get_free_params(model).values())
 
         if n_pix <= n_free_params:
-            msg += "cancelling final fitting due to insufficient no. of data " \
+            msg += (
+                "cancelling final fitting due to insufficient no. of data "
                 f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
+            )
             logger.critical(msg)
             return False
-        
-        msg += "n_pixels={}, n_submodels={} (n_free_params={}), " \
-            .format(n_pix, model.n_submodels, n_free_params)
-        
+
+        msg += f"n_pixels={n_pix}, n_submodels={model.n_submodels} (n_free_params={n_free_params}), "
 
         try:
-            with stopwatch() as watch, \
-                PrepareModel(x=masked_coords.x, model=model, copy=True) as fit:
-                
-                _, fit_info = fitter(
-                    fit,
+            with (
+                stopwatch() as watch,
+                PrepareModel(x=masked_coords.x, model=model),
+            ):
+                fitter = Fitter()
+                fit = fitter(
+                    model,
                     masked_coords.x,
                     masked_coords.y,
-                    masked_coords.dy,
-                    inplace=True,
+                    dy=masked_coords.dy,
+                    get_model=True,
+                    inplace=False,
+                    **(fitter_kwargs or {}),
                 )
-            
-            msg += "successfully finalised fit in {:.1f} ms." \
-                .format(watch.elapsed)
-        except ValidationError as e: 
+
+            msg += f"successfully finalised fit in {watch.elapsed:.1f} ms."
+        except ValidationError as e:
             msg += f"failed fitting due to validation error: {e}"
             logger.warning(msg)
             return False
         except Exception as e:
             msg += f"failed fitting due to an unexpected error: {e}"
             logger.warning(msg)
-            raise e
-            return False
-        
-        logger.debug(msg)    
+            raise 
+
+        logger.debug(msg)
         self.applyFit.__wrapped__(
-            self, 
-            fit, 
-            fit_info=fit_info,
+            self,
+            fit,
+            fit_info=fitter.fit_info,
             update_emission=True,
         )
-
         return True
 
     def reformatFit(self):
         """
-        Updates each 'Subslice' class' submodel names, such that they are in 
+        Updates each 'Subslice' class' submodel names, such that they are in
         order (sorted by observed wavelength, in ascending order). For emission
-        lines with multiple assigned submodels, the submodels are numbered in 
-        the appropriate order (#1, #2, #3, etc.). 
+        lines with multiple assigned submodels, the submodels are numbered in
+        the appropriate order (#1, #2, #3, etc.).
         """
         self.fit = self.fit[0]
         for lwindow in self.line_windows:
@@ -1114,8 +1124,8 @@ class Spectrum(_SpecData):
 
         Notes
         -----
-        If 'data_types' is None, the entire spectrum is considered, i.e. 
-        window-like objects' masks are not applied. 
+        If 'data_types' is None, the entire spectrum is considered, i.e.
+        window-like objects' masks are not applied.
         """
         mask = zeros_like(self._x, dtype=bool)
         if (data_types is None) or (not covered):
@@ -1123,8 +1133,8 @@ class Spectrum(_SpecData):
         else:
             for d_type in filter(lambda dt: self[dt] is not None, data_types):
                 mask |= self[d_type].mask
-            
-        if without_rejections: 
+
+        if without_rejections:
             mask &= invert(self._rejected_pixels)
         if without_absorption:
             mask &= invert(self._absorbed_pixels)
@@ -1135,12 +1145,12 @@ class Spectrum(_SpecData):
             mask &= self._valid_pixels
 
         return mask
-    
+
     @validate_call
     def getMaskedCoords(
         self,
         *,
-        mode: Literal['r', 'c'] | None = None,
+        mode: Literal["r", "c"] | None = None,
         data_types: DataTypes | None = None,
         bg_flux: BackgroundFlux | None = None,
         covered: bool = True,
@@ -1153,8 +1163,8 @@ class Spectrum(_SpecData):
         Notes
         -----
         If 'data_types' is None, the entire spectrum is considered, i.e.
-        window-like objects' masks are not applied. 
-        
+        window-like objects' masks are not applied.
+
         If 'bg_flux' is None, no background flux is subtracted.
         """
         mask = self.getMask.__wrapped__(
@@ -1167,21 +1177,24 @@ class Spectrum(_SpecData):
             log_valid=log_valid,
         )
         match mode:
-            case 'r': 
+            case "r":
                 return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
-            case 'c': 
+            case "c":
                 return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
             case None:
                 return MaskedCoords(self, mask, bg_flux=bg_flux)
-    
+
     @validate_call
     def getModel(
         self,
-        model_types: ModelTypes = ModelTypes({'all'}),
+        model_types: ModelTypes | None = None,
     ) -> Optional[Model_]:
         """
         ** PYDANTIC VALIDATED METHOD **
-        """        
+        """
+        if model_types is None:
+            model_types = ModelTypes({"all"})
+            
         models: list[Model_] = []
         for m_type in filter(lambda mt: self[mt] is not None, model_types):
             windows = self[m_type]
@@ -1191,7 +1204,7 @@ class Spectrum(_SpecData):
                 models.append(model)
 
         return None if len(models) == 0 else sum(models[1:], start=models[0])
-    
+
     @validate_call
     def adoptFit(
         self,
@@ -1202,7 +1215,7 @@ class Spectrum(_SpecData):
     ) -> None:
         count = 0
         parts = get_model_parts(fit)
-        for key in ('pl', 'fe', 'ba', 'hg', 'em'):
+        for key in ("pl", "fe", "ba", "hg", "em"):
             model = parts[key]
             if model is None:
                 continue
@@ -1211,31 +1224,31 @@ class Spectrum(_SpecData):
                 finfo = None
             else:
                 n_free = sum(get_free_params(model).values())
-                sel = slice(count, count+n_free)
+                sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
-                    message =    fit_info.message,
-                    success =    fit_info.success,
-                    status =     fit_info.status,
-                    fun =        fit_info.fun,
-                    x =          fit_info.x[sel],
-                    cost =       fit_info.cost,
-                    jac =        fit_info.jac[sel,sel],
-                    grad =       fit_info.grad[sel],
-                    optimality = fit_info.optimality,
-                    nfev =       fit_info.nfev,
-                    njev =       fit_info.njev,
-                    param_cov =  fit_info.param_cov[sel,sel]
+                    message=fit_info.message,
+                    success=fit_info.success,
+                    status=fit_info.status,
+                    fun=fit_info.fun,
+                    x=fit_info.x[sel],
+                    cost=fit_info.cost,
+                    jac=fit_info.jac[sel, sel],
+                    grad=fit_info.grad[sel],
+                    optimality=fit_info.optimality,
+                    nfev=fit_info.nfev,
+                    njev=fit_info.njev,
+                    param_cov=fit_info.param_cov[sel, sel],
                 )
                 count += n_free
 
             windows = self[key]
             windows.adoptFit.__wrapped__(
-                windows, 
-                model, 
+                windows,
+                model,
                 fit_info=finfo,
                 update_emission=update_emission,
             )
-    
+
     @validate_call
     def applyFit(
         self,
@@ -1246,7 +1259,7 @@ class Spectrum(_SpecData):
     ) -> None:
         count = 0
         parts = get_model_parts(fit)
-        for key in ('pl', 'fe', 'ba', 'hg', 'em'):
+        for key in ("pl", "fe", "ba", "hg", "em"):
             model = parts[key]
             if model is None:
                 continue
@@ -1255,75 +1268,75 @@ class Spectrum(_SpecData):
                 finfo = None
             else:
                 n_free = sum(get_free_params(model).values())
-                sel = slice(count, count+n_free)
+                sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
-                    message =    fit_info.message,
-                    success =    fit_info.success,
-                    status =     fit_info.status,
-                    fun =        fit_info.fun,
-                    x =          fit_info.x[sel],
-                    cost =       fit_info.cost,
-                    jac =        fit_info.jac[sel,sel],
-                    grad =       fit_info.grad[sel],
-                    optimality = fit_info.optimality,
-                    nfev =       fit_info.nfev,
-                    njev =       fit_info.njev,
-                    param_cov =  fit_info.param_cov[sel,sel]
+                    message=fit_info.message,
+                    success=fit_info.success,
+                    status=fit_info.status,
+                    fun=fit_info.fun,
+                    x=fit_info.x[sel],
+                    cost=fit_info.cost,
+                    jac=fit_info.jac[sel, sel],
+                    grad=fit_info.grad[sel],
+                    optimality=fit_info.optimality,
+                    nfev=fit_info.nfev,
+                    njev=fit_info.njev,
+                    param_cov=fit_info.param_cov[sel, sel],
                 )
                 count += n_free
 
             windows = self[key]
             windows.applyFit.__wrapped__(
-                windows, 
-                model, 
+                windows,
+                model,
                 fit_info=finfo,
                 update_emission=update_emission,
             )
-    
+
     def summariseContinuumFit(self) -> ContinuumFitResult:
         try:
             return self.continuum_windows.summariseContinuumFit()
         except Exception as _:
             return None
-    
-    @validated_apply_info_to_method(subjects=('error', 'nonlinear'))
+
+    @validated_apply_info_to_method(subjects=("error", "nonlinear"))
     def instantiateBootstrapper(
         self,
         *,
         covered: bool = True,
-        data_types: DataTypes = DataTypes({'all'}),
-        model_types: ModelTypes = ModelTypes({'all'}),
-
+        data_types: DataTypes | None = None,
+        model_types: ModelTypes | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-
         pool: Pool_ | None = None,
-
         scale: Scale | None = None,
         variant: Variant | None = None,
         bootstrap_type: BootstrapType | None = None,
         n_sigmas: float | None = None,
         vary_lines: VaryLines | None = None,
-
         iterations: int | None = None,
         random_state: RandomState_ | None = None,
         renew_rng: bool | None = None,
         replace_missing: bool | None = None,
         tqdm_disable: bool | None = None,
         tqdm_leave: bool | None = None,
-
-        fitter: FitterInstance | None = None,
+        fitter_kwargs: FitterKwargs | None = None,
     ) -> BaseBootstrapper:
         """
         ** PYDANTIC VALIDATED METHOD **
         """
-        if scale == 'semilocal' or scale == 'local':
+        if data_types is None:
+            data_types = DataTypes({"all"})
+        if model_types is None:
+            model_types = ModelTypes({"all"})
+
+        if scale == "semilocal" or scale == "local":
             if self.em is None:
                 msg = f"Cannot perform bootstrapping on '{scale}' scale \
                     without emission line windows!"
                 logger.warning(msg)
                 raise ValueError(msg)
-            
+
             for lwindow in self.line_windows:
                 lwindow.instantiateBootstrapper.__wrapped__(
                     lwindow,
@@ -1338,14 +1351,14 @@ class Spectrum(_SpecData):
                     bootstrap_type=bootstrap_type,
                     n_sigmas=n_sigmas,
                     vary_lines=vary_lines,
-                    cfit=self['pl'].summariseContinuumFit(),
+                    cfit=self["pl"].summariseContinuumFit(),
                     iterations=iterations,
                     random_state=random_state,
                     renew_rng=renew_rng,
                     replace_missing=replace_missing,
                     tqdm_disable=tqdm_disable,
                     tqdm_leave=tqdm_leave,
-                    fitter=fitter,
+                    fitter_kwargs=fitter_kwargs,
                     logger=logger,
                 )
 
@@ -1354,7 +1367,7 @@ class Spectrum(_SpecData):
 
         cls, args, kwargs = format_bootstrapping_kwargs_for_spectrum(
             self,
-            fitter,
+            fitter_kwargs=fitter_kwargs,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -1376,12 +1389,14 @@ class Spectrum(_SpecData):
         self.bootstrapper = cls(*args, **kwargs)
         return self.bootstrapper
 
-    @validated_apply_info_to_method(subjects=('error',), specific_kwargs={'scale'})
+    @validated_apply_info_to_method(
+        subjects=("error",), specific_kwargs={"scale"}
+    )
     def runBootstrapper(self, *, scale: Scale | None = None) -> ErrorResult:
         """
         ** PYDANTIC VALIDATED METHOD // INFO APPLIED TO METHOD **
         """
-        if scale == 'semilocal' or scale == 'local':
+        if scale == "semilocal" or scale == "local":
             pass
 
         if self.bootstrapper is None:
@@ -1395,8 +1410,8 @@ class Spectrum(_SpecData):
         out = self.bootstrapper.run()
         self.error_result = self.bootstrapper.toErrorResult(out)
         return self.error_result
-    
-    @validated_apply_info_to_method(subjects=('error',))
+
+    @validated_apply_info_to_method(subjects=("error",))
     def analyseBootstrapSamples(
         self,
         directory: AbsoluteDirPath | None = None,
@@ -1420,19 +1435,16 @@ class Spectrum(_SpecData):
         """
         raise NotImplementedError
 
-    @validated_apply_info_to_method(subjects=('error',))
+    @validated_apply_info_to_method(subjects=("error",))
     def instantiateNestedSampler(
         self,
         *,
         covered: bool = True,
-        data_types: DataTypes = DataTypes({'all'}),
-        model_types: ModelTypes = ModelTypes({'all'}),
-
+        data_types: DataTypes | None = None,
+        model_types: ModelTypes | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-
         pool: Pool_ | None = None,
-
         iterations: int | None = None,
         random_state: RandomState_ | None = None,
         renew_rng: bool | None = None,
@@ -1443,6 +1455,11 @@ class Spectrum(_SpecData):
         """
         ...
         """
+        if data_types is None:
+            data_types = DataTypes({"all"})
+        if model_types is None:
+            model_types = ModelTypes({"all"})
+
         self.nested_sampler = UniformNestedSampler.from_spectrum(
             spectrum=self,
             covered=covered,
@@ -1463,24 +1480,27 @@ class Spectrum(_SpecData):
         return self.nested_sampler
 
     def runNestedSampler(
-        self, 
-        *, 
+        self,
+        *,
         maxiter: int,
         dlogz: float | None = None,
         print_progress: bool = True,
-        scale: Scale | None = None) -> ErrorResult:
+        scale: Scale | None = None,
+    ) -> ErrorResult:
         """
         ...
         """
-        if scale == 'semilocal' or scale == 'local':
+        if scale == "semilocal" or scale == "local":
             pass
 
         if self.nested_sampler is None:
-            msg = "No nested sampler instance found! "\
+            msg = (
+                "No nested sampler instance found! "
                 "Run 'instantiateNestedSampler()' method first."
+            )
             logger.critical(msg)
             raise AttributeError(msg)
-        
+
         if self.error_result is not None:
             logger.debug("Existing 'error_result' will be overwritten.")
 
@@ -1505,13 +1525,13 @@ class Spectrum(_SpecData):
         ylabel: str | None = None,
         xlim: tuple[float, float] | None = None,
         ylim: tuple[float, float] | None = None,
-        pl_color: str | None = DEFAULT_COLORS['pl'],
-        fe_color: str | None = DEFAULT_COLORS['fe'],
-        ba_color: str | None = DEFAULT_COLORS['ba'],
-        hg_color: str | None = DEFAULT_COLORS['hg'],
-        em_color: str | None = DEFAULT_COLORS['em'],
-        sm_color: str | None = DEFAULT_COLORS['sm'],
-        ab_color: str | None = DEFAULT_COLORS['ab'],
+        pl_color: str | None = DEFAULT_COLORS["pl"],
+        fe_color: str | None = DEFAULT_COLORS["fe"],
+        ba_color: str | None = DEFAULT_COLORS["ba"],
+        hg_color: str | None = DEFAULT_COLORS["hg"],
+        em_color: str | None = DEFAULT_COLORS["em"],
+        sm_color: str | None = DEFAULT_COLORS["sm"],
+        ab_color: str | None = DEFAULT_COLORS["ab"],
         xticks: tuple[float, float] | None = None,
         yticks: tuple[float, float] | None = None,
         logx: bool = False,
@@ -1534,10 +1554,10 @@ class Spectrum(_SpecData):
             dpi=dpi,
             title=title or self.title,
             n_sigma=n_sigma,
-            xlabel=xlabel or 'auto',
-            ylabel=ylabel or 'auto',
+            xlabel=xlabel or "auto",
+            ylabel=ylabel or "auto",
             xlim=xlim,
-            ylim=ylim or 'auto',
+            ylim=ylim or "auto",
             pl_color=pl_color,
             fe_color=fe_color,
             ba_color=ba_color,
@@ -1545,8 +1565,8 @@ class Spectrum(_SpecData):
             em_color=em_color,
             sm_color=sm_color,
             ab_color=ab_color,
-            xticks=xticks or 'auto',
-            yticks=yticks or 'auto',
+            xticks=xticks or "auto",
+            yticks=yticks or "auto",
             logx=logx,
             logy=logy,
         )
@@ -1568,13 +1588,13 @@ class Spectrum(_SpecData):
         ylim: tuple[float, float] | None = None,
         zlim: tuple[float, float] | None = (-5, 5),
         plim: tuple[float, float] | None = (-5, 0),
-        pl_color: str | None = DEFAULT_COLORS['pl'],
-        fe_color: str | None = DEFAULT_COLORS['fe'],
-        ba_color: str | None = DEFAULT_COLORS['ba'],
-        hg_color: str | None = DEFAULT_COLORS['hg'],
-        em_color: str | None = DEFAULT_COLORS['em'],
-        sm_color: str | None = DEFAULT_COLORS['sm'],
-        ab_color: str | None = DEFAULT_COLORS['ab'],
+        pl_color: str | None = DEFAULT_COLORS["pl"],
+        fe_color: str | None = DEFAULT_COLORS["fe"],
+        ba_color: str | None = DEFAULT_COLORS["ba"],
+        hg_color: str | None = DEFAULT_COLORS["hg"],
+        em_color: str | None = DEFAULT_COLORS["em"],
+        sm_color: str | None = DEFAULT_COLORS["sm"],
+        ab_color: str | None = DEFAULT_COLORS["ab"],
         xticks: tuple[float, float] | None = None,
         yticks: tuple[float, float] | None = None,
         zticks: tuple[float, float] | None = None,
@@ -1595,14 +1615,14 @@ class Spectrum(_SpecData):
             n_sigma=n_sigma,
             z_crit=self.info.absorption.z_crit,
             p_crit=self.info.absorption.p_crit,
-            xlabel=xlabel or 'auto',
-            ylabel=ylabel or 'auto',
-            zlabel=zlabel or 'auto',
-            plabel=plabel or 'auto',
-            xlim=xlim or 'auto',
-            ylim=ylim or 'auto',
-            zlim=zlim or 'auto',
-            plim=plim or 'auto',
+            xlabel=xlabel or "auto",
+            ylabel=ylabel or "auto",
+            zlabel=zlabel or "auto",
+            plabel=plabel or "auto",
+            xlim=xlim or "auto",
+            ylim=ylim or "auto",
+            zlim=zlim or "auto",
+            plim=plim or "auto",
             pl_color=pl_color,
             fe_color=fe_color,
             ba_color=ba_color,
@@ -1610,10 +1630,10 @@ class Spectrum(_SpecData):
             em_color=em_color,
             sm_color=sm_color,
             ab_color=ab_color,
-            xticks=xticks or 'auto',
-            yticks=yticks or 'auto',
-            zticks=zticks or 'auto',
-            pticks=pticks or 'auto',
+            xticks=xticks or "auto",
+            yticks=yticks or "auto",
+            zticks=zticks or "auto",
+            pticks=pticks or "auto",
             logx=logx,
             logy=logy,
             logp=logp,
@@ -1623,7 +1643,7 @@ class Spectrum(_SpecData):
         self,
         *,
         plot_components: bool = False,
-        plot_type: Literal['difference', 'residual'] = 'difference',
+        plot_type: Literal["difference", "residual"] = "difference",
         figure: tuple[Figure, list[Axes, Axes]] | None = None,
         figsize: tuple[float, float] = (8, 6),
         dpi: int = 300,
@@ -1638,57 +1658,57 @@ class Spectrum(_SpecData):
         ylim: tuple[float, float] | None = None,
         dlim: tuple[float, float] | None = None,
         zlim: tuple[float, float] | None = (-5, 5),
-        pl_color: str | None = DEFAULT_COLORS['pl'],
-        fe_color: str | None = DEFAULT_COLORS['fe'],
-        ba_color: str | None = DEFAULT_COLORS['ba'],
-        hg_color: str | None = DEFAULT_COLORS['hg'],
-        em_color: str | None = DEFAULT_COLORS['em'],
-        sm_color: str | None = DEFAULT_COLORS['sm'],
-        ab_color: str | None = DEFAULT_COLORS['ab'],
+        pl_color: str | None = DEFAULT_COLORS["pl"],
+        fe_color: str | None = DEFAULT_COLORS["fe"],
+        ba_color: str | None = DEFAULT_COLORS["ba"],
+        hg_color: str | None = DEFAULT_COLORS["hg"],
+        em_color: str | None = DEFAULT_COLORS["em"],
+        sm_color: str | None = DEFAULT_COLORS["sm"],
+        ab_color: str | None = DEFAULT_COLORS["ab"],
         xticks: tuple[float, float] | None = None,
         yticks: tuple[float, float] | None = None,
         dticks: tuple[float, float] | None = None,
         zticks: tuple[float, float] | None = None,
         logx: bool = False,
         logy: bool = False,
-        cmap_name: str = 'tab20',
+        cmap_name: str = "tab20",
         distinguish_narrow: bool = True,
     ) -> tuple[Figure, list[Axes, Axes]]:
         xlim = xlim or self.x_bounds
         coords = get_coords(self, x_bounds=xlim, replace_with_nan=False)
 
-        kwargs = dict(
-            plot_type=plot_type,
-            figure=figure,
-            figsize=figsize,
-            dpi=dpi,
-            title=title or self.title,
-            height_ratio=height_ratio,
-            n_sigma=n_sigma,
-            xlabel=xlabel or 'auto',
-            ylabel=ylabel or 'auto',
-            dlabel=dlabel or 'auto',
-            zlabel=zlabel or 'auto',
-            xlim=xlim or 'auto',
-            ylim=ylim or 'auto',
-            dlim=dlim or 'auto',
-            zlim=zlim or 'auto',
-            pl_color=pl_color,
-            fe_color=fe_color,
-            ba_color=ba_color,
-            hg_color=hg_color,
-            em_color=em_color,
-            sm_color=sm_color,
-            ab_color=ab_color,
-            xticks=xticks or 'auto',
-            yticks=yticks or 'auto',
-            dticks=dticks or 'auto',
-            zticks=zticks or 'auto',
-            logx=logx,
-            logy=logy,
-            cmap_name=cmap_name,
-            distinguish_narrow=distinguish_narrow,
-        )
+        kwargs = {
+            'plot_type': plot_type,
+            'figure': figure,
+            'figsize': figsize,
+            'dpi': dpi,
+            'title': title or self.title,
+            'height_ratio': height_ratio,
+            'n_sigma': n_sigma,
+            'xlabel': xlabel or "auto",
+            'ylabel': ylabel or "auto",
+            'dlabel': dlabel or "auto",
+            'zlabel': zlabel or "auto",
+            'xlim': xlim or "auto",
+            'ylim': ylim or "auto",
+            'dlim': dlim or "auto",
+            'zlim': zlim or "auto",
+            'pl_color': pl_color,
+            'fe_color': fe_color,
+            'ba_color': ba_color,
+            'hg_color': hg_color,
+            'em_color': em_color,
+            'sm_color': sm_color,
+            'ab_color': ab_color,
+            'xticks': xticks or "auto",
+            'yticks': yticks or "auto",
+            'dticks': dticks or "auto",
+            'zticks': zticks or "auto",
+            'logx': logx,
+            'logy': logy,
+            'cmap_name': cmap_name,
+            'distinguish_narrow': distinguish_narrow,
+        }
         model = self.getModel() if plot_components else None
         if plot_components:
             with PrepareModel(x=coords.x, model=model):

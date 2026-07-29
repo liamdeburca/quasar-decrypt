@@ -1,19 +1,18 @@
-from logging import getLogger
-from typing import Self, ClassVar, Optional
 from dataclasses import dataclass, field
+from logging import getLogger
+from typing import ClassVar, Optional, Self
+
 from numpy import dot
+from quasar_models.continuum import PowerLawModel
+from quasar_typing.astropy import FitInfo
+from quasar_typing.misc import BackgroundFlux, Suffix
+from quasar_typing.numpy import FloatVector
+from quasar_utils.decorators import validate_call
 
 from quasar_decrypt.utils.specdata import SpecData
 
-from quasar_utils.decorators import validate_call
-
-from quasar_typing.numpy import FloatVector
-from quasar_typing.astropy import FitInfo
-from quasar_typing.misc import BackgroundFlux, Suffix
-
-from quasar_models.continuum import PowerLawModel
-
 logger = getLogger(__name__)
+
 
 @dataclass(init=False)
 class CWindow(SpecData):
@@ -22,7 +21,7 @@ class CWindow(SpecData):
     fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
     fit_sc: Optional[PowerLawModel] = field(default=None, init=False)
 
-    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({'all', 'pl'})
+    default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "pl"})
 
     @validate_call
     def getResiduals(
@@ -31,7 +30,7 @@ class CWindow(SpecData):
         log: bool = False,
         *,
         covered: bool = True,
-        without_rejections: bool = False, 
+        without_rejections: bool = False,
         without_absorption: bool = False,
         valid: bool = True,
         log_valid: bool | None = None,
@@ -48,7 +47,7 @@ class CWindow(SpecData):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            mode='r', # r: read only
+            mode="r",  # r: read only
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -64,7 +63,7 @@ class CWindow(SpecData):
         fit: PowerLawModel,
         *,
         covered: bool = True,
-        without_rejections: bool = False, 
+        without_rejections: bool = False,
         without_absorption: bool = False,
         bg_flux: BackgroundFlux | None = None,
     ) -> float:
@@ -76,7 +75,7 @@ class CWindow(SpecData):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            mode='r', # r: read only
+            mode="r",  # r: read only
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -88,10 +87,12 @@ class CWindow(SpecData):
         f = fit(masked_coords.x)
 
         snr = dot(f, masked_coords.dx) / X
-        snr /= (dot((masked_coords.y - f)**2, masked_coords.dx)**2 / X)**0.5
+        snr /= (
+            dot((masked_coords.y - f) ** 2, masked_coords.dx) ** 2 / X
+        ) ** 0.5
 
         return snr
-    
+
     @validate_call
     def applyFit(
         self,
@@ -106,9 +107,9 @@ class CWindow(SpecData):
         """
         self.fit_info = fit_info
 
-        if suffix == 'raw':
+        if suffix == "raw":
             self.fit_raw = fit
-        elif suffix == 'sc':
+        elif suffix == "sc":
             self.fit_sc = fit
         else:
             self.fit = fit

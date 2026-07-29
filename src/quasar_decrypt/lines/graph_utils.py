@@ -6,59 +6,51 @@ from pydantic_core.core_schema import no_info_plain_validator_function
 
 logger = getLogger(__name__)
 
+
 class Graph(dict[int, set[int]]):
     def __init__(self, n: int = 0):
-        super().__init__([
-            (i, set()) \
-            for i in range(n)
-        ])
+        super().__init__([(i, set()) for i in range(n)])
         self.is_circular: bool = False
 
     def __str__(self) -> str:
-        lines = [
-            f"{orig}: {str(dests)}"\
-            for (orig, dests) in self.items()
-        ]
+        lines = [f"{orig}: {dests!s}" for (orig, dests) in self.items()]
         lines.insert(0, f"Graph at {hex(id(self))}:")
 
-        return '\n'.join(lines)
-    
+        return "\n".join(lines)
+
     @classmethod
     def _validate(cls, value: object) -> Self:
         if not isinstance(value, cls):
-            msg = "Expected a '{}' instance, got {} instead.".format(
-                cls.__name__,
-                type(value).__name__,
-            )
-            raise PydanticCustomError('validation_error', msg)
+            msg = f"Expected a '{cls.__name__}' instance, got {type(value).__name__} instead."
+            raise PydanticCustomError("validation_error", msg)
         return value
-    
+
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type, handler):
         return no_info_plain_validator_function(cls._validate)
-    
+
     def copy(self) -> Self:
         g = Graph()
         g.update(self)
         return g
-    
+
     def expand(self, inplace: bool = True) -> Self:
         """
-        This method expands all sets such that all downstream nodes are 
+        This method expands all sets such that all downstream nodes are
         shown.
         """
         new_graph = self if inplace else self.copy()
 
-        check: bool = (len(self) > 1)
+        check: bool = len(self) > 1
         for orig, dests in sorted(
             new_graph.items(),
-            key = lambda item: len(item[1]),
+            key=lambda item: len(item[1]),
         ):
             if check and (len(dests) > 0):
                 self.is_circular = True
                 logger.warning("'Graph' is circular!")
                 return new_graph
-            
+
             new_dests = dests.copy()
             for dest in dests:
                 new_dests = new_dests.union(new_graph[dest])
@@ -81,21 +73,17 @@ class Graph(dict[int, set[int]]):
             self.is_circular = True
             logger.warning("'Graph' is circular!")
             return None, self
-        
-        root = sorted(possible_roots)[0]
+
+        root = min(possible_roots)
         graph = Graph()
-        graph.update(dict([
-            item \
-            for item in self.items() \
-            if item[0] != root
-        ]))
+        graph.update(dict([item for item in self.items() if item[0] != root]))
 
         return root, graph
-    
+
     def createChain(self) -> list[int]:
         if self.is_circular:
             return list(range(len(self)))
-        
+
         chain: list[int] = []
         graph = self
         while True:

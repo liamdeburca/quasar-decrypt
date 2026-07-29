@@ -27,3 +27,9 @@ Repository = "https://github.com/liamdeburca/quasar-decrypt.git"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 79
+
+[lint.pyupgrade]
+keep-runtime-typing = true
