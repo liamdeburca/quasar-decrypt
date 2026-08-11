@@ -7,7 +7,7 @@ __all__ = [
 from collections.abc import Callable
 from dataclasses import field
 from functools import wraps
-from typing import TypeVar
+from typing import Self, TypeVar
 
 from numpy import float64, log, zeros
 from pydantic.dataclasses import dataclass
@@ -50,6 +50,33 @@ class MaskedCoords:
 
     def __tuple__(self) -> CoordsTuple:
         return CoordsTuple(self.x, self.y, self.dy)
+
+    def copy(self) -> Self:
+        return self.__class__(
+            self.spec,
+            self.mask.copy(),
+            bg_flux=self.bg_flux,
+        )
+
+    def updateMask(
+        self, 
+        new_mask: BoolVector,
+        inplace: bool = False,
+    ) -> Self | None:
+        obj = self if inplace else self.copy()
+        obj.mask = new_mask
+        return None if inplace else obj
+
+    def ensureLogValid(
+        self,
+        inplace: bool = False,
+    ) -> Self:
+        """
+        Updates the 'mask' attribute to ensure that all y-values are positive.
+        """
+        new_mask = self.mask.copy()
+        new_mask[self.mask] &= (self.y > 0)
+        return self.updateMask(new_mask, inplace=inplace)
 
     @classmethod
     def _format(cls, arr: A) -> A:

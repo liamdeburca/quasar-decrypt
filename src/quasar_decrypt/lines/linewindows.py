@@ -572,32 +572,30 @@ class LineWindows(SpecList[LWindow]):
             if not fs:
                 continue
 
-            local_fit = sum(fs[1:], start=fs[0])
-            if fit_info is not None:
-                n_free = sum(get_free_params.__wrapped__(local_fit).values())
+            model = sum(fs[1:], start=fs[0])
+            if fit_info is None:
+                finfo = None
+            else:
+                n_free = sum(get_free_params(model).values())
                 sel = slice(count, count + n_free)
-                local_fit_info = OptimizeResult(
-                    message=fit_info.message,
+                finfo = OptimizeResult(
+                    x=fit_info.x[sel],
                     success=fit_info.success,
+                    message=fit_info.message,
                     status=fit_info.status,
                     fun=fit_info.fun,
-                    x=fit_info.x[sel],
-                    cost=fit_info.cost,
                     jac=fit_info.jac[sel, sel],
-                    grad=fit_info.grad[sel],
-                    optimality=fit_info.optimality,
                     nfev=fit_info.nfev,
                     njev=fit_info.njev,
-                    param_cov=fit_info.param_cov[sel, sel],
+                    nit=fit_info.get("nit", 0),
+                    maxcv=fit_info.get("maxcv", 0),
                 )
                 count += n_free
-            else:
-                local_fit_info = None
 
             lwindow.adoptFit.__wrapped__(
                 lwindow,
-                local_fit,
-                fit_info=local_fit_info,
+                model,
+                fit_info=finfo,
                 update_emission=update_emission,
             )
 
@@ -636,32 +634,30 @@ class LineWindows(SpecList[LWindow]):
             if not fs:
                 continue
 
-            local_fit = sum(fs[1:], start=fs[0])
-            if fit_info is not None:
-                n_free = sum(get_free_params.__wrapped__(local_fit).values())
+            model = sum(fs[1:], start=fs[0])
+            if fit_info is None:
+                finfo = None
+            else:
+                n_free = sum(get_free_params(model).values())
                 sel = slice(count, count + n_free)
-                local_fit_info = OptimizeResult(
-                    message=fit_info.message,
+                finfo = OptimizeResult(
+                    x=fit_info.x[sel],
                     success=fit_info.success,
+                    message=fit_info.message,
                     status=fit_info.status,
                     fun=fit_info.fun,
-                    x=fit_info.x[sel],
-                    cost=fit_info.cost,
                     jac=fit_info.jac[sel, sel],
-                    grad=fit_info.grad[sel],
-                    optimality=fit_info.optimality,
                     nfev=fit_info.nfev,
                     njev=fit_info.njev,
-                    param_cov=fit_info.param_cov[sel, sel],
+                    nit=fit_info.get("nit", 0),
+                    maxcv=fit_info.get("maxcv", 0),
                 )
                 count += n_free
-            else:
-                local_fit_info = None
 
             lwindow.applyFit.__wrapped__(
                 lwindow,
-                local_fit,
-                fit_info=local_fit_info,
+                model,
+                fit_info=finfo,
                 freeze=freeze,
                 update_emission=update_emission,
             )

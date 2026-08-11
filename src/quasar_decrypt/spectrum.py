@@ -380,52 +380,59 @@ class Spectrum(_SpecData):
 
         self._valid_pixels = invert(mask)
 
-    def _truncate_range(self, sel: slice) -> None:
+    def _truncate_range(self, sel: slice) -> Self:
+        """
+        Creates a new 'Spectrum' instance with the same, but truncated, data 
+        arrays.
+        """
         if sel.step not in (None, 1):
             raise ValueError("Only contiguous truncation is supported.")
 
         def f(arr):
             return arr[sel]
 
-        for key, value in (
-            super()
-            .get_kwargs.__wrapped__(
-                self.__class__,
-                x=f(self._x),
-                y=f(self._y),
-                dy=f(self._dy),
-                dx=f(self._dx),
-                x_bounds=None,
-                info=self.info,
-                y_smooth=f(self._y_smooth),
-                y_pl=f(self._y_pl),
-                y_fe=f(self._y_fe),
-                y_ba=f(self._y_ba),
-                y_hg=f(self._y_hg),
-                y_em=f(self._y_em),
-                rejected_pixels=f(self._rejected_pixels),
-                absorbed_pixels=f(self._absorbed_pixels),
-                valid_pixels=f(self._valid_pixels),
-                log_valid_pixels=f(self._log_valid_pixels),
-                p_absorbed=f(self._p_absorbed),
-                x0=self.x0,
-                y0=self.y0,
-                x_log=f(self._x_log),
-                y_log=f(self._y_log),
-                dy_log=f(self._dy_log),
-                get_mask=None,
-            )
-            .items()
-        ):
-            setattr(self, key, value)
+        kwargs = self.get_kwargs.__wrapped__(
+            self.__class__,
+            path=self.path,
+            title=self.title,
+            x=f(self._x),
+            y=f(self._y),
+            dy=f(self._dy),
+            dx=f(self._dx),
+            y_smooth=f(self._y_smooth),
+            y_pl=f(self._y_pl),
+            y_fe=f(self._y_fe),
+            y_ba=f(self._y_ba),
+            y_hg=f(self._y_hg),
+            y_em=f(self._y_em),
+            rejected_pixels=f(self._rejected_pixels),
+            absorbed_pixels=f(self._absorbed_pixels),
+            valid_pixels=f(self._valid_pixels),
+            log_valid_pixels=f(self._log_valid_pixels),
+            p_absorbed=f(self._p_absorbed),
+            x0=self.x0,
+            y0=self.y0,
+            x_log=f(self._x_log),
+            y_log=f(self._y_log),
+            dy_log=f(self._dy_log),
+            info=self.info,
+            x_bounds=None,
+            get_mask=None,
+        )
+        return self.__class__(**kwargs)
 
-    def truncateSpectrum(self) -> None:
+    def truncateSpectrum(self) -> Self:
         """
         Truncates the spectrum if edges contain NaN values.
+
+        Returns the same 'Spectrum' instance if no truncation is necessary, 
+        otherwise returns a new 'Spectrum' instance with the same, but 
+        truncated, data arrays (see: `_truncate_range`).
         """
         mask = self._valid_pixels
-
         n_valid = self._valid_pixels.sum()
+
+        out = self
         if n_valid == 0:
             logger.warning("All pixels are invalid! Cannot truncate spectrum.")
         elif n_valid == 1:
@@ -443,8 +450,7 @@ class Spectrum(_SpecData):
             n_red = n - 1 - idx_end
             n_tot = n_blue + n_red
 
-            self._truncate_range(sel)
-
+            out = self._truncate_range(sel)
             logger.debug(
                 "Cutting %d/%d pixel(s): %d/%d (blue edge), %d/%d (red edge)",
                 n_tot,
@@ -455,17 +461,27 @@ class Spectrum(_SpecData):
                 n,
             )
 
+        return out
+
     @validated_apply_info_to_method(subjects=("lines",))
     def cropLymanAlphaForest(
         self,
         *,
         x_limit: float | None = None,
-    ) -> None:
+    ) -> Self:
         logger.debug(f"Cropping Lyman-alpha forest: {self}")
 
         indices = argwhere(self._x < x_limit).flatten()
-        if (len(indices) != 0) and ((edge_idx := indices[-1]) >= 1):
-            _y = self._y[: edge_idx + 1]
+        if indices.size and ((edge_idx := indices[-1]) >= 1):
+            _y = self._y[:edge_idx+1]
+
+            if not isfinite(_y).any():
+                logger.warning(
+                    "No finite pixels found blue-wards of `x_limit`: "
+                    "Cancelling Lyman-alpha forest cropping."
+                )
+                return self
+
             idx_max = nanargmax(_y).flatten()[0]
 
             x_max = self._x[idx_max]
@@ -475,11 +491,12 @@ class Spectrum(_SpecData):
             logger.debug(msg)
 
             self._valid_pixels[:idx_max] = False
-            self.truncateSpectrum()
+            out = self.truncateSpectrum()
 
             logger.debug(f">>> Cropping {idx_max} pixel(s).")
 
-        logger.debug(f"Cropped Lyman-alpha forest: {self}")
+        logger.debug(f"Cropped Lyman-alpha forest and created: {out}")
+        return out
 
     @validated_apply_info_to_method(subjects=("absorption",))
     def smoothSpectrum(
@@ -493,7 +510,7 @@ class Spectrum(_SpecData):
         ** PYDANTIC VALIDATED AND INFO-APPLIED METHOD **
         """
         self._y_smooth[:] = smooth_spectrum.__wrapped__(
-            *self._coords,
+            self._x, self._y, self._dy,
             self._valid_pixels,
             w,
             p,
@@ -525,7 +542,7 @@ class Spectrum(_SpecData):
             )
 
         result = remove_absorption.__wrapped__(
-            *self._coords,
+            self._x, self._y, self._dy,
             self._y_smooth,
             sum(getattr(self, f"_y_{bg}") for bg in bg_flux),
             self._valid_pixels,
@@ -700,6 +717,7 @@ class Spectrum(_SpecData):
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
+        min_fittable_total: int | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         """
@@ -741,6 +759,7 @@ class Spectrum(_SpecData):
             sigmas=sigmas,
             flux_bounds=flux_bounds,
             alpha_bounds=alpha_bounds,
+            min_fittable_total=min_fittable_total,
             fitter_kwargs=fitter_kwargs,
         )
 
@@ -1178,11 +1197,16 @@ class Spectrum(_SpecData):
         )
         match mode:
             case "r":
-                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
+                out = ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
             case "c":
-                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
+                out = ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
             case None:
-                return MaskedCoords(self, mask, bg_flux=bg_flux)
+                out = MaskedCoords(self, mask, bg_flux=bg_flux)
+
+        if log_valid:
+            out.ensureLogValid(inplace=True)
+
+        return out
 
     @validate_call
     def getModel(
@@ -1226,18 +1250,16 @@ class Spectrum(_SpecData):
                 n_free = sum(get_free_params(model).values())
                 sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
-                    message=fit_info.message,
+                    x=fit_info.x[sel],
                     success=fit_info.success,
+                    message=fit_info.message,
                     status=fit_info.status,
                     fun=fit_info.fun,
-                    x=fit_info.x[sel],
-                    cost=fit_info.cost,
                     jac=fit_info.jac[sel, sel],
-                    grad=fit_info.grad[sel],
-                    optimality=fit_info.optimality,
                     nfev=fit_info.nfev,
                     njev=fit_info.njev,
-                    param_cov=fit_info.param_cov[sel, sel],
+                    nit=fit_info.get("nit", 0),
+                    maxcv=fit_info.get("maxcv", 0),
                 )
                 count += n_free
 
@@ -1270,18 +1292,16 @@ class Spectrum(_SpecData):
                 n_free = sum(get_free_params(model).values())
                 sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
-                    message=fit_info.message,
+                    x=fit_info.x[sel],
                     success=fit_info.success,
+                    message=fit_info.message,
                     status=fit_info.status,
                     fun=fit_info.fun,
-                    x=fit_info.x[sel],
-                    cost=fit_info.cost,
                     jac=fit_info.jac[sel, sel],
-                    grad=fit_info.grad[sel],
-                    optimality=fit_info.optimality,
                     nfev=fit_info.nfev,
                     njev=fit_info.njev,
-                    param_cov=fit_info.param_cov[sel, sel],
+                    nit=fit_info.get("nit", 0),
+                    maxcv=fit_info.get("maxcv", 0),
                 )
                 count += n_free
 

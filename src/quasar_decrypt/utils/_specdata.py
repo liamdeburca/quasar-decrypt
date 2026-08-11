@@ -3,7 +3,7 @@ __all__ = ["_SpecData"]
 from collections.abc import Callable
 from dataclasses import field
 from logging import getLogger
-from typing import Literal, Optional, Self, Union
+from typing import Any, Literal, Optional, Self, Union
 
 from numpy import (
     ascontiguousarray,
@@ -36,8 +36,7 @@ from .masked_coords import (
 )
 from .utils import create_cached_get_mask, get_log
 
-logger = getLogger(__name__)
-
+logger = getLogger(__name__)        
 
 @dataclass
 class _SpecData:
@@ -161,56 +160,65 @@ class _SpecData:
         info: Info = None,
         x_bounds: CoordBounds | None = None,
         get_mask: Callable[[float, float], BoolVector] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
+        """
+        Creates the keyword arguments for instantiating a _SpecData object. 
+
+        Notes
+        -----
+        This method ensures that all output arrays are C-contiguous and of the 
+        correct data type, and it therefore creates copies of the input arrays.
+        """
         kwargs = {
-            "_x": x,
-            "_y": y,
-            "_dy": dy,
+            "_x": ascontiguousarray(x, dtype=float64),
+            "_y": ascontiguousarray(y, dtype=float64),
+            "_dy": ascontiguousarray(dy, dtype=float64),
         }
-        kwargs["_dx"] = ascontiguousarray(
-            x * info.loading.sigma_res if dx is None else dx
+
+        kwargs['_dx'] = ascontiguousarray(
+            x * info.loading.sigma_res if dx is None else dx,
+            dtype=float64,
+        )
+        kwargs['_y_smooth'] = ascontiguousarray(
+            y if y_smooth is None else y_smooth,
+            dtype=float64,
         )
 
-        kwargs["_y_smooth"] = (
-            kwargs["_y"].copy(order="C")
-            if y_smooth is None
-            else ascontiguousarray(y_smooth)
-        )
         kwargs["_y_pl"] = (
             zeros_like(kwargs["_x"], dtype=float64, order="C")
             if y_pl is None
-            else ascontiguousarray(y_pl)
+            else ascontiguousarray(y_pl, dtype=float64)
         )
         kwargs["_y_fe"] = (
             zeros_like(kwargs["_x"], dtype=float64, order="C")
             if y_fe is None
-            else ascontiguousarray(y_fe)
+            else ascontiguousarray(y_fe, dtype=float64)
         )
         kwargs["_y_ba"] = (
             zeros_like(kwargs["_x"], dtype=float64, order="C")
             if y_ba is None
-            else ascontiguousarray(y_ba)
+            else ascontiguousarray(y_ba, dtype=float64)
         )
         kwargs["_y_hg"] = (
             zeros_like(kwargs["_x"], dtype=float64, order="C")
             if y_hg is None
-            else ascontiguousarray(y_hg)
+            else ascontiguousarray(y_hg, dtype=float64)
         )
         kwargs["_y_em"] = (
             zeros_like(kwargs["_x"], dtype=float64, order="C")
             if y_em is None
-            else ascontiguousarray(y_em)
+            else ascontiguousarray(y_em, dtype=float64)
         )
 
         kwargs["_rejected_pixels"] = (
             zeros_like(kwargs["_x"], dtype=bool_, order="C")
             if rejected_pixels is None
-            else ascontiguousarray(rejected_pixels)
+            else ascontiguousarray(rejected_pixels, dtype=bool_)
         )
         kwargs["_absorbed_pixels"] = (
             zeros_like(kwargs["_x"], dtype=bool_, order="C")
             if absorbed_pixels is None
-            else ascontiguousarray(absorbed_pixels)
+            else ascontiguousarray(absorbed_pixels, dtype=bool_)
         )
         kwargs["_valid_pixels"] = ascontiguousarray(
             isfinite(kwargs["_x"])
@@ -218,18 +226,20 @@ class _SpecData:
             & isfinite(kwargs["_dy"])
             & (kwargs["_dy"] > 0)
             if valid_pixels is None
-            else valid_pixels
+            else valid_pixels,
+            dtype=bool_,
         )
         kwargs["_log_valid_pixels"] = ascontiguousarray(
             kwargs["_valid_pixels"] & (kwargs["_y"] > 0)
             if log_valid_pixels is None
-            else ascontiguousarray(log_valid_pixels)
+            else log_valid_pixels,
+            dtype=bool_,
         )
 
         kwargs["_p_absorbed"] = (
             ones_like(kwargs["_x"], dtype=float64, order="C")
             if p_absorbed is None
-            else ascontiguousarray(p_absorbed)
+            else ascontiguousarray(p_absorbed, dtype=float64)
         )
 
         if x_bounds is None:
@@ -254,17 +264,20 @@ class _SpecData:
         kwargs["_x_log"] = ascontiguousarray(
             get_log(kwargs["_x"], kwargs["x0"], kwargs["_log_valid_pixels"])
             if x_log is None
-            else ascontiguousarray(x_log)
+            else x_log,
+            dtype=float64,
         )
         kwargs["_y_log"] = ascontiguousarray(
             get_log(kwargs["_y"], kwargs["y0"], kwargs["_log_valid_pixels"])
             if y_log is None
-            else ascontiguousarray(y_log)
+            else y_log,
+            dtype=float64,
         )
         kwargs["_dy_log"] = ascontiguousarray(
             get_log(kwargs["_dy"], kwargs["_y"], kwargs["_log_valid_pixels"])
             if dy_log is None
-            else ascontiguousarray(dy_log)
+            else dy_log,
+            dtype=float64,
         )
 
         kwargs["info"] = info
@@ -276,6 +289,55 @@ class _SpecData:
         )
 
         return kwargs
+
+    @classmethod
+    @validate_call
+    def get_kwargs_from_specdata(
+        self,
+        obj: object,
+        *,
+        x_bounds: CoordBounds | None = None,
+        info: Info | None = None,
+    ) -> dict[str, Any]:
+        """
+        Creates the keyword arguments for instantiating a _SpecData object from
+        another _SpecData object. 
+        
+        Notes
+        -----
+        This method assumes that the attributes are already C-contiguous and of 
+        the correct data type, therefore returning references to the original 
+        arrays instead of copies.
+
+        The only attributes that may be overridden are `x_bounds` (useful when 
+        creating spectral window objects) and `info` (rarely useful).
+        """
+        assert isinstance(obj, _SpecData)
+        return {
+            "_x": obj._x,
+            "_y": obj._y,
+            "_dy": obj._dy,
+            "_dx": obj._dx,
+            "_y_smooth": obj._y_smooth,
+            "_y_pl": obj._y_pl,
+            "_y_fe": obj._y_fe,
+            "_y_ba": obj._y_ba,
+            "_y_hg": obj._y_hg,
+            "_y_em": obj._y_em,
+            "_rejected_pixels": obj._rejected_pixels,
+            "_absorbed_pixels": obj._absorbed_pixels,
+            "_valid_pixels": obj._valid_pixels,
+            "_log_valid_pixels": obj._log_valid_pixels,
+            "_p_absorbed": obj._p_absorbed,
+            "x_bounds": x_bounds or obj.x_bounds,
+            "x0": obj.x0,
+            "y0": obj.y0,
+            "_x_log": obj._x_log,
+            "_y_log": obj._y_log,
+            "_dy_log": obj._dy_log,
+            "info": info or obj.info,
+            "get_mask": obj.get_mask,
+        }
 
     def __str__(self, simple: bool = False) -> str:
 
@@ -492,7 +554,7 @@ class _SpecData:
         r1 = self.n_rej
         if len(rejected_pixels) == len(self._x):
             if enforce:
-                self._rejected_pixels = rejected_pixels
+                self._rejected_pixels[:] = rejected_pixels
             else:
                 self._rejected_pixels |= rejected_pixels
 

@@ -23,8 +23,9 @@ from quasar_utils.decorators import (
 )
 from quasar_utils.setup import FitterKwargs
 
-from quasar_decrypt.host import HWindow
 from quasar_decrypt.utils.speclist import SpecList
+
+from .hwindow import HWindow
 
 logger = getLogger(__name__)
 
@@ -309,10 +310,7 @@ class HostWindows(SpecList[HWindow]):
         return self.models
 
     @validate_call
-    def chooseModel(
-        self,
-        name: str,
-    ) -> HostGalaxyModel:
+    def chooseModel(self, name: str) -> HostGalaxyModel:
         """
         Choose a HostGalaxyModel from the 'models' dict by name and set it as
         the current model.

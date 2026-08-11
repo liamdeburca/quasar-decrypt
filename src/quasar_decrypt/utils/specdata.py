@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging import getLogger
-from typing import Self
+from typing import Any, Self
 
 from quasar_typing.bounds import CoordBounds
 from quasar_typing.numpy import BoolVector, FloatVector
@@ -108,75 +108,56 @@ class SpecData(_SpecData):
         y_log: FloatVector | None = None,
         dy_log: FloatVector | None = None,
         x_bounds: CoordBounds | None = None,
-        info: Info = None,
+        info: Info | None = None,
         get_mask: Callable[[float, float], BoolVector] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         kwargs = {}
-        if spectrum is not None:
-            kwargs["spectrum"] = spectrum
-            kwargs.update(
-                super().get_kwargs.__wrapped__(
-                    cls,
-                    x=spectrum._x,
-                    y=spectrum._y,
-                    dy=spectrum._dy,
-                    dx=spectrum._dx,
-                    y_smooth=spectrum._y_smooth,
-                    y_pl=spectrum._y_pl,
-                    y_fe=spectrum._y_fe,
-                    y_ba=spectrum._y_ba,
-                    y_hg=spectrum._y_hg,
-                    y_em=spectrum._y_em,
-                    rejected_pixels=spectrum._rejected_pixels,
-                    absorbed_pixels=spectrum._absorbed_pixels,
-                    valid_pixels=spectrum._valid_pixels,
-                    log_valid_pixels=spectrum._log_valid_pixels,
-                    p_absorbed=spectrum._p_absorbed,
-                    x0=spectrum.x0,
-                    y0=spectrum.y0,
-                    x_log=spectrum._x_log,
-                    y_log=spectrum._y_log,
-                    dy_log=spectrum._dy_log,
-                    x_bounds=x_bounds,
-                    info=spectrum.info,
-                    get_mask=spectrum.get_mask,
-                )
-            )
-        else:
+
+        if spectrum is None:
             if any(arr is None for arr in (x, y, dy)):
                 raise ValueError(
                     "All arrays ('x', 'y', 'dy') must be provided if "
                     "'spectrum' is not given."
                 )
+            if info is None:
+                raise ValueError(
+                    "The 'info' argument must be provided if 'spectrum' "
+                    "is not given."
+                )
 
             kwargs["spectrum"] = None
-            kwargs.update(
-                super().get_kwargs.__wrapped__(
-                    cls,
-                    x=x,
-                    y=y,
-                    dy=dy,
-                    dx=dx,
-                    y_smooth=y_smooth,
-                    y_pl=y_pl,
-                    y_fe=y_fe,
-                    y_ba=y_ba,
-                    y_hg=y_hg,
-                    y_em=y_em,
-                    rejected_pixels=rejected_pixels,
-                    absorbed_pixels=absorbed_pixels,
-                    valid_pixels=valid_pixels,
-                    log_valid_pixels=log_valid_pixels,
-                    p_absorbed=p_absorbed,
-                    x0=x0,
-                    y0=y0,
-                    x_log=x_log,
-                    y_log=y_log,
-                    dy_log=dy_log,
-                    x_bounds=x_bounds,
-                    info=info,
-                    get_mask=get_mask,
-                )
-            )
-
+            kwargs.update(super().get_kwargs.__wrapped__(
+                cls,
+                x=x,
+                y=y,
+                dy=dy,
+                dx=dx,
+                y_smooth=y_smooth,
+                y_pl=y_pl,
+                y_fe=y_fe,
+                y_ba=y_ba,
+                y_hg=y_hg,
+                y_em=y_em,
+                rejected_pixels=rejected_pixels,
+                absorbed_pixels=absorbed_pixels,
+                valid_pixels=valid_pixels,
+                log_valid_pixels=log_valid_pixels,
+                p_absorbed=p_absorbed,
+                x0=x0,
+                y0=y0,
+                x_log=x_log,
+                y_log=y_log,
+                dy_log=dy_log,
+                x_bounds=x_bounds,
+                info=info,
+                get_mask=get_mask,
+            ))
+        else:
+            kwargs["spectrum"] = spectrum
+            kwargs.update(super().get_kwargs_from_specdata.__wrapped__(
+                cls,
+                spectrum,
+                x_bounds=x_bounds,
+                info=info,
+            ))
         return kwargs

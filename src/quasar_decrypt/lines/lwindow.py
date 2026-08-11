@@ -840,7 +840,7 @@ class LWindow(SpecData):
         return self
 
     @validated_apply_info_to_method(
-        subjects=("nonlinear",), specific_kwargs={"fitter"}
+        subjects=("nonlinear",), specific_kwargs={"fitter_kwargs"}
     )
     def fitModel(
         self,
