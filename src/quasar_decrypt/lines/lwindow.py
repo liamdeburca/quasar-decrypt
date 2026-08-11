@@ -61,12 +61,13 @@ from quasar_utils.setup import FitterKwargs
 from scipy.ndimage import binary_dilation
 
 from ..ml import Over, Under
-from ..utils import SpecData
-from ..utils.general import get_bounds_indices, stopwatch
-from ..utils.masked_coords import (
+from ..utils import (
     ContiguousMaskedCoords,
     MaskedCoords,
     ReadOnlyMaskedCoords,
+    _SpecWindow,
+    get_bounds_indices,
+    stopwatch,
 )
 from .utils import common_middle, update_v_off_bounds
 
@@ -76,7 +77,7 @@ type LineModel = Union[GaussianModel, CompoundModel_[GaussianModel]]
 
 
 @dataclass(kw_only=True)
-class LWindow(SpecData):
+class LWindow(_SpecWindow):
     names: set[str] = field(default_factory=set, kw_only=True)
 
     complexes: dict[str, str] = field(default_factory=dict, kw_only=True)
@@ -106,7 +107,7 @@ class LWindow(SpecData):
     blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
     _blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
 
-    neighbours: tuple[SpecData | None, SpecData | None] = field(
+    neighbours: tuple[_SpecWindow | None, _SpecWindow | None] = field(
         default=(None, None), kw_only=True
     )
     # prev_model: LineModel | None = field(default=None, kw_only=True)
@@ -1477,7 +1478,7 @@ class LWindow(SpecData):
     )
     def applyMyself(
         self,
-        line_windows: list[SpecData] | None = None,
+        line_windows: list[_SpecWindow] | None = None,
         *,
         adapt_scale: bool | None = None,
     ) -> Self:

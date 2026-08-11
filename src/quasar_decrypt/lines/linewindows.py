@@ -22,11 +22,11 @@ from quasar_utils.pipeline import LineList
 from quasar_utils.setup import FitterKwargs
 from scipy.optimize import OptimizeResult
 
-from ..utils import SpecList
-from ..utils.masked_coords import (
+from ..utils import (
     ContiguousMaskedCoords,
     MaskedCoords,
     ReadOnlyMaskedCoords,
+    _SpecWindowList,
 )
 from .graph_utils import Graph
 from .lwindow import LWindow
@@ -35,7 +35,7 @@ logger = getLogger(__name__)
 
 
 @dataclass(init=False)
-class LineWindows(SpecList[LWindow]):
+class LineWindows(_SpecWindowList[LWindow]):
     graph: Graph | None = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "em"})
@@ -63,9 +63,6 @@ class LineWindows(SpecList[LWindow]):
         limited: bool = True,
         v_sep: float | None = None,
     ) -> BoolVector:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if line is None:
             mask = zeros_like(self._x, dtype=bool)
             for lwindow in self:
@@ -366,7 +363,9 @@ class LineWindows(SpecList[LWindow]):
             if cond:
                 lwindow = LWindow.create.__wrapped__(
                     LWindow,
-                    **kwargs,
+                    spectrum=self.spectrum,
+                    x_bounds=self.x_bounds,
+                    get_mask=None,
                 )
                 self.append(lwindow)
 

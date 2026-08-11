@@ -9,13 +9,13 @@ from quasar_typing.misc import BackgroundFlux, Suffix
 from quasar_typing.numpy import FloatVector
 from quasar_utils.decorators import validate_call
 
-from quasar_decrypt.utils.specdata import SpecData
+from ..utils import _SpecWindow
 
 logger = getLogger(__name__)
 
 
 @dataclass(init=False)
-class CWindow(SpecData):
+class CWindow(_SpecWindow):
     fit_info: FitInfo | None = field(default=None, init=False)
     fit: Optional[PowerLawModel] = field(default=None, init=False)
     fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
@@ -36,9 +36,6 @@ class CWindow(SpecData):
         log_valid: bool | None = None,
         bg_flux: BackgroundFlux | None = None,
     ) -> FloatVector:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -67,9 +64,6 @@ class CWindow(SpecData):
         without_absorption: bool = False,
         bg_flux: BackgroundFlux | None = None,
     ) -> float:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -102,9 +96,6 @@ class CWindow(SpecData):
         suffix: Suffix | None = None,
         update_emission: bool = True,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         self.fit_info = fit_info
 
         if suffix == "raw":

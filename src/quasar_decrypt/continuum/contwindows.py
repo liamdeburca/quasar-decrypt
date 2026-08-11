@@ -20,15 +20,14 @@ from quasar_utils.decorators import (
 )
 from quasar_utils.setup import FitterKwargs
 
-from ..utils.general import stopwatch
-from ..utils.speclist import SpecList
+from ..utils import _SpecWindowList, stopwatch
 from .cwindow import CWindow
 
 logger = getLogger(__name__)
 
 
 @dataclass(init=False)
-class ContinuumWindows(SpecList[CWindow]):
+class ContinuumWindows(_SpecWindowList[CWindow]):
     fit_info: FitInfo | None = field(default=None, init=False)
 
     fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
@@ -52,14 +51,13 @@ class ContinuumWindows(SpecList[CWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        kwargs = self.get_kwargs_from_specdata.__wrapped__(
-            self.__class__,
-            self.spectrum or self,
-        )
-        kwargs.pop("x_bounds")
-
         for x_bounds in windows:
-            cwindow = CWindow(x_bounds=x_bounds, **kwargs)
+            cwindow = CWindow.create.__wrapped__(
+                CWindow,
+                spectrum=self.spectrum,
+                x_bounds=x_bounds,
+                get_mask=None, # Creates new, dedicated get_mask for each window
+            )
             if cwindow.size > 0:
                 self.append(cwindow)
 

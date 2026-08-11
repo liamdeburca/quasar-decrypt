@@ -23,15 +23,14 @@ from quasar_utils.decorators import (
 )
 from quasar_utils.setup import FitterKwargs
 
-from quasar_decrypt.balmer.bwindow import BWindow
-from quasar_decrypt.utils.general import stopwatch
-from quasar_decrypt.utils.speclist import SpecList
+from ..utils import _SpecWindowList, stopwatch
+from .bwindow import BWindow
 
 logger = getLogger(__name__)
 
 
 @dataclass(init=False)
-class BalmerWindows(SpecList[BWindow]):
+class BalmerWindows(_SpecWindowList[BWindow]):
     model: Optional[BalmerModel] = field(default=None, init=False)
     fit: Optional[BalmerModel] = field(default=None, init=False)
     fit_info: FitInfo | None = field(default=None, init=False)
@@ -53,43 +52,15 @@ class BalmerWindows(SpecList[BWindow]):
         *,
         windows: Iterable[CoordBounds] | None = None,
     ) -> Self:
-        kwargs = {}
-        if self.spectrum is None:
-            kwargs["x"] = self._x
-            kwargs["y"] = self._y
-            kwargs["dy"] = self._dy
-            kwargs["dx"] = self._dx
-
-            kwargs["y_smooth"] = self._y_smooth
-            kwargs["y_pl"] = self._y_pl
-            kwargs["y_fe"] = self._y_fe
-            kwargs["y_ba"] = self._y_ba
-            kwargs["y_hg"] = self._y_hg
-            kwargs["y_em"] = self._y_em
-
-            kwargs["rejected_pixels"] = self._rejected_pixels
-            kwargs["absorbed_pixels"] = self._absorbed_pixels
-            kwargs["valid_pixels"] = self._valid_pixels
-            kwargs["log_valid_pixels"] = self._log_valid_pixels
-            kwargs["p_absorbed"] = self._p_absorbed
-
-            kwargs["x0"] = self.x0
-            kwargs["y0"] = self.y0
-            kwargs["x_log"] = self._x_log
-            kwargs["y_log"] = self._y_log
-            kwargs["dy_log"] = self._dy_log
-
-            kwargs["info"] = self.info
-            kwargs["get_mask"] = self.get_mask
-        else:
-            kwargs["spectrum"] = self.spectrum
-
         for x_bounds in windows:
-            kwargs["x_bounds"] = x_bounds
-            bwindow = BWindow.create.__wrapped__(BWindow, **kwargs)
+            bwindow = BWindow.create.__wrapped__(
+                BWindow,
+                spectrum=self.spectrum,
+                x_bounds=x_bounds,
+                get_mask=None, # Create a new get_mask for each window
+            )
             if bwindow.size > 0:
                 self.append(bwindow)
-
         return self
 
     @validated_apply_info_to_method(subjects=("balmer", "nonlinear"))

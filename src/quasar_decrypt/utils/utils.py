@@ -16,7 +16,7 @@ def get_mask(
     ub: float,
 ) -> BoolVector:
     """
-    NaN-insensitive function for finding the mask covering a '_SpecData' object.
+    NaN-insensitive function for finding the mask covering a '_BaseSpec' object.
     """
     mask = zeros_like(arr, dtype=bool)
     not_nan = isfinite(arr)

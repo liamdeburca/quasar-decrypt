@@ -8,11 +8,11 @@ from typing import ClassVar
 
 from quasar_typing.misc import BackgroundFlux
 
-from quasar_decrypt.utils.specdata import SpecData
+from ..utils import _SpecWindow
 
 logger = getLogger(__name__)
 
 
 @dataclass(init=False)
-class HWindow(SpecData):
+class HWindow(_SpecWindow):
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "hg"})

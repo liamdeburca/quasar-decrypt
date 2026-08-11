@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import field
 from logging import getLogger
 from typing import Literal, Optional, Self, Union, overload
@@ -69,7 +69,7 @@ from quasar_utils.decorators import (
     validated_apply_info_to_method,
 )
 from quasar_utils.pipeline import LineList
-from quasar_utils.setup import FitterKwargs, Info
+from quasar_utils.setup import FitterKwargs
 from scipy.optimize import OptimizeResult
 
 from .balmer import BalmerWindows
@@ -77,7 +77,8 @@ from .continuum import ContinuumWindows
 from .host import HostWindows
 from .iron import IronWindows
 from .lines import LineWindows
-from .utils import SpecList, _SpecData
+from .utils._spec import _Spec
+from .utils._specwindowlist import _SpecWindowList
 from .utils.general import stopwatch
 from .utils.masked_coords import (
     ContiguousMaskedCoords,
@@ -89,7 +90,7 @@ logger = getLogger(__name__)
 
 
 @dataclass
-class Spectrum(_SpecData):
+class Spectrum(_Spec):
     path: AbsoluteFilePath = field(kw_only=True)
     title: str = field(kw_only=True)
 
@@ -106,129 +107,6 @@ class Spectrum(_SpecData):
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     nested_sampler: BaseNestedSampler | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
-
-    @classmethod
-    @validate_call
-    def create(
-        cls,
-        *,
-        path: AbsoluteFilePath,
-        title: str,
-        x: FloatVector,
-        y: FloatVector,
-        dy: FloatVector,
-        dx: FloatVector | None = None,
-        y_smooth: FloatVector | None = None,
-        y_pl: FloatVector | None = None,
-        y_fe: FloatVector | None = None,
-        y_ba: FloatVector | None = None,
-        y_hg: FloatVector | None = None,
-        y_em: FloatVector | None = None,
-        rejected_pixels: BoolVector | None = None,
-        absorbed_pixels: BoolVector | None = None,
-        valid_pixels: BoolVector | None = None,
-        log_valid_pixels: BoolVector | None = None,
-        p_absorbed: FloatVector | None = None,
-        x0: float | None = None,
-        y0: float | None = None,
-        x_log: FloatVector | None = None,
-        y_log: FloatVector | None = None,
-        dy_log: FloatVector | None = None,
-        x_bounds: CoordBounds | None = None,
-        info: Info = None,
-        get_mask: Callable[[float, float], BoolVector] | None = None,
-    ) -> Self:
-        kwargs = cls.get_kwargs.__wrapped__(
-            cls,
-            path=path,
-            title=title,
-            x=x,
-            y=y,
-            dy=dy,
-            dx=dx,
-            y_smooth=y_smooth,
-            y_pl=y_pl,
-            y_fe=y_fe,
-            y_ba=y_ba,
-            y_hg=y_hg,
-            y_em=y_em,
-            rejected_pixels=rejected_pixels,
-            absorbed_pixels=absorbed_pixels,
-            valid_pixels=valid_pixels,
-            log_valid_pixels=log_valid_pixels,
-            p_absorbed=p_absorbed,
-            x0=x0,
-            y0=y0,
-            x_log=x_log,
-            y_log=y_log,
-            dy_log=dy_log,
-            x_bounds=x_bounds,
-            info=info,
-            get_mask=get_mask,
-        )
-        return cls(**kwargs)
-
-    @classmethod
-    @validate_call
-    def get_kwargs(
-        cls,
-        *,
-        path: AbsoluteFilePath,
-        title: str,
-        x: FloatVector,
-        y: FloatVector,
-        dy: FloatVector,
-        dx: FloatVector | None = None,
-        y_smooth: FloatVector | None = None,
-        y_pl: FloatVector | None = None,
-        y_fe: FloatVector | None = None,
-        y_ba: FloatVector | None = None,
-        y_hg: FloatVector | None = None,
-        y_em: FloatVector | None = None,
-        rejected_pixels: BoolVector | None = None,
-        absorbed_pixels: BoolVector | None = None,
-        valid_pixels: BoolVector | None = None,
-        log_valid_pixels: BoolVector | None = None,
-        p_absorbed: FloatVector | None = None,
-        x0: float | None = None,
-        y0: float | None = None,
-        x_log: FloatVector | None = None,
-        y_log: FloatVector | None = None,
-        dy_log: FloatVector | None = None,
-        x_bounds: CoordBounds | None = None,
-        info: Info = None,
-        get_mask: Callable[[float, float], BoolVector] | None = None,
-    ) -> dict:
-        kwargs = {"path": path, "title": title}
-        kwargs.update(
-            super().get_kwargs.__wrapped__(
-                cls,
-                x=x,
-                y=y,
-                dy=dy,
-                dx=dx,
-                y_smooth=y_smooth,
-                y_pl=y_pl,
-                y_fe=y_fe,
-                y_ba=y_ba,
-                y_hg=y_hg,
-                y_em=y_em,
-                rejected_pixels=rejected_pixels,
-                absorbed_pixels=absorbed_pixels,
-                valid_pixels=valid_pixels,
-                log_valid_pixels=log_valid_pixels,
-                p_absorbed=p_absorbed,
-                x0=x0,
-                y0=y0,
-                x_log=x_log,
-                y_log=y_log,
-                dy_log=dy_log,
-                x_bounds=x_bounds,
-                info=info,
-                get_mask=get_mask,
-            )
-        )
-        return kwargs
 
     def __post_init__(self) -> None:
         self.preprocess()
@@ -283,14 +161,6 @@ class Spectrum(_SpecData):
     def basic_error_result(self) -> ErrorResult:
         return ErrorResult((self.basic_sample,), (1.0,))
 
-    def __str__(self, simple: bool = False):
-        s = "'Spectrum' class [{:.1f} <-> {:.1f}]".format(*self.x_bounds)
-        if not simple:
-            i = int((~self.valid_pixels).sum())
-            n = len(self.x)
-            s += f" w/ {i}/{n} (invalid)."
-        return s
-
     @validated_apply_info_to_method(subjects=("absorption", "lines"))
     def __call__(
         self,
@@ -337,7 +207,7 @@ class Spectrum(_SpecData):
     def __getitem__(
         self,
         key: Literal["pl", "fe", "ba", "hg", "em"],
-    ) -> SpecList | None:
+    ) -> _SpecWindowList | None:
         match key:
             case "pl":
                 return self.continuum_windows
