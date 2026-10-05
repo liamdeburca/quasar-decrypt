@@ -1,17 +1,20 @@
 from collections.abc import Iterable
 from dataclasses import field
 from logging import getLogger
-from typing import Literal, Optional, Self, Union, overload
+from pickle import dump as pickle_dump
+from pickle import load as pickle_load
+from typing import Any, Literal, Optional, Self, Union, overload
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from numpy import (
     argwhere,
-    array_equal,
+    float64,
+    interp,
     invert,
     isfinite,
+    isnan,
     nanargmax,
-    zeros_like,
 )
 from pydantic.dataclasses import dataclass
 from pydantic_core import ValidationError
@@ -28,9 +31,6 @@ from quasar_errors.nested_sampling import (
     BaseNestedSampler,
     UniformNestedSampler,
 )
-from quasar_errors.spectrum_utils import (
-    format_bootstrapping_kwargs_for_spectrum,
-)
 from quasar_models import (
     BalmerModel,
     GaussianModel,
@@ -38,9 +38,9 @@ from quasar_models import (
     IronModel,
     PowerLawModel,
 )
-from quasar_models.modeling import Fitter, PrepareModel
+from quasar_models.modeling import BaseModel, Fitter, MCMCFitter, PrepareModel
 from quasar_models.utils.astropy import get_free_params, get_model_parts
-from quasar_plotting import absorptionplot, fitplot, quickplot
+from quasar_plotting import absorptionplot
 from quasar_plotting.colors import DEFAULT_COLORS
 from quasar_plotting.utils import get_coords
 from quasar_typing.astropy import CompoundModel_, FitInfo, Model_, QTable_
@@ -62,13 +62,14 @@ from quasar_typing.pathlib import (
     AbsoluteFITSPath,
     RelativeFilePath,
 )
+from quasar_typing.scipy import OptimizeResult_
 from quasar_utils.absorption import remove_absorption, smooth_spectrum
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 from quasar_utils.decorators import (
     validate_call,
     validated_apply_info_to_method,
 )
-from quasar_utils.pipeline import LineList
+from quasar_utils.linelist import LineList
 from quasar_utils.setup import FitterKwargs
 from scipy.optimize import OptimizeResult
 
@@ -77,13 +78,19 @@ from .continuum import ContinuumWindows
 from .host import HostWindows
 from .iron import IronWindows
 from .lines import LineWindows
+from .plotting.basics import DifferencePlotter, QuickPlotter, ResidualPlotter
+from .plotting.windows_and_templates_plots import (
+    AllTemplatesWithDifferencesPlot,
+    AllTemplatesWithResidualsPlot,
+)
 from .utils._spec import _Spec
 from .utils._specwindowlist import _SpecWindowList
-from .utils.general import stopwatch
+from .utils.bootstrapping import (
+    args_and_kwargs_helper,
+    validate_model_and_data,
+)
 from .utils.masked_coords import (
-    ContiguousMaskedCoords,
     MaskedCoords,
-    ReadOnlyMaskedCoords,
 )
 
 logger = getLogger(__name__)
@@ -93,8 +100,6 @@ logger = getLogger(__name__)
 class Spectrum(_Spec):
     path: AbsoluteFilePath = field(kw_only=True)
     title: str = field(kw_only=True)
-
-    _is_preprocessed: bool = field(default=False, init=False)
 
     continuum_windows: ContinuumWindows | None = field(
         default=None, init=False
@@ -106,10 +111,69 @@ class Spectrum(_Spec):
 
     bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
     nested_sampler: BaseNestedSampler | None = field(default=None, init=False)
+    emcee_sampler: object | None = field(default=None, init=False)
     error_result: ErrorResult | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        self.preprocess()
+        self.findAnomalies()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["path"] = self.path
+        state["title"] = self.title
+        state["continuum_windows"] = self.continuum_windows
+        state["iron_windows"] = self.iron_windows
+        state["balmer_windows"] = self.balmer_windows
+        state["host_windows"] = self.host_windows
+        state["line_windows"] = self.line_windows
+        state["bootstrapper"] = self.bootstrapper
+        state["nested_sampler"] = self.nested_sampler
+        state["emcee_sampler"] = self.emcee_sampler
+        state["error_result"] = self.error_result
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self.path = state["path"]
+        self.title = state["title"]
+
+        self.continuum_windows = state.get("continuum_windows", None)
+        self.iron_windows = state.get("iron_windows", None)
+        self.balmer_windows = state.get("balmer_windows", None)
+        self.host_windows = state.get("host_windows", None)
+        self.line_windows = state.get("line_windows", None)
+
+        self.bootstrapper = state.get("bootstrapper", None)
+        self.nested_sampler = state.get("nested_sampler", None)
+        self.emcee_sampler = state.get("emcee_sampler", None)
+        self.error_result = state.get("error_result", None)
+
+    def _finalize_unpickling(self) -> None:
+        """
+        Set the `spectrum` for this object and all window(list) objects.
+        """
+        super()._finalize_unpickling()
+        if self.pl is not None:
+            self.pl._finalize_unpickling(self)
+        if self.fe is not None:
+            self.fe._finalize_unpickling(self)
+        if self.ba is not None:
+            self.ba._finalize_unpickling(self)
+        if self.hg is not None:
+            self.hg._finalize_unpickling(self)
+        if self.em is not None:
+            self.em._finalize_unpickling(self)
+
+    def dump(self, path: str) -> None:
+        with open(path, "wb") as f:
+            pickle_dump(self, f)
+
+    @classmethod
+    def load(cls, path: str) -> Self:
+        with open(path, "rb") as f:
+            obj: Self = pickle_load(f)
+        obj._finalize_unpickling()
+        return obj
 
     @property
     def pl(self) -> ContinuumWindows | None:
@@ -219,16 +283,7 @@ class Spectrum(_Spec):
                 return self.host_windows
             case "em":
                 return self.line_windows
-
-    def preprocess(self) -> None:
-        if not self._is_preprocessed:
-            logger.debug(f"Preprocessing: {self}")
-            self.findAnomalies()
-            self.truncateSpectrum()
-            logger.debug(f"Preprocessed: {self}")
-
-            self._is_preprocessed = True
-
+            
     def findAnomalies(self) -> None:
         """
         Identifies anomalous pixels, and replaces them with NaN. Anomalous
@@ -248,7 +303,7 @@ class Spectrum(_Spec):
         msg += f"{cond_3.sum()}/{n} (invalid flux unc.)."
         logger.debug(msg)
 
-        self._valid_pixels = invert(mask)
+        self._valid_pixels[:] = invert(mask)
 
     def _truncate_range(self, sel: slice) -> Self:
         """
@@ -287,7 +342,6 @@ class Spectrum(_Spec):
             dy_log=f(self._dy_log),
             info=self.info,
             x_bounds=None,
-            get_mask=None,
         )
         return self.__class__(**kwargs)
 
@@ -299,39 +353,40 @@ class Spectrum(_Spec):
         otherwise returns a new 'Spectrum' instance with the same, but 
         truncated, data arrays (see: `_truncate_range`).
         """
+        logger.debug("Truncating spectrum:")
+
         mask = self._valid_pixels
         n_valid = self._valid_pixels.sum()
+        logger.debug(f">>> Found {n_valid}/{mask.size} valid pixels.")
 
-        out = self
         if n_valid == 0:
-            logger.warning("All pixels are invalid! Cannot truncate spectrum.")
+            msg = ">>> All pixels are invalid! Cannot truncate spectrum."
+            logger.critical(msg)
+            raise ValueError(msg)
         elif n_valid == 1:
-            logger.critical("Only one valid pixel! Cannot truncate spectrum.")
-        elif self._valid_pixels[0] and self._valid_pixels[-1]:
-            logger.debug("No invalid pixels at either edge")
-        else:
-            valid_indices = argwhere(mask).flatten()
-            idx_start = valid_indices[0]
-            idx_end = valid_indices[-1]
-            sel = slice(valid_indices[0], valid_indices[-1] + 1)
+            msg = ">>> Only one valid pixel! Cannot truncate spectrum."
+            logger.critical(msg)
+            raise ValueError(msg)
+        elif mask[0] and mask[-1]:
+            logger.debug(">>> No invalid pixels at either edge")
+            return self
 
-            n = len(mask)
-            n_blue = idx_start
-            n_red = n - 1 - idx_end
-            n_tot = n_blue + n_red
+        valid_indices = argwhere(mask).flatten()
+        idx_start = valid_indices[0]
+        idx_end = valid_indices[-1]
 
-            out = self._truncate_range(sel)
-            logger.debug(
-                "Cutting %d/%d pixel(s): %d/%d (blue edge), %d/%d (red edge)",
-                n_tot,
-                n,
-                n_blue,
-                n,
-                n_red,
-                n,
-            )
+        lb, ub = self.x_bounds
+        new_lb = self._x[idx_start]
+        new_ub = self._x[idx_end]
+        if lb < new_lb:
+            logger.debug(f">>> Increasing lower bound: {lb:.1f} -> {new_lb:.1f}")
+            lb = new_lb
+        if new_ub < ub:
+            logger.debug(f">>> Decreasing upper bound: {ub:.1f} -> {new_ub:.1f}")
+            ub = new_ub
 
-        return out
+        self.x_bounds = (new_lb, new_ub)
+        return self
 
     @validated_apply_info_to_method(subjects=("lines",))
     def cropLymanAlphaForest(
@@ -339,34 +394,46 @@ class Spectrum(_Spec):
         *,
         x_limit: float | None = None,
     ) -> Self:
-        logger.debug(f"Cropping Lyman-alpha forest: {self}")
+        logger.debug("Cropping Lyman-alpha forest:")
 
-        indices = argwhere(self._x < x_limit).flatten()
-        if indices.size and ((edge_idx := indices[-1]) >= 1):
-            _y = self._y[:edge_idx+1]
+        lb = self.x_bounds[0]
 
-            if not isfinite(_y).any():
-                logger.warning(
-                    "No finite pixels found blue-wards of `x_limit`: "
-                    "Cancelling Lyman-alpha forest cropping."
-                )
-                return self
+        indices = argwhere((lb < self._x) & (self._x < x_limit)).flatten()
+        logger.debug(
+            f">>> Found {indices.size}/{self._x.size} pixels "
+            f"above {lb=:.1f} and below {x_limit=:.1f}"
+        )
 
-            idx_max = nanargmax(_y).flatten()[0]
+        if not (indices.size and ((edge_idx := indices[-1]) >= 1)):
+            logger.debug(
+                ">>> No pixels found above the lower bound and below `x_limit`. "
+                "Returning early!")
+            return self
 
-            x_max = self._x[idx_max]
-            y_max = self._y[idx_max]
+        _y = self._y[:edge_idx+1]
+        if not isfinite(_y).any():
+            logger.debug(
+                ">>> No finite flux densities blue-wards of `x_limit`. "
+                "Returning early!"
+            )
+            return self
 
-            msg = f">>> Peak found at ({x_max:.1f}, {y_max:.1f}) under the condition: x < {self._x[edge_idx]:.1f}."
-            logger.debug(msg)
+        idx_max = nanargmax(_y).flatten()[0]
+        x_max = self._x[idx_max]
+        y_max = self._y[idx_max]
+        logger.debug(
+            f">>> Found peak at index {idx_max}: "
+            f"({x_max=:.1f}, {y_max=:.1f})"
+        )
+        if x_max < lb:
+            logger.debug(
+                ">>> Peak is blue-wards of the existing lower bound! "
+                "Returning early!"
+            )
+            return self
 
-            self._valid_pixels[:idx_max] = False
-            out = self.truncateSpectrum()
-
-            logger.debug(f">>> Cropping {idx_max} pixel(s).")
-
-        logger.debug(f"Cropped Lyman-alpha forest and created: {out}")
-        return out
+        self.x_bounds = (x_max, self.x_bounds[1])
+        return self
 
     @validated_apply_info_to_method(subjects=("absorption",))
     def smoothSpectrum(
@@ -376,9 +443,6 @@ class Spectrum(_Spec):
         p: int | None = None,
         logspace: int | None = None,
     ) -> None:
-        """
-        ** PYDANTIC VALIDATED AND INFO-APPLIED METHOD **
-        """
         self._y_smooth[:] = smooth_spectrum.__wrapped__(
             self._x, self._y, self._dy,
             self._valid_pixels,
@@ -403,7 +467,7 @@ class Spectrum(_Spec):
         if bg_flux is None:
             bg_flux = BackgroundFlux({"all"})
 
-        if array_equal(self._y, self._y_smooth):
+        if isnan(self._y_smooth).all():
             self.smoothSpectrum.__wrapped__(
                 self,
                 w=w,
@@ -582,7 +646,11 @@ class Spectrum(_Spec):
         self,
         *,
         template_model: Optional[PowerLawModel] = None,
+        original: bool = False,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
         bg_flux: BackgroundFlux | None = None,
+        shrink: float | None = None,
         windows: list[CoordBounds] | None = None,
         sigmas: list[float] | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -624,8 +692,12 @@ class Spectrum(_Spec):
         )
         self.continuum_windows.__call__.__wrapped__(
             self.continuum_windows,
+            original=original,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
             template_model=template_model,
             bg_flux=bg_flux,
+            shrink=shrink,
             sigmas=sigmas,
             flux_bounds=flux_bounds,
             alpha_bounds=alpha_bounds,
@@ -640,9 +712,11 @@ class Spectrum(_Spec):
         template_model: Union[
             IronModel, CompoundModel_[IronModel], None
         ] = None,
-        bg_flux: BackgroundFlux | None = None,
+        original: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        shrink: float | None = None,
         windows: list[CoordBounds] | None = None,
         template_files: list[AbsoluteFITSPath | str] | None = None,
         resample: bool | None = None,
@@ -653,6 +727,7 @@ class Spectrum(_Spec):
         bias: list[str] | None = None,
         ratio: FloatVector | None = None,
         scale: float | None = None,
+        tie_similar: bool | None = None,
         allow_interp_fitting: bool | None = None,
         raster: bool | None = None,
         fine_tune: bool | None = None,
@@ -668,9 +743,11 @@ class Spectrum(_Spec):
         self.iron_windows.__call__.__wrapped__(
             self.iron_windows,
             template_model=template_model,
+            original=original,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
+            shrink=shrink,
             template_files=template_files,
             resample=resample,
             flux_bounds=flux_bounds,
@@ -680,6 +757,7 @@ class Spectrum(_Spec):
             bias=bias,
             ratio=ratio,
             scale=scale,
+            tie_similar=tie_similar,
             allow_interp_fitting=allow_interp_fitting,
             raster=raster,
             fine_tune=fine_tune,
@@ -691,9 +769,11 @@ class Spectrum(_Spec):
         self,
         *,
         template_model: Optional[BalmerModel] = None,
-        bg_flux: BackgroundFlux | None = None,
+        original: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        shrink: float | None = None,
         windows: list[CoordBounds] | None = None,
         flux: float | None = None,
         fwhm: float | None = None,
@@ -723,10 +803,12 @@ class Spectrum(_Spec):
         self.balmer_windows.__call__.__wrapped__(
             self.balmer_windows,
             template_model=template_model,
+            original=original,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             covered=not self.ba.is_empty,
+            shrink=shrink,
             flux=flux,
             fwhm=fwhm,
             ratio=ratio,
@@ -753,14 +835,19 @@ class Spectrum(_Spec):
     def fitHost(
         self,
         *,
-        windows: list[CoordBounds] | None = None,
         template_model: Optional[HostGalaxyModel] = None,
-        bg_flux: BackgroundFlux | None = None,
+        original: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        shrink: bool | None = None,
+        windows: list[CoordBounds] | None = None,
+        x_min: float | None = None,
         template_files: list[str | AbsoluteFITSPath] | None = None,
         sources: list[Literal["bc2003"]] | None = None,
         ages: list[int] | None = None,
+        default_source: Literal["bc2003"] | None = None,
+        default_age: int | None = None,
         flux: float | None = None,
         fwhm: float | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -769,9 +856,6 @@ class Spectrum(_Spec):
         fixed: dict[str, bool] | None = None,
         raster: bool = True,
         fine_tune: bool = True,
-        only_model: bool = False,
-        min_fittable_ratio: float | None = None,
-        min_fittable_total: int | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         self.instantiateHost.__wrapped__(
@@ -781,13 +865,18 @@ class Spectrum(_Spec):
         self.host_windows.__call__.__wrapped__(
             self.host_windows,
             template_model=template_model,
+            original=original,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             covered=not self.hg.is_empty,
+            shrink=shrink,
+            x_min=x_min,
             template_files=template_files,
             sources=sources,
             ages=ages,
+            default_source=default_source,
+            default_age=default_age,
             flux=flux,
             fwhm=fwhm,
             flux_bounds=flux_bounds,
@@ -796,9 +885,6 @@ class Spectrum(_Spec):
             fixed=fixed,
             raster=raster,
             fine_tune=fine_tune,
-            only_model=only_model,
-            min_fittable_total=min_fittable_total,
-            min_fittable_ratio=min_fittable_ratio,
             fitter_kwargs=fitter_kwargs,
         )
 
@@ -810,10 +896,12 @@ class Spectrum(_Spec):
         template_model: Optional[
             Union[GaussianModel, CompoundModel_[GaussianModel]]
         ] = None,
-        bg_flux: BackgroundFlux | None = None,
+        original: bool | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        shrink: bool | None = None,
         limited: bool = False,
         sigma_res: float | None = None,
         v_sep: float | None = None,
@@ -826,7 +914,6 @@ class Spectrum(_Spec):
         crop: bool | None = None,
         measure: str | None = None,
         reverse: bool | None = None,
-        make_copies: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> None:
         """
@@ -849,17 +936,19 @@ class Spectrum(_Spec):
         See '__call__()' method of the 'CSSpectrum' class.
         """
         if bg_flux is None:
-            bg_flux = BackgroundFlux({"pl", "fe", "ba", "hg"})
+            bg_flux = BackgroundFlux({"all", "em"})
 
         self.instantiateLines()
         self.line_windows.__call__.__wrapped__(
             self.line_windows,
             linelist,
             template_model=template_model,
+            original=original,
             bg_flux=bg_flux,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             with_neighbours=with_neighbours,
+            shrink=shrink,
             limited=limited,
             v_sep=v_sep,
             forced_splits=forced_splits,
@@ -872,20 +961,21 @@ class Spectrum(_Spec):
             crop=crop,
             measure=measure,
             reverse=reverse,
-            make_copies=make_copies,
             fitter_kwargs=fitter_kwargs,
         )
 
-    @validated_apply_info_to_method(subjects=("nonlinear",))
+    @validate_call
     def finaliseFit(
         self,
+        *,
+        original: bool = False,
         model_types: ModelTypes | None = None,
         data_types: DataTypes | None = None,
         bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        *,
-        fitter_kwargs: FitterKwargs | None = None,
+        shrink: bool | None = None,
+        **fitter_kwargs,
     ) -> bool:
         """
         Notes
@@ -900,90 +990,304 @@ class Spectrum(_Spec):
         s = self.__str__(simple=True).removesuffix(".")
         msg = f"Finalising fit for {s}: "
 
-        if model_types is None:
-            model_types = (
-                ModelTypes({"all"})
-                if data_types is None
-                else data_types.copy()
-            )
-
-        if data_types is not None and not any(self[dt] is not None for dt in data_types):
-            msg += f"no data types found for {data_types}. "
-            logger.warning(msg)
-            return False
-
-        if bg_flux is None:
-            _bg_flux = set(model_types)
-            _bg_flux.add("all")
-            bg_flux = BackgroundFlux(_bg_flux)
-
-        msg += f"{model_types=}, {data_types=}, {bg_flux=} -> "
-
-        masked_coords = self.getMaskedCoords.__wrapped__(
+        masked_coords, model = self._final_data_and_model.__wrapped__(
             self,
-            mode="c",  # c: contiguous
+            original=original,
+            model_types=model_types,
             data_types=data_types,
             bg_flux=bg_flux,
-            covered=True,
-            log_valid=False,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
-            valid=True,
+            shrink=shrink,
         )
+        fitter_kwargs = self.info.nonlinear.fitter_kwargs | fitter_kwargs
 
-        model = self.getModel.__wrapped__(self, model_types=model_types)
-        if model is None:
-            msg += "no models found!"
-            logger.warning(msg)
-            return False
-
-        n_pix = masked_coords.size
-        n_free_params = sum(get_free_params(model).values())
-
-        if n_pix <= n_free_params:
-            msg += (
-                "cancelling final fitting due to insufficient no. of data "
-                f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
-            )
-            logger.critical(msg)
-            return False
-
-        msg += f"n_pixels={n_pix}, n_submodels={model.n_submodels} (n_free_params={n_free_params}), "
-
+        preparer = PrepareModel.fromCoords(masked_coords, model)
+        data = preparer.createDataDict(masked_coords)
         try:
-            with (
-                stopwatch() as watch,
-                PrepareModel(x=masked_coords.x, model=model),
-            ):
+            with preparer as (seq_model, where):
                 fitter = Fitter()
                 fit = fitter(
-                    model,
-                    masked_coords.x,
-                    masked_coords.y,
-                    dy=masked_coords.dy,
+                    seq_model,
+                    data["x"],
+                    data["y"],
+                    dy=data["dy"],
+                    where=where,
                     get_model=True,
                     inplace=False,
-                    **(fitter_kwargs or {}),
+                    **fitter_kwargs,
                 )
+                fit_info = fitter.fit_info
 
-            msg += f"successfully finalised fit in {watch.elapsed:.1f} ms."
+            msg += "successfully!"
         except ValidationError as e:
             msg += f"failed fitting due to validation error: {e}"
-            logger.warning(msg)
+            logger.info(msg)
             return False
-        except Exception as e:
-            msg += f"failed fitting due to an unexpected error: {e}"
-            logger.warning(msg)
-            raise 
 
         logger.debug(msg)
         self.applyFit.__wrapped__(
             self,
             fit,
-            fit_info=fitter.fit_info,
+            fit_info=fit_info,
             update_emission=True,
         )
         return True
+
+    @validated_apply_info_to_method(subjects=("random",))
+    def finaliseFitWithMCMC(
+        self,
+        *,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        model_types: ModelTypes | None = None,
+        data_types: DataTypes | None = None,
+        bg_flux: BackgroundFlux | None = None,
+        progress: bool = True,
+        pool: Any | None = None,
+        random_state: RandomState_ | None = None,
+        **mcmc_kwargs,
+    ) -> bool:
+
+        s = self.__str__(simple=True).removesuffix(".")
+        msg = f"Finalising fit with MCMC for {s}: "
+
+        masked_coords, model = self._final_data_and_model.__wrapped__(
+            self,
+            model_types=model_types,
+            data_types=data_types,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+        )
+        mcmc_kwargs = self.info.mcmc.mcmc_kwargs | mcmc_kwargs
+
+        try:
+            with PrepareModel(x=masked_coords.x, model=model, is_logbinned=True) as seq_model:
+                fitter = MCMCFitter()
+                fit = fitter(
+                    seq_model,
+                    masked_coords.x,
+                    masked_coords.y,
+                    dy=masked_coords.dy,
+                    get_model=True,
+                    inplace=False,
+                    progress=progress,
+                    vectorize=pool is None,
+                    random_state=random_state,
+                    **mcmc_kwargs,
+                )
+                fit_info = fitter.fit_info
+
+                self.emcee_sampler = fitter.sampler
+
+            msg += "successfully!"
+        except ValidationError as e:
+            msg += f"failed fitting due to validation error: {e}"
+            logger.info(msg)
+            return False
+
+        logger.debug(msg)
+        self.applyFit.__wrapped__(
+            self,
+            fit,
+            fit_info=fit_info,
+            update_emission=True,
+        )
+        return True
+
+    @validated_apply_info_to_method(
+        subjects=("nonlinear",), 
+        specific_kwargs=("fitter_kwargs",),
+    )
+    def chooseHostGalaxyTemplate(
+        self,
+        *,
+        original: bool = False,
+        model_types: ModelTypes | None = None,
+        data_types: DataTypes | None = None,
+        bg_flux: BackgroundFlux | None = None,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        **fitter_kwargs,
+    ) -> Optional[HostGalaxyModel]:
+        msg = "Choosing host galaxy template: "
+        if self.hg is None:
+            msg += "no `HostWindows` instance available!"
+            logger.info(msg)
+            return None
+
+        n = len(self.hg.models)
+        if n == 0:
+            msg += "no host galaxy templates available!"
+            logger.info(msg)
+            return None
+        elif n == 1:
+            msg += "only one host galaxy template available."
+            logger.debug(msg)
+            return self.hg.getModel()
+
+        if model_types is not None:
+            model_types.add("hg")
+
+        if (bg_flux is not None) and ("hg" in bg_flux):
+            logger.info(
+                "Host galaxy emission included in background flux "
+                "-> Removing!"
+            )
+            bg_flux.remove("hg")
+    
+        masked_coords, _model = self._final_data_and_model.__wrapped__(
+            self,
+            original=original,
+            model_types=model_types,
+            data_types=data_types,
+            bg_flux=bg_flux,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+        )
+        ms: list[BaseModel] = [
+            m
+            for m in ([_model] if _model.n_submodels == 1 else list(_model))
+            if m.model_type != "hg"
+        ]
+        bg_model = sum(ms[1:], start=ms[0])
+
+        fits: dict[str, Union[BaseModel, CompoundModel_[BaseModel]]] = {}
+        fit_infos: dict[str, OptimizeResult_] = {}
+        for template_name, host_model in self.hg.models.items():
+            model = bg_model + host_model
+            try:
+                with PrepareModel(x=masked_coords.x, model=model) as seq_model:
+                    fitter = Fitter()
+                    fits[template_name] = fitter(
+                        seq_model,
+                        masked_coords.x,
+                        masked_coords.y,
+                        dy=masked_coords.dy,
+                        get_model=True,
+                        inplace=False,
+                        **fitter_kwargs,
+                    )
+                    fit_infos[template_name] = fitter.fit_info
+            except ValidationError as e:
+                msg += f"failed fitting due to validation error: {e}"
+                logger.info(msg)
+                return None
+
+        # Update host galaxy models
+        for template_name, host_model in self.hg.models.items():
+            self.hg.models[template_name] = fits[template_name][host_model.name]
+
+        chi2s: dict[str, float] = {
+            template_name: (fit_info.fun ** 2).mean()
+            for template_name, fit_info in fit_infos.items()
+        }
+        best_template: str = min(chi2s, key=chi2s.get)
+
+        for template_name, chi2 in chi2s.items():
+            msg += f"({template_name}) {chi2:.1f} "
+        msg = msg.removesuffix(" ")
+        msg += f"-> Best template: {best_template}"
+        logger.debug(msg)
+
+        self.hg.chooseModel.__wrapped__(self.hg, best_template)
+        self.applyFit.__wrapped__(
+            self,
+            fits[best_template],
+            fit_info=fit_infos[best_template],
+            update_emission=True,
+        )
+        return fits[best_template]
+
+    @validate_call
+    def _final_data_and_model(
+        self,
+        original: bool = False,
+        model_types: ModelTypes | None = None,
+        data_types: DataTypes | None = None,
+        bg_flux: BackgroundFlux | None = None,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        shrink: bool | None = None,
+    ) -> tuple[MaskedCoords, Union[BaseModel, CompoundModel_[BaseModel]]]:
+        """
+        Parameters
+        ----------
+        original : bool
+            If True, the model will be fit to the original data arrays if these
+            are not identical to the currently used data arrays.
+        model_types : ModelTypes | None
+            The types of models to include in the final model. If None, all
+            available model types are included. 
+        data_types : DataTypes | None
+            The types of data to include in the final dataset. If None, the 
+            entire spectrum is included (not just the data from all spectral 
+            windows).
+        bg_flux : BackgroundFlux | None
+            The flux density contributions to be subtracted from the spectrum 
+            before fitting. If None, defaults to all model types not included in 
+            'model_types'.
+        without_rejections : bool
+            If True, pixels masked during sigma clipping are excluded.
+        without_absorption : bool
+            If True, pixels masked due to absorption are excluded.
+        """
+        logger.debug("Getting final data and model:")
+        original = self._update_original_flag(
+            original=original,
+            log=True,
+            prefix=">>> ",
+        )
+        if model_types is None:
+            # Include all model types whose corresponding spectral windows exist
+            model_types = ModelTypes({
+                t
+                for t in ModelTypes._string_options
+                if getattr(self, t) is not None
+            })
+
+        if bg_flux is None:
+            # Include all possible model types not already in 'model_types'
+            bg_flux = BackgroundFlux({
+                t 
+                for t in BackgroundFlux._string_options 
+                if not model_types(t)
+            })
+
+        logger.debug(
+            f">>> {model_types=}, {bg_flux=}, {original=}, {data_types=}, "
+            f"{without_rejections=}, {without_absorption=}"
+        )
+        masked_coords = self.getMaskedCoords.__wrapped__(
+            self,
+            original=original,
+            mode="c",
+            data_types=data_types,
+            bg_flux=bg_flux,
+            covered=True,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=True,
+            log_valid=False,
+            shrink=shrink,
+        )
+        logger.debug(f">>> MaskedCoords: size={masked_coords.size}")
+
+        model = self.getModel.__wrapped__(self, model_types=model_types)
+        if model is None:
+            msg = "Could not retrieve any model(s)!"
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        n_free = sum(get_free_params(model).values())
+        if masked_coords.size <= n_free:
+            msg = "The problem is undervalued: "\
+                f"size={masked_coords.size}, {n_free=}"
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        return masked_coords, model
 
     def reformatFit(self):
         """
@@ -1001,52 +1305,64 @@ class Spectrum(_Spec):
     def getMask(
         self,
         *,
+        original: bool = False,
         data_types: DataTypes | None = None,
         covered: bool = True,
         without_rejections: bool = False,
         without_absorption: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-    ) -> BoolVector:
+        as_tuple: bool = False,
+    ) -> BoolVector | tuple[BoolVector, BoolVector]:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Notes
         -----
         If 'data_types' is None, the entire spectrum is considered, i.e.
         window-like objects' masks are not applied.
         """
-        mask = zeros_like(self._x, dtype=bool)
-        if (data_types is None) or (not covered):
-            mask[:] = True
-        else:
-            for d_type in filter(lambda dt: self[dt] is not None, data_types):
-                mask |= self[d_type].mask
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
+        suffix = "_original" if original else ""
 
+        primary_mask = getattr(self, "mask" + suffix).copy(order="C")
+        if not ((data_types is None) or (not covered)):
+            for d_type in data_types:
+                windows = getattr(self, d_type, None)
+                if windows is None:
+                    continue
+                primary_mask |= getattr(windows, "mask" + suffix)
+
+        secondary_mask = primary_mask.copy(order="C")
         if without_rejections:
-            mask &= invert(self._rejected_pixels)
+            secondary_mask &= invert(getattr(self, "_rejected_pixels" + suffix))
         if without_absorption:
-            mask &= invert(self._absorbed_pixels)
+            secondary_mask &= invert(getattr(self, "_absorbed_pixels" + suffix))
 
         if log_valid:
-            mask &= self._log_valid_pixels
+            secondary_mask &= getattr(self, "_log_valid_pixels" + suffix)
         elif valid:
-            mask &= self._valid_pixels
+            secondary_mask &= getattr(self, "_valid_pixels" + suffix)
 
-        return mask
+        if as_tuple:
+            return primary_mask, secondary_mask
+        return primary_mask & secondary_mask
 
     @validate_call
     def getMaskedCoords(
         self,
         *,
-        mode: Literal["r", "c"] | None = None,
+        original: bool = False,
         data_types: DataTypes | None = None,
-        bg_flux: BackgroundFlux | None = None,
         covered: bool = True,
+        mode: Literal["r", "c"] | None = None,
+        bg_flux: BackgroundFlux | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
         valid: bool = False,
         log_valid: bool = False,
+        shrink: bool | None = None,
     ) -> MaskedCoords:
         """
         Notes
@@ -1056,27 +1372,30 @@ class Spectrum(_Spec):
 
         If 'bg_flux' is None, no background flux is subtracted.
         """
-        mask = self.getMask.__wrapped__(
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
+        primary_mask, secondary_mask = self.getMask.__wrapped__(
             self,
+            original=original,
             data_types=data_types,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=valid,
             log_valid=log_valid,
+            as_tuple=True,
         )
-        match mode:
-            case "r":
-                out = ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
-            case "c":
-                out = ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
-            case None:
-                out = MaskedCoords(self, mask, bg_flux=bg_flux)
-
-        if log_valid:
-            out.ensureLogValid(inplace=True)
-
-        return out
+        return self._get_masked_coords_helper(
+            original=original,
+            mode=mode,
+            primary_mask=primary_mask,
+            secondary_mask=secondary_mask,
+            log_valid=log_valid,
+            bg_flux=bg_flux,
+            shrink=shrink,
+        )
 
     @validate_call
     def getModel(
@@ -1098,6 +1417,139 @@ class Spectrum(_Spec):
                 models.append(model)
 
         return None if len(models) == 0 else sum(models[1:], start=models[0])
+
+    @validate_call
+    def updateOriginalRejections(
+        self, 
+        coverage: Literal["partial", "full"] = "full",
+    ) -> None:
+        if self._no_original:
+            return
+        
+        _rej = interp(
+            self._x_original,
+            self._x,
+            self._rejected_pixels.astype(float64),
+            left=0.0,
+            right=0.0,
+        )
+        mask = (_rej == 1.0) if coverage == "full" else (_rej >= 0.0)
+        self.applyRejections.__wrapped__(
+            self, 
+            mask, 
+            enforce=True, 
+            original=True,
+        )
+
+    @validate_call
+    def updateOriginalAbsorption(
+        self,
+        coverage: Literal["partial", "full"] = "full",
+    ) -> None:
+        """
+        Update the '_absorbed_pixels_original' and '_p_absorbed_original' 
+        arrays based on the current '_absorbed_pixels' and '_p_absorbed' arrays.
+        If '_y_smooth' has been calculated (i.e. not all NaN), the corresponding
+        array is also updated.
+        """
+        if self._no_original:
+            return
+        
+        if isnan(self._y_smooth).all():
+            y_smooth = None
+        else:
+            y_smooth = interp(
+                self._x_original,
+                self._x,
+                self._y_smooth,
+                left=self._y_original[0],
+                right=self._y_original[-1],
+            )
+
+        _abs = interp(
+            self._x_original,
+            self._x,
+            self._absorbed_pixels.astype(float64),
+            left=0.0,
+            right=0.0,
+        )
+        mask = (_abs == 1.0) if coverage == "full" else (_abs >= 0.0)
+
+        self.applyAbsorption.__wrapped__(
+            self,
+            mask,
+            y_smooth=y_smooth,
+            enforce=True,
+            original=True,
+        )
+        self._p_absorbed_original = interp(
+            self._x_original,
+            self._x,
+            self._p_absorbed,
+            left=1.0,
+            right=1.0,
+        )
+
+    def _update_original_emission_helper(self, data_type: str) -> None:
+        model = None
+        if getattr(self, data_type) is not None:
+            model = getattr(self, data_type).getModel()
+        self._update_emission_helper(model, True, data_type)
+
+    def updateOriginalContinuumEmission(self) -> None:
+        """
+        Update the '_pl_original' array by evaluating the power law model on the 
+        '_x_original' array.
+        """
+        self._update_original_emission_helper("pl")
+
+    def updateOriginalIronEmission(self) -> None:
+        """
+        Update the '_fe_original' array by evaluating the iron emission model on 
+        the '_x_original' array.
+        """
+        self._update_original_emission_helper("fe")
+
+    def updateOriginalBalmerEmission(self) -> None:
+        """
+        Update the '_ba_original' array by evaluating the Balmer emission model 
+        on the '_x_original' array.
+        """
+        self._update_original_emission_helper("ba")
+
+    def updateOriginalHostGalaxyEmission(self) -> None:
+        """
+        Update the '_hg_original' array by evaluating the host galaxy emission 
+        model on the '_x_original' array.
+        """
+        self._update_original_emission_helper("hg")
+
+    def updateOriginalLinesEmission(self) -> None:
+        """
+        Update the '_em_original' array by evaluating the lines emission model 
+        on the '_x_original' array.
+        """
+        self._update_original_emission_helper("em")
+
+    @validate_call
+    def updateAllOriginals(
+        self, 
+        coverage: Literal["partial", "full"] = "full",
+    ) -> None:
+        if self._no_original:
+            return
+        
+        # Rejections mask
+        self.updateOriginalRejections.__wrapped__(self, coverage=coverage)
+        # Absorption mask, absorption probabilities (, and smoothed signal)
+        self.updateOriginalAbsorption.__wrapped__(self, coverage=coverage)
+
+        # Model contributions
+        self.updateOriginalContinuumEmission()
+        self.updateOriginalIronEmission()
+        self.updateOriginalBalmerEmission()
+        self.updateOriginalHostGalaxyEmission()
+        self.updateOriginalLinesEmission()
 
     @validate_call
     def adoptFit(
@@ -1161,13 +1613,18 @@ class Spectrum(_Spec):
             else:
                 n_free = sum(get_free_params(model).values())
                 sel = slice(count, count + n_free)
+
+                jac = None \
+                    if getattr(fit_info, "jac", None) is None \
+                    else fit_info.jac[sel, sel]
+
                 finfo = OptimizeResult(
                     x=fit_info.x[sel],
                     success=fit_info.success,
                     message=fit_info.message,
                     status=fit_info.status,
                     fun=fit_info.fun,
-                    jac=fit_info.jac[sel, sel],
+                    jac=jac,
                     nfev=fit_info.nfev,
                     njev=fit_info.njev,
                     nit=fit_info.get("nit", 0),
@@ -1183,109 +1640,105 @@ class Spectrum(_Spec):
                 update_emission=update_emission,
             )
 
-    def summariseContinuumFit(self) -> ContinuumFitResult:
-        try:
-            return self.continuum_windows.summariseContinuumFit()
-        except Exception as _:
+    def summariseContinuumFit(self) -> ContinuumFitResult | None:
+        if self.continuum_windows is None:
             return None
+        return self.continuum_windows.summariseContinuumFit()
 
-    @validated_apply_info_to_method(subjects=("error", "nonlinear"))
+    @validated_apply_info_to_method(subjects=("error", "nonlinear", "random"))
     def instantiateBootstrapper(
         self,
         *,
-        covered: bool = True,
+        original: bool = False,
         data_types: DataTypes | None = None,
         model_types: ModelTypes | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
+        shrink: bool | None = None,
+
         pool: Pool_ | None = None,
-        scale: Scale | None = None,
         variant: Variant | None = None,
         bootstrap_type: BootstrapType | None = None,
         n_sigmas: float | None = None,
         vary_lines: VaryLines | None = None,
         iterations: int | None = None,
-        random_state: RandomState_ | None = None,
-        renew_rng: bool | None = None,
         replace_missing: bool | None = None,
         tqdm_disable: bool | None = None,
         tqdm_leave: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
+        random_state: RandomState_ | None = None,
     ) -> BaseBootstrapper:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+
         if data_types is None:
             data_types = DataTypes({"all"})
-        if model_types is None:
-            model_types = ModelTypes({"all"})
+            covered = False
+        else:
+            covered = True
 
-        if scale == "semilocal" or scale == "local":
-            if self.em is None:
-                msg = f"Cannot perform bootstrapping on '{scale}' scale \
-                    without emission line windows!"
-                logger.warning(msg)
-                raise ValueError(msg)
+        model_types = ModelTypes({"all"}) \
+            if model_types is None \
+            else model_types.copy()
 
-            for lwindow in self.line_windows:
-                lwindow.instantiateBootstrapper.__wrapped__(
-                    lwindow,
-                    pl=self.pl.getModel(),
-                    fe=self.fe.getModel(),
-                    ba=self.ba.getModel(),
-                    model_type=model_types,
-                    without_rejections=without_rejections,
-                    without_absorption=without_absorption,
-                    pool=pool,
-                    variant=variant,
-                    bootstrap_type=bootstrap_type,
-                    n_sigmas=n_sigmas,
-                    vary_lines=vary_lines,
-                    cfit=self["pl"].summariseContinuumFit(),
-                    iterations=iterations,
-                    random_state=random_state,
-                    renew_rng=renew_rng,
-                    replace_missing=replace_missing,
-                    tqdm_disable=tqdm_disable,
-                    tqdm_leave=tqdm_leave,
-                    fitter_kwargs=fitter_kwargs,
-                    logger=logger,
-                )
+        models: dict[str, Model_] = {}
+        for m_type in tuple(model_types):
+            if getattr(self, m_type) is None:
+                model_types.remove(m_type)
+                continue
 
-        if self.bootstrapper is not None:
-            logger.debug("Existing 'bootstrapper' will be overwritten.")
+            model = getattr(self, m_type).getModel()
+            if model is None:
+                model_types.remove(m_type)
+                continue
+            models[m_type] = model
 
-        cls, args, kwargs = format_bootstrapping_kwargs_for_spectrum(
+        for d_type in tuple(data_types):
+            if getattr(self, d_type) is None:
+                data_types.remove(d_type)
+                continue
+
+        validate_model_and_data(
+            model_types=model_types,
+            data_types=data_types,
+            variant=variant,
+        )
+
+        masked_coords = self.getMaskedCoords.__wrapped__(
             self,
-            fitter_kwargs=fitter_kwargs,
+            original=original,
+            data_types=data_types,
             covered=covered,
+            mode="c",
+            bg_flux=None,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
+            valid=True,
+            log_valid=False,
+            shrink=shrink,
+        )
+        bootstrapper_cls, args, kwargs = args_and_kwargs_helper(
+            masked_coords=masked_coords,
+            info=self.info,
             variant=variant,
-            data_types=data_types,
-            model_types=model_types,
+            cfit=self.summariseContinuumFit(),
+            **models,
+            fitter_kwargs=fitter_kwargs,
+            iterations=iterations,
+            random_state=random_state,
             bootstrap_type=bootstrap_type,
             n_sigmas=n_sigmas,
             vary_lines=vary_lines,
             pool=pool,
-            iterations=iterations,
-            random_state=random_state,
-            renew_rng=renew_rng,
             replace_missing=replace_missing,
             tqdm_disable=tqdm_disable,
             tqdm_leave=tqdm_leave,
-            logger=logger,
         )
-        self.bootstrapper = cls(*args, **kwargs)
+        self.bootstrapper = bootstrapper_cls(*args, **kwargs)
         return self.bootstrapper
 
     @validated_apply_info_to_method(
         subjects=("error",), specific_kwargs={"scale"}
     )
     def runBootstrapper(self, *, scale: Scale | None = None) -> ErrorResult:
-        """
-        ** PYDANTIC VALIDATED METHOD // INFO APPLIED TO METHOD **
-        """
         if scale == "semilocal" or scale == "local":
             pass
 
@@ -1325,7 +1778,7 @@ class Spectrum(_Spec):
         """
         raise NotImplementedError
 
-    @validated_apply_info_to_method(subjects=("error",))
+    @validated_apply_info_to_method(subjects=("error", "random"))
     def instantiateNestedSampler(
         self,
         *,
@@ -1336,11 +1789,10 @@ class Spectrum(_Spec):
         without_absorption: bool = False,
         pool: Pool_ | None = None,
         iterations: int | None = None,
-        random_state: RandomState_ | None = None,
-        renew_rng: bool | None = None,
         replace_missing: bool | None = None,
         tqdm_disable: bool | None = None,
         tqdm_leave: bool | None = None,
+        random_state: RandomState_ | None = None,
     ) -> BaseNestedSampler:
         """
         ...
@@ -1360,7 +1812,6 @@ class Spectrum(_Spec):
             pool=pool,
             iterations=iterations,
             random_state=random_state,
-            renew_rng=renew_rng,
             replace_missing=replace_missing,
             tqdm_disable=tqdm_disable,
             tqdm_leave=tqdm_leave,
@@ -1404,63 +1855,85 @@ class Spectrum(_Spec):
         return self.error_result
 
     def quickplot(
+        self, 
+        lazy: bool = False, 
+        **plotter_kwargs,
+    ) -> QuickPlotter:
+        """Basic plotting routine for 'Spectrum' classes.
+
+        Creates and returns a 'QuickPlotter' instance, which is used to plot the 
+        spectrum.
+
+        Parameters
+        ----------
+        lazy : bool, optional
+            If True, returns the 'QuickPlotter' instance without plotting. If 
+            False, plots the spectrum and returns the 'QuickPlotter' instance. 
+            Default is False.
+        plotter_kwargs : dict
+            See `quasar_decrypt.plotting.basics.QuickPlotter` for details.
+
+        Returns
+        -------
+        plotter : QuickPlotter
+            The 'QuickPlotter' instance used to plot the spectrum.
+        """
+        if 'xlim' not in plotter_kwargs:
+            plotter_kwargs['xlim'] = self.x_bounds
+
+        plotter = QuickPlotter(self, **plotter_kwargs)
+        return plotter if lazy else plotter.plot()
+
+    def differenceplot(
+        self, 
+        mode: Literal['difference', 'residual'],
+        lazy: bool = False, 
+        **plotter_kwargs,
+    ) -> DifferencePlotter | ResidualPlotter:
+        """Basic plotting routine showing the data-model difference.
+
+        Parameters
+        ----------
+        lazy : bool, optional
+            If True, returns the plotter instance without plotting. If False, 
+            plots the difference and returns the plotter instance. Default is 
+            False.
+        plotter_kwargs : dict
+            See `quasar_decrypt.plotting.basics` for details.
+
+        Returns
+        -------
+        plotter : DifferencePlotter | ResidualPlotter
+            The 'DifferencePlotter' or 'ResidualPlotter' instance used to plot 
+            the data-model difference or residuals.
+        """
+        cls = DifferencePlotter if mode == "difference" else ResidualPlotter
+
+        if 'xlim' not in plotter_kwargs:
+            plotter_kwargs['xlim'] = self.x_bounds
+            
+        plotter = cls(self, **plotter_kwargs)
+        return plotter if lazy else plotter.plot()
+
+    def templatesplot(
         self,
-        *,
-        figure: tuple[Figure, Axes] | None = None,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-        n_sigma: float = 2.0,
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        pl_color: str | None = DEFAULT_COLORS["pl"],
-        fe_color: str | None = DEFAULT_COLORS["fe"],
-        ba_color: str | None = DEFAULT_COLORS["ba"],
-        hg_color: str | None = DEFAULT_COLORS["hg"],
-        em_color: str | None = DEFAULT_COLORS["em"],
-        sm_color: str | None = DEFAULT_COLORS["sm"],
-        ab_color: str | None = DEFAULT_COLORS["ab"],
-        xticks: tuple[float, float] | None = None,
-        yticks: tuple[float, float] | None = None,
-        logx: bool = False,
-        logy: bool = False,
-    ) -> tuple[Figure, Axes]:
+        mode: Literal["residual", "difference"],
+        lazy: bool = False,
+        **plotter_kwargs,
+    ) -> AllTemplatesWithDifferencesPlot | AllTemplatesWithResidualsPlot:
         """
-        Basic plotting routing for 'Spectrum' classes.
-
-        NOTES
-        -----
-        This method overwrites but still calls the inherited '_quickplot'
-        method, setting 'title' equal to 'self.title' by default.
+        ...
         """
-        xlim = xlim or self.x_bounds
-        return quickplot(
-            get_coords(self, x_bounds=xlim, replace_with_nan=False),
-            self.info,
-            figure=figure,
-            figsize=figsize,
-            dpi=dpi,
-            title=title or self.title,
-            n_sigma=n_sigma,
-            xlabel=xlabel or "auto",
-            ylabel=ylabel or "auto",
-            xlim=xlim,
-            ylim=ylim or "auto",
-            pl_color=pl_color,
-            fe_color=fe_color,
-            ba_color=ba_color,
-            hg_color=hg_color,
-            em_color=em_color,
-            sm_color=sm_color,
-            ab_color=ab_color,
-            xticks=xticks or "auto",
-            yticks=yticks or "auto",
-            logx=logx,
-            logy=logy,
-        )
+        cls = AllTemplatesWithDifferencesPlot \
+            if mode == "difference" \
+            else AllTemplatesWithResidualsPlot
 
+        if 'xlim' not in plotter_kwargs:
+            plotter_kwargs['xlim'] = self.x_bounds
+
+        plotter = cls(self.getModel(), self, **plotter_kwargs)
+        return plotter if lazy else plotter.plot()
+    
     def absorptionplot(
         self,
         *,
@@ -1527,90 +2000,4 @@ class Spectrum(_Spec):
             logx=logx,
             logy=logy,
             logp=logp,
-        )
-
-    def fitplot(
-        self,
-        *,
-        plot_components: bool = False,
-        plot_type: Literal["difference", "residual"] = "difference",
-        figure: tuple[Figure, list[Axes, Axes]] | None = None,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-        height_ratio: float = 3.0,
-        n_sigma: float = 2.0,
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-        dlabel: str | None = None,
-        zlabel: str | None = None,
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        dlim: tuple[float, float] | None = None,
-        zlim: tuple[float, float] | None = (-5, 5),
-        pl_color: str | None = DEFAULT_COLORS["pl"],
-        fe_color: str | None = DEFAULT_COLORS["fe"],
-        ba_color: str | None = DEFAULT_COLORS["ba"],
-        hg_color: str | None = DEFAULT_COLORS["hg"],
-        em_color: str | None = DEFAULT_COLORS["em"],
-        sm_color: str | None = DEFAULT_COLORS["sm"],
-        ab_color: str | None = DEFAULT_COLORS["ab"],
-        xticks: tuple[float, float] | None = None,
-        yticks: tuple[float, float] | None = None,
-        dticks: tuple[float, float] | None = None,
-        zticks: tuple[float, float] | None = None,
-        logx: bool = False,
-        logy: bool = False,
-        cmap_name: str = "tab20",
-        distinguish_narrow: bool = True,
-    ) -> tuple[Figure, list[Axes, Axes]]:
-        xlim = xlim or self.x_bounds
-        coords = get_coords(self, x_bounds=xlim, replace_with_nan=False)
-
-        kwargs = {
-            'plot_type': plot_type,
-            'figure': figure,
-            'figsize': figsize,
-            'dpi': dpi,
-            'title': title or self.title,
-            'height_ratio': height_ratio,
-            'n_sigma': n_sigma,
-            'xlabel': xlabel or "auto",
-            'ylabel': ylabel or "auto",
-            'dlabel': dlabel or "auto",
-            'zlabel': zlabel or "auto",
-            'xlim': xlim or "auto",
-            'ylim': ylim or "auto",
-            'dlim': dlim or "auto",
-            'zlim': zlim or "auto",
-            'pl_color': pl_color,
-            'fe_color': fe_color,
-            'ba_color': ba_color,
-            'hg_color': hg_color,
-            'em_color': em_color,
-            'sm_color': sm_color,
-            'ab_color': ab_color,
-            'xticks': xticks or "auto",
-            'yticks': yticks or "auto",
-            'dticks': dticks or "auto",
-            'zticks': zticks or "auto",
-            'logx': logx,
-            'logy': logy,
-            'cmap_name': cmap_name,
-            'distinguish_narrow': distinguish_narrow,
-        }
-        model = self.getModel() if plot_components else None
-        if plot_components:
-            with PrepareModel(x=coords.x, model=model):
-                return fitplot(
-                    coords,
-                    self.info,
-                    model=model,
-                    **kwargs,
-                )
-        return fitplot(
-            coords,
-            self.info,
-            model=model,
-            **kwargs,
         )

@@ -29,6 +29,8 @@ class Graph(dict[int, set[int]]):
     def __get_pydantic_core_schema__(cls, source_type, handler):
         return no_info_plain_validator_function(cls._validate)
 
+    ###
+
     def copy(self) -> Self:
         g = Graph()
         g.update(self)
@@ -47,8 +49,8 @@ class Graph(dict[int, set[int]]):
             key=lambda item: len(item[1]),
         ):
             if check and (len(dests) > 0):
-                self.is_circular = True
-                logger.warning("'Graph' is circular!")
+                self.is_circular = new_graph.is_circular = True
+                logger.info("'Graph' is circular!")
                 return new_graph
 
             new_dests = dests.copy()
@@ -71,7 +73,7 @@ class Graph(dict[int, set[int]]):
 
         if len(possible_roots) == 0:
             self.is_circular = True
-            logger.warning("'Graph' is circular!")
+            logger.info("'Graph' is circular!")
             return None, self
 
         root = min(possible_roots)
@@ -92,5 +94,8 @@ class Graph(dict[int, set[int]]):
 
             if len(graph) == 0:
                 break
+
+        if None in chain:
+            return list(range(len(self)))
 
         return chain

@@ -1,13 +1,17 @@
 __all__ = [
-    "create_cached_get_mask",
+    "CachedGetMask",
     "get_log",
     "get_mask",
 ]
 
-from functools import lru_cache
+from typing import Any
 
+from cachetools import LRUCache
 from numpy import full_like, isfinite, log, nan, ndarray, zeros_like
+from pydantic.dataclasses import dataclass
+from quasar_typing.cachetools import LRUCache_
 from quasar_typing.numpy import BoolVector, FloatVector
+from quasar_utils.decorators import validate_call
 
 
 def get_mask(
@@ -29,13 +33,33 @@ def get_mask(
     return mask
 
 
-def create_cached_get_mask(arr: FloatVector, maxsize: int | None = 1):
-    @lru_cache(maxsize=maxsize)
-    def cached_get_mask(lb: float, ub: float) -> BoolVector:
-        nonlocal arr
-        return get_mask(arr, lb, ub)
+@dataclass
+class CachedGetMask:
+    arr: FloatVector
+    cache: LRUCache_
 
-    return cached_get_mask
+    @classmethod
+    @validate_call
+    def create(cls, arr: FloatVector, maxsize: int = 1):
+        arr = arr.copy(order="C")
+        arr.setflags(write=False)
+        return cls(arr, LRUCache(maxsize))
+    
+    def __call__(self, lb: float, ub: float) -> BoolVector:
+        key = (lb, ub)
+        if key not in self.cache:
+            self.cache[key] = get_mask(self.arr, lb, ub)
+        return self.cache[key]
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "arr": self.arr,
+            "cache": self.cache,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.arr = state["arr"]
+        self.cache = state["cache"]
 
 
 def get_log(

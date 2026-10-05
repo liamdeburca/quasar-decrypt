@@ -3,14 +3,15 @@ from dataclasses import dataclass, field
 from itertools import repeat
 from logging import getLogger
 from pathlib import Path
-from typing import ClassVar, Literal, Optional, Self, Union
+from typing import Any, ClassVar, Literal, Optional, Self, Union
 
 from numpy import isfinite
 from pydantic import ValidationError
 from quasar_errors.model_samples import IronSampleList
 from quasar_models.iron import IronModel, IronTemplate
 from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.utils.astropy import apply_bounds, get_free_params
+from quasar_models.modeling.utils import LinearTie
+from quasar_models.utils.astropy import get_free_params
 from quasar_typing.astropy import CompoundModel_, FitInfo
 from quasar_typing.bounds import AstropyBounds, CoordBounds
 from quasar_typing.misc import BackgroundFlux
@@ -23,7 +24,17 @@ from quasar_utils.decorators import (
 from quasar_utils.setup import FitterKwargs
 from scipy.ndimage import binary_fill_holes
 
-from ..utils import _SpecWindowList, stopwatch
+from ..plotting.windows_and_templates_plots import (
+    IronTemplatesWithDifferencesPlot,
+    IronTemplatesWithResidualsPlot,
+    IronWindowsAndTemplatesWithDifferencesPlot,
+    IronWindowsAndTemplatesWithResidualsPlot,
+)
+from ..plotting.windows_plots import (
+    IronWindowsPlotWithDifferences,
+    IronWindowsPlotWithResiduals,
+)
+from ..utils import _SpecWindowList
 from .iwindow import IWindow
 
 logger = getLogger(__name__)
@@ -45,6 +56,19 @@ class IronWindows(_SpecWindowList[IWindow]):
     )
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "fe"})
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["templates"] = self.templates
+        state["template_models"] = self.template_models
+        state["fit_info"] = self.fit_info
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self.templates = state.get("templates", {})
+        self.template_models = state.get("template_models", {})
+        self.fit_info = state.get("fit_info", None)
 
     @property
     def sample(self) -> IronSampleList | None:
@@ -76,10 +100,12 @@ class IronWindows(_SpecWindowList[IWindow]):
     def __call__(
         self,
         *,
+        original: bool = False,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
         template_model: Union[IronModel, CompoundModel_[IronModel], None] = None,
         bg_flux: BackgroundFlux | None = None,
-        without_rejections: bool = True,
-        without_absorption: bool = True,
+        shrink: float | None = None,
         template_files: list[AbsoluteFITSPath | str] | None = None,
         resample: bool | None = None,
         split: FloatVector | None = None,
@@ -87,6 +113,7 @@ class IronWindows(_SpecWindowList[IWindow]):
         bias: list[Literal["left", "right"]] | None = None,
         ratio: FloatVector | None = None,
         scale: float | None = None,
+        tie_similar: bool | None = None,
         raster: bool | None = None,
         allow_interp_fitting: bool | None = None,
         flux_bounds: AstropyBounds | None = None,
@@ -94,9 +121,6 @@ class IronWindows(_SpecWindowList[IWindow]):
         fine_tune: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -128,6 +152,9 @@ class IronWindows(_SpecWindowList[IWindow]):
                 flux_bounds=flux_bounds,
                 fwhm_bounds=fwhm_bounds,
             )
+            if tie_similar:
+                self.tieSimilarModels()
+
             if raster:
                 self.getRasterFit.__wrapped__(
                     self,
@@ -136,13 +163,16 @@ class IronWindows(_SpecWindowList[IWindow]):
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
                 )
+
             if fine_tune:
                 self.performFineTuning.__wrapped__(
                     self,
+                    original=original,
                     bg_flux=bg_flux,
                     covered=not self.is_empty,
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
+                    shrink=shrink,
                     fitter_kwargs=fitter_kwargs,
                 )
 
@@ -161,6 +191,9 @@ class IronWindows(_SpecWindowList[IWindow]):
         scale: float | None = None,
         flux_bounds: AstropyBounds | None = None,
         fwhm_bounds: AstropyBounds | None = None,
+        split_bounds: AstropyBounds | None = None,
+        left_bounds: AstropyBounds | None = None,
+        right_bounds: AstropyBounds | None = None,
         allow_interp_fitting: bool | None = None,
     ) -> Self:
         """
@@ -198,11 +231,10 @@ class IronWindows(_SpecWindowList[IWindow]):
         mask = isfinite(self._x)
 
         if self.is_empty:
-            msg = (
+            logger.debug(
                 "IronWindows is empty: using entire wavelength array to "
                 "check coverages of IronTemplates."
             )
-            logger.debug(msg)
         else:
             mask &= self.mask
 
@@ -218,73 +250,43 @@ class IronWindows(_SpecWindowList[IWindow]):
             bias,
             ratio,
         ):
-            try:
-                template = IronTemplate.load_from_cache(
-                    name=template_file,
-                    info=self.info,
-                ).copy(with_matrices=True)
-            except FileNotFoundError:
-                msg = (
-                    f"Could not find template file '{template_file}' -> "
-                    "Skipping."
-                )
-                logger.info(msg)
-                continue
+            logger.debug(f"Loading IronTemplate from file: {template_file!s}")
+            template = IronTemplate.load_from_cache(
+                name=template_file,
+                info=self.info,
+            ).copy(with_matrices=True)
+            logger.debug(f">>> Template name: {template.name}")
 
             # Check template-coverage
             tx = template.x[binary_fill_holes(template.data[0] > 0)]
+            template_lb = tx[0]
+            template_ub = tx[-1]
+            logger.debug(
+                f">>> Template bounds: "
+                f"lb={template_lb:.1f}, ub={template_ub:.1f}"
+            )
 
-            add_template: bool = False
-            if self.is_empty:
-                add_template = not (x[-1] < tx[0] or tx[-1] < x[0])
-            else:
-                for iwindow in self:
-                    lb, ub = iwindow.x_bounds
-                    add_template = not (ub < tx[0] or tx[-1] < lb)
-                    if add_template or tx[-1] < lb:
-                        break
-
-            if not add_template:
-                if tx[-1] < x[0]:
-                    msg = (
-                        f"IronTemplate @ {template_file} is entirely "
-                        "bluewards of the spectrum! Skipping."
-                    )
-                elif x[-1] < tx[0]:
-                    msg = (
-                        f"IronTemplate @ {template_file} is entirely "
-                        "redwards of the spectrum! Skipping."
-                    )
-                else:
-                    msg = (
-                        f"IronTemplate @ {template_file} does not cover any "
-                        "of the iron windows! Skipping."
-                    )
-
-                logger.debug(msg)
+            lb = x[0]
+            ub = x[-1]
+            if (ub <= template_lb):
+                logger.debug(
+                    ">>> IronTemplate is entirely redwards of the spectrum: "
+                    f"{ub=:.1f} <= {template_lb=:.1f}."
+                )
+                continue
+            elif (template_ub <= lb):
+                logger.debug(
+                    ">>> IronTemplate is entirely bluewards of the spectrum: "
+                    f"{template_ub=:.1f} <= {lb=:.1f}."
+                )
                 continue
 
-            # Transform template if necessary
-            if template.is_logspace:
-                msg = (
-                    f"IronTemplate @ {template_file} is already in logspace!"
-                    "Using template as is."
-                )
-                logger.debug(msg)
-
+            logger.debug(
+                f">>> IronTemplate ({template.name}) covers the spectrum: "
+                f"({lb=:.1f}, {ub=:.1f})."
+            )
             if not template.is_logspace:
-                msg = (
-                    f"IronTemplate @ {template_file} is not in logspace! "
-                    "Creating logspace-equivalent version."
-                )
-                logger.debug(msg)
-
-                msg = (
-                    f"IronTemplate @ {template_file} will be transformed to "
-                    "logspace, which may be inefficient for pipelines. "
-                    "Consider caching a logspace-equivalent of this IronTemplate."
-                )
-                logger.info(msg)
+                logger.debug(">>> Transforming to logspace!")
 
                 tx_wide = template.x[binary_fill_holes(template.data[-1] > 0)]
                 mask = (
@@ -295,7 +297,6 @@ class IronWindows(_SpecWindowList[IWindow]):
 
                 template = template.createLogspace(
                     sigma_res=self.info.loading.sigma_res,
-                    xr=self._x[mask],
                     keep_x=True,
                 )
 
@@ -304,8 +305,9 @@ class IronWindows(_SpecWindowList[IWindow]):
                 template.resample(fwhm, inplace=True)
 
             if template.x[0] < s < template.x[-1]:
-                msg = f"Applying split to IronTemplate @ {template_file}: split={s:.1f}, bias={b}, ratio={r:.2f}."
-                logger.debug(msg)
+                logger.debug(
+                    f">>> Applying split: split={s:.1f}, bias={b}, ratio={r:.2f}."
+                )
 
                 template.applySplit(
                     split=s,
@@ -318,21 +320,56 @@ class IronWindows(_SpecWindowList[IWindow]):
             self.templates[template.name] = template
 
             model = IronModel.create(
-                apply_bounds.__wrapped__(1.0, flux_bounds),
-                apply_bounds.__wrapped__(template.fwhm[0], fwhm_bounds),
+                1.0, template.fwhm[0], #? Values are automatically adapted to bounds
                 scale=self.info.iron.scale,
                 template=template,
                 split=s,
                 left=1.0,
                 right=1.0,
                 allow_interp_fitting=allow_interp_fitting,
+                flux_bounds=flux_bounds,
+                fwhm_bounds=fwhm_bounds,
+                split_bounds=split_bounds,
+                left_bounds=left_bounds,
+                right_bounds=right_bounds,
             )
-            model.flux.bounds = flux_bounds
-            model.fwhm.bounds = fwhm_bounds
-
             self.template_models[model.name] = model
 
         return self
+
+    def tieSimilarModels(self) -> None:
+        """
+        Tie the `fwhm` parameters of `IronModel` instances whose templates' 
+        names are similar, i.e. they share the same prefix (`_` as a separator).
+        """
+        from collections import Counter
+
+        # Get prefixes for models w/o fixed fwhm parameters
+        prefix_counts = Counter(
+            name.split("_")[0]
+            for name, model in self.template_models.items()
+            if not model.fwhm.fixed
+        )
+        for prefix in filter(
+            lambda p: prefix_counts[p] > 1,
+            prefix_counts.keys()
+        ):
+            models: list[IronModel] = sorted(
+                (
+                    model
+                    for name, model in self.template_models.items()
+                    if name.startswith(prefix) and not model.fwhm.fixed
+                ),
+                key=lambda m: m.sorting_key,
+            )
+            assert len(models) == prefix_counts[prefix]
+
+            master_model = models.pop(0)
+            for model in models:
+                model.fwhm.tied = LinearTie(
+                    a=1.0, b=0.0,
+                    model_name=master_model.name, parameter_name="fwhm",
+                )
 
     @validated_apply_info_to_method(subjects=("iron",))
     def getRasterFit(
@@ -356,6 +393,7 @@ class IronWindows(_SpecWindowList[IWindow]):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=False,
             mode="c",  # c: contiguous
             covered=covered,
             without_rejections=without_rejections,
@@ -363,6 +401,7 @@ class IronWindows(_SpecWindowList[IWindow]):
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
+            shrink=None,
         )
 
         n_pix = masked_coords.size
@@ -374,7 +413,13 @@ class IronWindows(_SpecWindowList[IWindow]):
             logger.info(msg)
             return self
 
-        for model in self.template_models.values():
+        for model in (
+            model
+            for model in self.template_models.values()
+            if not model.fwhm.tied
+        ):
+            # Only fit models whose FWHM is not tied, as would be the case if 
+            # `tieSimilarModels` had been called
             model.rasterFit.__wrapped__(
                 model,
                 masked_coords.x,
@@ -382,7 +427,7 @@ class IronWindows(_SpecWindowList[IWindow]):
                 masked_coords.dy,
                 inplace=True,
             )
-
+                
         self.updateIronEmission.__wrapped__(self, self.getModel())
         return self
 
@@ -444,28 +489,37 @@ class IronWindows(_SpecWindowList[IWindow]):
     def performFineTuning(
         self,
         *,
+        original: bool = False,
         covered: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
         bg_flux: BackgroundFlux | None = None,
+        shrink: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> Self:
         """
         Fits the available templates using a nonlinear optimiser.
         """
-        s = self.__str__(simple=True).removesuffix(".")
-        msg = f"Performing fine-tuning on {s}: "
+        logger.debug("Performing fine tuning:")
+
+        original = self._update_original_flag(
+            original=original,
+            log=True,
+            prefix=">>> ",
+        )
 
         if bg_flux is None:
             bg_flux = self.default_bg
 
         if covered and self.is_empty:
-            msg += f"setting {covered=} to False due to missing iron windows, "
-            logger.info(msg)
+            logger.debug(
+                ">>> Setting `covered` to False due to missing iron windows."
+            )
             covered = False
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=original,
             mode="c",  # c: contiguous
             covered=covered,
             without_rejections=without_rejections,
@@ -473,56 +527,113 @@ class IronWindows(_SpecWindowList[IWindow]):
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
+            shrink=shrink,
         )
 
         model = self.getModel()
         if model is None:
-            msg += "tried to fine-tune IronModels, but none are available!"
-            logger.critical(msg)
-            return self
+            msg = "No IronModels available!"
+            logger.critical(">>> " + msg)
+            raise ValueError(msg)
 
         n_pix = masked_coords.size
         n_free_params = sum(get_free_params(model).values())
 
         if n_pix <= n_free_params:
-            msg += (
-                f"cancelling fine-tuning due to insufficient no. of data "
-                f"points (n_pix={n_pix} <= n_free_params={n_free_params})!"
-            )
-            logger.info(msg)
-            return self
+            msg = "Cancelling fine-tuning due to insufficient number of data "\
+                f"points: {n_pix=} <= {n_free_params=}"
+            logger.critical(">>> " + msg)
+            raise ValueError(msg)
 
         try:
-            with (
-                stopwatch() as watch,
-                PrepareModel(x=masked_coords.x, model=model, copy=True),
-            ):
+            preparer = PrepareModel.fromCoords(masked_coords, model)
+            data = preparer.createDataDict(masked_coords)
+
+            with preparer as (seq_model, where):
                 fitter = Fitter()
                 fit = fitter(
-                    model,
-                    masked_coords.x,
-                    masked_coords.y,
-                    dy=masked_coords.dy,
+                    seq_model,
+                    data["x"],
+                    data["y"],
+                    dy=data["dy"],
+                    where=where,
                     get_model=True,
                     inplace=False,
                     **fitter_kwargs,
                 )
+                fit_info = fitter.fit_info
 
-            msg += f"Successfully performed fine-tuning in {1e3 * watch.elapsed:.1f} ms."
-            logger.debug(msg)
+            logger.debug(">>> Successfully fitted model!")
         except ValidationError as e:
-            msg += f"failed fitting due to a validation error: {e}"
-            logger.warning(msg)
-            return self
-        except Exception as e:
-            msg += f"failed fitting due to an unexpected error: {e}"
-            logger.warning(msg)
+            logger.critical(
+                f">>> Failed fitting model due to validation error: {e}"
+            )
             return self
 
         self.applyFit.__wrapped__(
             self,
             fit,
-            fit_info=fitter.fit_info,
+            fit_info=fit_info,
             update_emission=True,
         )
         return self
+
+    def windowsplot(
+        self,
+        mode: Literal["residual", "difference"],
+        lazy: bool = False,
+        **plotter_kwargs,
+    ) -> IronWindowsPlotWithResiduals | IronWindowsPlotWithDifferences:
+        """
+        ...
+        """
+        args = (self.getModel(), self.window_bounds, self.spectrum)
+        cls = IronWindowsPlotWithResiduals \
+            if mode == "residual" \
+            else IronWindowsPlotWithDifferences
+
+        if 'title_prefix' not in plotter_kwargs:
+            plotter_kwargs['title_prefix'] = "IronWindows of: "
+        if 'title' not in plotter_kwargs:
+            plotter_kwargs['title'] = self.spectrum.title
+        if 'xlim' not in plotter_kwargs:
+            plotter_kwargs['xlim'] = self.spectrum.x_bounds
+
+        plotter = cls(*args, **plotter_kwargs)
+        return plotter if lazy else plotter.plot() 
+
+    def templatesplot(
+        self,
+        mode: Literal["residual", "difference"],
+        with_windows: bool = True,
+        lazy: bool = False,
+        **plotter_kwargs,
+    ) -> Union[
+        IronWindowsAndTemplatesWithResidualsPlot,
+        IronWindowsAndTemplatesWithDifferencesPlot,
+        IronTemplatesWithResidualsPlot,
+        IronTemplatesWithDifferencesPlot,
+    ]:
+        """
+        ...
+        """
+        if with_windows:
+            args = (self.getModel(), self.window_bounds, self.spectrum)
+            cls = IronWindowsAndTemplatesWithResidualsPlot \
+                if mode == "residual" \
+                else IronWindowsAndTemplatesWithDifferencesPlot
+        else:
+            args = (self.getModel(), self.spectrum)
+            cls = IronTemplatesWithResidualsPlot \
+                if mode == "residual" \
+                else IronTemplatesWithDifferencesPlot
+
+        if 'title_prefix' not in plotter_kwargs:
+            plotter_kwargs['title_prefix'] = "IronTemplates/Windows of: "
+        if 'title' not in plotter_kwargs:
+            plotter_kwargs['title'] = self.spectrum.title
+        if 'xlim' not in plotter_kwargs:
+            plotter_kwargs['xlim'] = self.spectrum.x_bounds
+
+        plotter = cls(*args, **plotter_kwargs)
+        return plotter if lazy else plotter.plot()

@@ -1,7 +1,6 @@
 __all__ = ["_BaseSpec"]
 
 from abc import abstractmethod
-from collections.abc import Callable
 from dataclasses import field
 from logging import getLogger
 from typing import Any, Literal, Optional, Self, Union
@@ -19,14 +18,20 @@ from quasar_models.modeling import PrepareModel
 from quasar_typing.astropy import CompoundModel_
 from quasar_typing.bounds import CoordBounds
 from quasar_typing.misc import BackgroundFlux
-from quasar_typing.numpy import BoolVector, FloatVector
+from quasar_typing.numpy import BoolVector, FloatMatrix, FloatVector
+from quasar_typing.scipy import csr_matrix_
 from quasar_utils.decorators import validate_call
+from quasar_utils.resolving import mask_kernels
 
 from .masked_coords import (
     ContiguousMaskedCoords,
     MaskedCoords,
+    OriginalContiguousMaskedCoords,
+    OriginalMaskedCoords,
+    OriginalReadOnlyMaskedCoords,
     ReadOnlyMaskedCoords,
 )
+from .utils import CachedGetMask
 
 logger = getLogger(__name__)
 
@@ -39,15 +44,18 @@ class _BaseSpec:
     Stores very basic attributes and essential methods. 
     """
     x_bounds: CoordBounds = field(kw_only=True)
-    get_mask: Callable[[float, float], BoolVector] | None = field(kw_only=True)
+    get_mask: CachedGetMask = field(kw_only=True)           # Not pickled
+    get_mask_original: CachedGetMask = field(kw_only=True)  # Not pickled
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("get_mask", None)
+        state.pop("get_mask_original", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
+        self.x_bounds = state["x_bounds"]
+        self._no_original = state["_no_original"]
 
     def __str__(self, simple: bool = False) -> str:
         s = f"<{self.__class__.__name__} object at {hex(id(self))}> "
@@ -66,68 +74,253 @@ class _BaseSpec:
     def create(cls, *args, **kwargs) -> Self:
         pass
 
+    # Mask covering the 'x_bounds' of the spectrum
+
     @property
     def mask(self) -> BoolVector:
         return self.get_mask(*self.x_bounds)
+
+    @property
+    def mask_original(self) -> BoolVector:
+        return self.get_mask_original(*self.x_bounds)
+
+    # The size (no. of pixels) of the mask -- cannot be modified directly
 
     @property
     def size(self) -> int:
         return self.mask.astype(int).sum()
 
     @property
+    def size_original(self) -> int:
+        return self.mask_original.astype(int).sum()
+
+    # The masked wavelength array
+
+    @property
     def x(self) -> FloatVector:
+        """Masked vector of rest wavelength values."""
         return self._x[self.mask]
 
     @property
+    def x_original(self) -> FloatVector:
+        """Original, masked vector of rest wavelength values."""
+        return self._x_original[self.mask_original]
+
+    # The masked flux density array
+
+    @property
     def y(self) -> FloatVector:
+        """Masked vector of flux density values."""
         return self._y[self.mask]
 
     @property
+    def y_original(self) -> FloatVector:
+        """Original, masked vector of flux density values."""
+        return self._y_original[self.mask_original]
+
+    # The masked flux density uncertainty array
+
+    @property
     def dy(self) -> FloatVector:
+        """Masked vector of flux density uncertainty values."""
         return self._dy[self.mask]
 
     @property
+    def dy_original(self) -> FloatVector:
+        """Original, masked vector of flux density uncertainty values."""
+        return self._dy_original[self.mask_original]
+
+    # The masked wavelength bin size array
+
+    @property
     def dx(self) -> FloatVector:
+        """Masked vector of wavelength bin size values."""
         return self._dx[self.mask]
 
     @property
+    def dx_original(self) -> FloatVector:
+        """Original, masked vector of wavelength bin size values."""
+        return self._dx_original[self.mask_original]
+
+    # The matrix of resolution kernels (corrects for instrumental broadening)
+
+    @property
+    def kernels(self) -> FloatMatrix | csr_matrix_:
+        """Masked matrix of resolution kernels."""
+        return mask_kernels(
+            self._kernels,
+            self.mask,
+        )
+
+    @property
+    def kernels_original(self) -> FloatMatrix | csr_matrix_:
+        """Masked matrix of original resolution kernels."""
+        return mask_kernels(
+            self._kernels_original,
+            self.mask_original,
+        )
+
+    # The masked log-wavelength array
+
+    @property
     def x_log(self) -> FloatVector:
+        """Masked vector of log-wavelength values."""
         return self._x_log[self.mask]
 
     @property
+    def x_log_original(self) -> FloatVector:
+        """Original, masked vector of log-wavelength values."""
+        return self._x_log_original[self.mask_original]
+
+    # The masked log-flux density array
+
+    @property
     def y_log(self) -> FloatVector:
+        """Masked vector of log-flux density values."""
         return self._y_log[self.mask]
 
     @property
+    def y_log_original(self) -> FloatVector:
+        """Original, masked vector of log-flux density values."""
+        return self._y_log_original[self.mask_original]
+
+    # The masked log-flux density uncertainty array
+
+    @property
     def dy_log(self) -> FloatVector:
+        """Masked vector of log-flux density uncertainty values."""
         return self._dy_log[self.mask]
 
     @property
+    def dy_log_original(self) -> FloatVector:
+        """Original, masked vector of log-flux density uncertainty values."""
+        return self._dy_log_original[self.mask_original]
+
+    # The masked smoothed flux density array -- can only be modified inplace
+
+    @property
     def y_smooth(self) -> FloatVector:
+        """Masked vector of smoothed flux density values."""
         return self._y_smooth[self.mask]
+
+    @y_smooth.setter
+    def y_smooth(self, value: FloatVector) -> None:
+        self._y_smooth[self.mask] = value
+
+    @property
+    def y_smooth_original(self) -> FloatVector:
+        """Original, masked vector of smoothed flux density values."""
+        return self._y_smooth_original[self.mask_original]
+
+    @y_smooth_original.setter
+    def y_smooth_original(self, value: FloatVector) -> None:
+        self._y_smooth_original[self.mask_original] = value
+
+    # The masked continuum flux density array -- can only be modified inplace
 
     @property
     def y_pl(self) -> FloatVector:
+        """Masked vector of power law continuum flux density values."""
         return self._y_pl[self.mask]
+
+    @y_pl.setter
+    def y_pl(self, value: FloatVector) -> None:
+        self._y_pl[self.mask] = value
+
+    @property
+    def y_pl_original(self) -> FloatVector:
+        """Original, masked vector of power law continuum flux density values."""
+        return self._y_pl_original[self.mask_original]
+
+    @y_pl_original.setter
+    def y_pl_original(self, value: FloatVector) -> None:
+        self._y_pl_original[self.mask_original] = value
+
+    # The masked iron flux density array -- can only be modified inplace
 
     @property
     def y_fe(self) -> FloatVector:
+        """Masked vector of iron pseudo-continuum flux density values."""
         return self._y_fe[self.mask]
+
+    @y_fe.setter
+    def y_fe(self, value: FloatVector) -> None:
+        self._y_fe[self.mask] = value
+
+    @property
+    def y_fe_original(self) -> FloatVector:
+        """Original, masked vector of iron pseudo-continuum flux density values."""
+        return self._y_fe_original[self.mask_original]
+
+    @y_fe_original.setter
+    def y_fe_original(self, value: FloatVector) -> None:
+        self._y_fe_original[self.mask_original] = value
+
+    # The masked Balmer flux density array -- can only be modified inplace
 
     @property
     def y_ba(self) -> FloatVector:
+        """Masked vector of Balmer pseudo-continuum flux density values."""
         return self._y_ba[self.mask]
+
+    @y_ba.setter
+    def y_ba(self, value: FloatVector) -> None:
+        self._y_ba[self.mask] = value
+
+    @property
+    def y_ba_original(self) -> FloatVector:
+        """Original, masked vector of Balmer pseudo-continuum flux density values."""
+        return self._y_ba_original[self.mask_original]
+
+    @y_ba_original.setter
+    def y_ba_original(self, value: FloatVector) -> None:
+        self._y_ba_original[self.mask_original] = value
+
+    # The masked host galaxy flux density array -- can only be modified inplace
 
     @property
     def y_hg(self) -> FloatVector:
+        """Masked vector of host galaxy flux density values."""
         return self._y_hg[self.mask]
+
+    @y_hg.setter
+    def y_hg(self, value: FloatVector) -> None:
+        self._y_hg[self.mask] = value
+
+    @property
+    def y_hg_original(self) -> FloatVector:
+        """Original, masked vector of host galaxy flux density values."""
+        return self._y_hg_original[self.mask_original]
+
+    @y_hg_original.setter
+    def y_hg_original(self, value: FloatVector) -> None:
+        self._y_hg_original[self.mask_original] = value
+
+    # The masked emission lines flux density array -- can only be modified inplace
 
     @property
     def y_em(self) -> FloatVector:
+        """Masked vector of emission line flux density values."""
         return self._y_em[self.mask]
+
+    @y_em.setter
+    def y_em(self, value: FloatVector) -> None:
+        self._y_em[self.mask] = value
+
+    @property
+    def y_em_original(self) -> FloatVector:
+        """Original, masked vector of emission line flux density values."""
+        return self._y_em_original[self.mask_original]
+
+    @y_em_original.setter
+    def y_em_original(self, value: FloatVector) -> None:
+        self._y_em_original[self.mask_original] = value
+
+    # The masked boolean mask of rejected pixels -- can only be modified inplace -- deleting resets the mask
 
     @property
     def rejected_pixels(self) -> BoolVector:
+        """Masked boolean mask of rejected pixels."""
         return self._rejected_pixels[self.mask]
 
     @rejected_pixels.setter
@@ -139,7 +332,23 @@ class _BaseSpec:
         self.resetRejections()
 
     @property
+    def rejected_pixels_original(self) -> BoolVector:
+        """Original, masked boolean mask of rejected pixels."""
+        return self._rejected_pixels_original[self.mask_original]
+
+    @rejected_pixels_original.setter
+    def rejected_pixels_original(self, value: BoolVector) -> None:
+        self._rejected_pixels_original[self.mask_original] = value
+
+    @rejected_pixels_original.deleter
+    def rejected_pixels_original(self) -> None:
+        self.resetRejections()
+
+    # The masked boolean mask of absorbed pixels -- can only be modified inplace -- deleting resets the mask
+
+    @property
     def absorbed_pixels(self) -> BoolVector:
+        """Masked boolean mask of absorbed pixels."""
         return self._absorbed_pixels[self.mask]
 
     @absorbed_pixels.setter
@@ -151,63 +360,229 @@ class _BaseSpec:
         self.resetAbsorption()
 
     @property
+    def absorbed_pixels_original(self) -> BoolVector:
+        """Original, masked boolean mask of absorbed pixels."""
+        return self._absorbed_pixels_original[self.mask_original]
+
+    @absorbed_pixels_original.setter
+    def absorbed_pixels_original(self, value: BoolVector) -> None:
+        self._absorbed_pixels_original[self.mask_original] = value
+
+    @absorbed_pixels_original.deleter
+    def absorbed_pixels_original(self) -> None:
+        self.resetAbsorption()
+
+    # The masked boolean mask of valid pixels -- can only be modified inplace
+
+    @property
     def valid_pixels(self) -> BoolVector:
+        """Masked boolean mask of valid pixels."""
         return self._valid_pixels[self.mask]
+
+    @valid_pixels.setter
+    def valid_pixels(self, value: BoolVector) -> None:
+        self._valid_pixels[self.mask] = value
+
+    @property
+    def valid_pixels_original(self) -> BoolVector:
+        """Original, masked boolean mask of valid pixels."""
+        return self._valid_pixels_original[self.mask_original]
+
+    @valid_pixels_original.setter
+    def valid_pixels_original(self, value: BoolVector) -> None:
+        self._valid_pixels_original[self.mask_original] = value
+
+    # The masked boolean mask of valid pixels in log-space -- can only be modified inplace
 
     @property
     def log_valid_pixels(self) -> BoolVector:
+        """Masked boolean mask of valid pixels in log-space."""
         return self._log_valid_pixels[self.mask]
+
+    @log_valid_pixels.setter
+    def log_valid_pixels(self, value: BoolVector) -> None:
+        self._log_valid_pixels[self.mask] = value
+
+    @property
+    def log_valid_pixels_original(self) -> BoolVector:
+        """Original, masked boolean mask of valid pixels in log-space."""
+        return self._log_valid_pixels_original[self.mask_original]
+
+    @log_valid_pixels_original.setter
+    def log_valid_pixels_original(self, value: BoolVector) -> None:
+        self._log_valid_pixels_original[self.mask_original] = value
+
+    # The masked absorbed pixel p-values -- can only be modified inplace
 
     @property
     def p_absorbed(self) -> FloatVector:
+        """Masked vector of absorbed pixel p-values."""
         return self._p_absorbed[self.mask]
+
+    @p_absorbed.setter
+    def p_absorbed(self, value: FloatVector) -> None:
+        self._p_absorbed[self.mask] = value
+
+    @property
+    def p_absorbed_original(self) -> FloatVector:
+        """Original, masked vector of absorbed pixel p-values."""
+        return self._p_absorbed_original[self.mask_original]
+
+    @p_absorbed_original.setter
+    def p_absorbed_original(self, value: FloatVector) -> None:
+        self._p_absorbed_original[self.mask_original] = value
+
+    # The number of rejected pixels in the mask -- cannot be modified directly
 
     @property
     def n_rej(self) -> int:
+        """Number of rejected pixels in the mask."""
         return self.rejected_pixels.sum()
 
     @property
+    def n_rej_original(self) -> int:
+        """Number of rejected pixels (original) in the mask."""
+        return self.rejected_pixels_original.sum()
+
+    # The number of absorbed pixels in the mask -- cannot be modified directly
+
+    @property
     def n_abs(self) -> int:
+        """Number of absorbed pixels in the mask."""
         return self.absorbed_pixels.sum()
 
     @property
+    def n_abs_original(self) -> int:
+        """Number of absorbed pixels (original) in the mask."""
+        return self.absorbed_pixels_original.sum()
+
+    # The number of valid pixels in the mask -- cannot be modified directly
+
+    @property
     def n_val(self) -> int:
+        """Number of valid pixels in the mask."""
         return self.valid_pixels.sum()
 
     @property
+    def n_val_original(self) -> int:
+        """Number of valid pixels (original) in the mask."""
+        return self.valid_pixels_original.sum()
+
+    # The number of valid pixels in log-space in the mask -- cannot be modified directly
+
+    @property
     def n_logval(self) -> int:
+        """Number of valid pixels in log-space in the mask."""
         return self.log_valid_pixels.sum()
+
+    @property
+    def n_logval_original(self) -> int:
+        """Number of valid pixels (original) in log-space in the mask."""
+        return self.log_valid_pixels_original.sum()
+
+    def _update_original_flag(
+        self, 
+        original: bool, 
+        log: bool,
+        prefix: str = "",
+        suffix: str = "",
+    ) -> bool:
+        if original and self._no_original:
+            if log:
+                msg = "Original data is not available -> "\
+                    "setting `original` to False."
+                logger.debug(prefix + msg + suffix)
+            return False
+        return bool(original)
 
     @validate_call
     def getMask(
         self,
         *,
+        original: bool = False,
         covered: bool = True,
         without_rejections: bool = False,
         without_absorption: bool = False,
         valid: bool = False,
         log_valid: bool = False,
-    ) -> BoolVector:
-        mask = self.mask.copy(order="C")
-
+        as_tuple: bool = False,
+    ) -> BoolVector | tuple[BoolVector, BoolVector]:
+        """
+        Get the total mask for the current object, corresponding to the window 
+        mask with additional filtering options.
+        """
+        original = self._update_original_flag(
+            original=original,
+            log=True,
+        )
+        suffix = "_original" if original else ""
+        
+        primary_mask = getattr(self, "mask" + suffix).copy(order="C")
         if not covered:
-            mask[:] = True
+            primary_mask[:] = True
+    
+        secondary_mask = primary_mask.copy(order="C")
         if without_rejections:
-            mask &= invert(self._rejected_pixels)
+            secondary_mask &= invert(getattr(self, "_rejected_pixels" + suffix))
         if without_absorption:
-            mask &= invert(self._absorbed_pixels)
+            secondary_mask &= invert(getattr(self, "_absorbed_pixels" + suffix))
 
         if log_valid:
-            mask &= self._log_valid_pixels
+            secondary_mask &= getattr(self, "_log_valid_pixels" + suffix)
         elif valid:
-            mask &= self._valid_pixels
+            secondary_mask &= getattr(self, "_valid_pixels" + suffix)
 
-        return mask
+        if as_tuple:
+            return primary_mask, secondary_mask
+        return primary_mask & secondary_mask
+
+    def _get_masked_coords_helper(
+        self,
+        *,
+        original: bool,
+        mode: Literal["r", "c"] | None,
+        primary_mask: BoolVector,
+        secondary_mask: BoolVector,
+        log_valid: bool,
+        bg_flux: BackgroundFlux | None,
+        shrink: bool | None,
+    ) -> MaskedCoords:
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
+        match original, mode:
+            case True, "r":
+                cls = OriginalReadOnlyMaskedCoords
+            case True, "c":
+                cls = OriginalContiguousMaskedCoords
+            case True, _:
+                cls = OriginalMaskedCoords
+            case False, "r":
+                cls = ReadOnlyMaskedCoords
+            case False, "c":
+                cls = ContiguousMaskedCoords
+            case False, _:
+                cls = MaskedCoords
+
+        coords = cls(
+            self, 
+            primary_mask, secondary_mask, 
+            bg_flux=bg_flux, 
+            original=original,
+        )
+        if log_valid:
+            coords = coords.ensureLogValid()
+        if shrink is not None:
+            coords = coords.limitLoss(shrink=shrink)
+        return coords
+    
 
     @validate_call
     def getMaskedCoords(
         self,
         *,
+        original: bool = False,
         mode: Literal["r", "c"] | None = None,
         covered: bool = False,
         without_rejections: bool = False,
@@ -215,76 +590,112 @@ class _BaseSpec:
         valid: bool = False,
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
+        shrink: bool | None = None,
     ) -> MaskedCoords:
-        mask = self.getMask.__wrapped__(
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
+        primary_mask, secondary_mask = self.getMask.__wrapped__(
             self,
+            original=original,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=valid,
             log_valid=log_valid,
+            as_tuple=True,
         )
-        match mode:
-            case "r":
-                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
-            case "c":
-                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
-            case _:
-                return MaskedCoords(self, mask, bg_flux=bg_flux)
+        return self._get_masked_coords_helper(
+            original=original,
+            mode=mode,
+            primary_mask=primary_mask,
+            secondary_mask=secondary_mask,
+            log_valid=log_valid,
+            bg_flux=bg_flux,
+            shrink=shrink,
+        )
 
     def resetRejections(self) -> None:
-        s = self.__str__(simple=True).removesuffix(".")
+        msg = "Resetting rejection mask for "
+        msg += self.__str__(simple=True).removesuffix(".")
+        msg += ": "
+
         n = self.size
         r = self.n_rej
-        logger.debug(f"Resetting rejection mask for {s}: {r}/{n} -> {0}/{n}.")
-        self._rejected_pixels[:] = False
+        msg += f"{r}/{n} -> {0}/{n}"
+
+        if self._no_original:
+            msg += " (no original)"
+            self._rejected_pixels[:] = False
+        else:
+            n = self.size_original
+            r = self.n_rej_original
+            msg += f", (original) {r}/{n} -> {0}/{n}"
+            self._rejected_pixels[:] = False
+            self._rejected_pixels_original[:] = False
+
+        logger.debug(msg)
 
     def resetAbsorption(self) -> None:
-        s = self.__str__(simple=True).removesuffix(".")
+        msg = "Resetting absorption mask for "
+        msg += self.__str__(simple=True).removesuffix(".")
+        msg += ": "
+
         n = self.size
         a = self.n_abs
-        logger.debug(f"Resetting absorption mask for {s}: {a}/{n} -> {0}/{n}.")
-        self._absorbed_pixels[:] = False
+        msg += f"{a}/{n} -> {0}/{n}"
+
+        if self._no_original:
+            msg += " (no original)"
+            self._absorbed_pixels[:] = False
+        else:
+            n = self.size_original
+            a = self.n_abs_original
+            msg += f", (original) {a}/{n} -> {0}/{n}"
+            self._absorbed_pixels[:] = False
+            self._absorbed_pixels_original[:] = False
+
+        logger.debug(msg)
 
     @validate_call
     def applyRejections(
         self,
-        rejected_pixels: BoolVector,
+        mask: BoolVector,
         enforce: bool = True,
+        original: bool = False,
     ) -> Self:
-        s = self.__str__(simple=True).removesuffix(".")
-        msg = f"Applying rejection mask to {s}: "
-        m = len(rejected_pixels)
-        _n = len(self._x)
-        n = self.size
+        """
+        Update the rejection mask with the provided boolean mask.
+        """
+        suffix = "_original" if original else ""
 
-        if m not in [n, _n]:
-            logger.error(
-                msg + f"Improper mask size, {m}. Should be either {n} or {_n}."
-            )
-            return
+        msg = "[ORIGINAL] " if original else ""
+        msg += "Applying rejection mask to "
+        msg += self.__str__(simple=True).removesuffix(".")
+        msg += ": "
 
-        r1 = self.n_rej
-        if len(rejected_pixels) == len(self._x):
+        m = mask.size
+        _n = getattr(self, "_x" + suffix).size
+        n = getattr(self, "size" + suffix)
+        if m not in {n, _n}:
+            msg += f"Improper mask size, {m}. Should be either {n} or {_n}."
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        r1 = getattr(self, "n_rej" + suffix)
+        if m == _n:
             if enforce:
-                self._rejected_pixels[:] = rejected_pixels
+                getattr(self, "_rejected_pixels" + suffix)[:] = mask
             else:
-                self._rejected_pixels |= rejected_pixels
-
-        elif len(rejected_pixels) == len(self.x):
-            if enforce:
-                self._rejected_pixels[self.mask] = rejected_pixels
-            else:
-                self._rejected_pixels[self.mask] |= rejected_pixels
-
+                getattr(self, "_rejected_pixels" + suffix)[:] |= mask
         else:
-            logger.error(
-                f"Mask size should be '{self.size}' or '{len(self._x)}', but is '{len(rejected_pixels)}'!"
-                "Doing nothing"
-            )
-            return
+            if enforce:
+                getattr(self, "_rejected_pixels" + suffix)[self.mask] = mask
+            else:
+                getattr(self, "_rejected_pixels" + suffix)[self.mask] |= mask
 
-        r2 = self.n_rej
+        r2 = getattr(self, "n_rej" + suffix)
         logger.debug(msg + f"{r1}/{n} -> {r2}/{n} (rej.).")
 
         return self
@@ -292,42 +703,97 @@ class _BaseSpec:
     @validate_call
     def applyAbsorption(
         self,
-        absorbed_pixels: BoolVector,
+        mask: BoolVector,
         y_smooth: FloatVector | None = None,
         enforce: bool = True,
+        original: bool = False,
     ) -> Self:
-        s = self.__str__(simple=True).removesuffix(".")
-        msg = f"Applying absorption mask to {s}: "
-        n = self.size
+        """
+        Update the absorption mask with the provided boolean mask, and 
+        optionally the array of smoothed flux density values.
+        """
+        suffix = "_original" if original else ""
 
-        a1 = self.n_abs
-        if len(absorbed_pixels) == len(self._x):
+        msg = "[ORIGINAL] " if original else ""
+        msg += "Applying absorption mask to "
+        msg += self.__str__(simple=True).removesuffix(".")
+        msg += ": "
+
+        m = mask.size
+        _n = getattr(self, "_x" + suffix).size
+        n = getattr(self, "size" + suffix)
+
+        if m not in {n, _n}:
+            msg += f"Improper mask size, {m}. Should be either {n} or {_n}."
+            logger.critical(msg)
+            raise ValueError(msg)
+
+        a1 = getattr(self, "n_abs" + suffix)
+        if m == _n:
             if enforce:
-                self._absorbed_pixels[:] = absorbed_pixels
+                getattr(self, "_absorbed_pixels" + suffix)[:] = mask
             else:
-                self._absorbed_pixels |= absorbed_pixels
+                getattr(self, "_absorbed_pixels" + suffix)[:] |= mask
 
             if y_smooth is not None:
-                self._y_smooth[:] = y_smooth
-
-        elif len(absorbed_pixels) == self.size:
-            if enforce:
-                self._absorbed_pixels[self.mask] = absorbed_pixels
-            else:
-                self._absorbed_pixels[self.mask] |= absorbed_pixels
-
-            if y_smooth is not None:
-                self._y_smooth[self.mask] = y_smooth
-
+                getattr(self, "_y_smooth" + suffix)[:] = y_smooth
         else:
-            logger.error(
-                f"Mask size should be '{self.size}' or '{len(self._x)}', but is '{len(absorbed_pixels)}'!"
-                "Doing nothing..."
-            )
-            return
+            if enforce:
+                getattr(self, "_absorbed_pixels" + suffix)[self.mask] = mask
+            else:
+                getattr(self, "_absorbed_pixels" + suffix)[self.mask] |= mask
 
-        a2 = self.n_abs
+            if y_smooth is not None:
+                getattr(self, "_y_smooth" + suffix)[self.mask] = y_smooth
+
+        a2 = getattr(self, "n_abs" + suffix)
         logger.debug(msg + f"{a1}/{n} -> {a2}/{n} (abs.).")
+
+        return self
+
+    def _update_emission_helper(
+        self,
+        model: object | None,
+        original: bool,
+        data_type: str,
+    ) -> Self:
+        original = self._update_original_flag(original, False)
+
+        arr: FloatVector = getattr(self, f"_y_{data_type}")
+        arr[:] = 0.0
+        if model is not None:
+            eval_mask = isfinite(self._x)
+            x = self._x[eval_mask]
+
+            preparer = PrepareModel(
+                x=self._x,
+                model=model,
+                eval_mask=eval_mask,
+                comp_mask=eval_mask,
+                kernels=self._kernels,
+                is_logbinned=True,
+            )
+            with preparer as (seq_model, _):
+                arr[eval_mask] = seq_model(x)
+
+        if original:
+            arr_original: FloatVector = getattr(self, f"_y_{data_type}_original")
+            arr_original[:] = 0.0
+
+            if model is not None:
+                eval_mask = isfinite(self._x_original)
+                x = self._x_original[eval_mask]
+
+                preparer = PrepareModel(
+                    x=self._x_original,
+                    model=model,
+                    eval_mask=eval_mask,
+                    comp_mask=eval_mask,
+                    kernels=self._kernels_original,
+                    is_logbinned=False,
+                )
+                with preparer as (seq_model, _):
+                    arr_original[eval_mask] = seq_model(x)
 
         return self
 
@@ -335,67 +801,38 @@ class _BaseSpec:
     def updateContinuumEmission(
         self,
         model: Optional[PowerLawModel] = None,
+        original: bool = False,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self._y_pl[:] = 0
-        if model is not None:
-            mask = isfinite(self._x)
-            self._y_pl[mask] = model(self._x[mask])
-        return self
+        return self._update_emission_helper(model, original, "pl")
 
     @validate_call
     def updateIronEmission(
         self,
         model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        original: bool = False,
     ) -> Self:
-        self._y_fe[:] = 0
-        if model is not None:
-            mask = isfinite(self._x)
-            x = self._x[mask]
-            with PrepareModel(x=x, model=model):
-                self._y_fe[mask] = model(x)
-        return self
+        return self._update_emission_helper(model, original, "fe")
 
     @validate_call
     def updateBalmerEmission(
         self,
         model: Optional[BalmerModel] = None,
+        original: bool = False,
     ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        self._y_ba[:] = 0
-        if model is not None:
-            mask = isfinite(self._x)
-            x = self._x[mask]
-            with PrepareModel(x=x, model=model):
-                self._y_ba[mask] = model(x)
-        return self
+        return self._update_emission_helper(model, original, "ba")
 
     @validate_call
     def updateHostGalaxyEmission(
         self,
         model: Optional[HostGalaxyModel] = None,
+        original: bool = False,
     ) -> Self:
-        self._y_hg[:] = 0
-        if model is not None:
-            mask = isfinite(self._x)
-            x = self._x[mask]
-            with PrepareModel(x=x, model=model):
-                self._y_hg[mask] = model(x)
-        return self
+        return self._update_emission_helper(model, original, "hg")
 
     @validate_call
     def updateLinesEmission(
         self,
-        model: Union[
-            GaussianModel, CompoundModel_[GaussianModel], None
-        ] = None,
+        model: Union[GaussianModel, CompoundModel_[GaussianModel], None] = None,
+        original: bool = False,
     ) -> Self:
-        self._y_em[:] = 0
-        if model is not None:
-            mask = isfinite(self._x)
-            self._y_em[mask] = model(self._x[mask])
-        return self
+        return self._update_emission_helper(model, original, "em")

@@ -4,8 +4,11 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import pairwise
 from logging import getLogger
-from typing import ClassVar, Literal, Optional, Self, Union
+from math import floor, prod
+from re import Pattern
+from typing import Any, ClassVar, Literal, Optional, Self, Union
 
+from astropy.constants import c
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from numpy import (
@@ -18,6 +21,7 @@ from numpy import (
     interp,
     invert,
     isfinite,
+    isnan,
     linspace,
     zeros_like,
 )
@@ -34,10 +38,19 @@ from quasar_models import (
     IronModel,
     PowerLawModel,
 )
-from quasar_models.line import VProfileCopy1G, VProfileCopyDict, _VProfileCopy
+from quasar_models.line import (
+    VProfileCopy,
+    VProfileCopy1G,
+    _VProfileCopy,
+    create_vprofilecopy,
+    rename_gaussians,
+)
 from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.utils.astropy import apply_bounds, order_submodels
-from quasar_plotting import absorptionplot, fitplot, quickplot
+from quasar_models.utils.astropy import (
+    apply_bounds,
+    get_largest_possible_bounds,
+)
+from quasar_plotting import absorptionplot, quickplot
 from quasar_plotting.colors import DEFAULT_COLORS
 from quasar_plotting.utils import get_coords
 from quasar_typing.astropy import CompoundModel_, FitInfo
@@ -61,17 +74,22 @@ from quasar_utils.setup import FitterKwargs
 from scipy.ndimage import binary_dilation
 
 from ..ml import Over, Under
+from ..plotting.diagnostics import (
+    EmissionLineComponentsWithDifferences,
+    EmissionLineComponentsWithResiduals,
+    SimpleEmissionLineComponents,
+)
 from ..utils import (
     ContiguousMaskedCoords,
     MaskedCoords,
     ReadOnlyMaskedCoords,
     _SpecWindow,
-    get_bounds_indices,
     stopwatch,
 )
 from .utils import common_middle, update_v_off_bounds
 
 logger = getLogger(__name__)
+C_KMS: float = c.to("km/s").value
 
 type LineModel = Union[GaussianModel, CompoundModel_[GaussianModel]]
 
@@ -80,34 +98,47 @@ type LineModel = Union[GaussianModel, CompoundModel_[GaussianModel]]
 class LWindow(_SpecWindow):
     names: set[str] = field(default_factory=set, kw_only=True)
 
+    linetypes: dict[str, Literal["n", "b"]] = field(default_factory=dict, kw_only=True)
     complexes: dict[str, str] = field(default_factory=dict, kw_only=True)
-
-    lines: dict[str, float] = field(default_factory=dict, kw_only=True)
+    waves: dict[str, float] = field(default_factory=dict, kw_only=True)
     n_maxs: dict[str, int] = field(default_factory=dict, kw_only=True)
     needs_line: dict[str, str] = field(default_factory=dict, kw_only=True)
 
     strength_bounds: dict[str, tuple] = field(
-        default_factory=dict, kw_only=True
+        default_factory=dict, 
+        kw_only=True,
     )
-    fwhm_v_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
-    v_off_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    fwhm_v_bounds: dict[str, tuple] = field(
+        default_factory=dict, 
+        kw_only=True,
+    )
+    v_off_bounds: dict[str, tuple] = field(
+        default_factory=dict, 
+        kw_only=True,
+    )
 
+    # Dictionary of string-string pairs, with the first string being the name of 
+    # a line covered by this LWindow instance, and the second string being the 
+    # name of the line to copy. 
     is_copy_of: dict[str, str] = field(default_factory=dict, kw_only=True)
     is_multiplet_of: dict[str, str] = field(default_factory=dict, kw_only=True)
+
     scale_init: dict[str, float] = field(default_factory=dict, kw_only=True)
-    scale_bounds: dict[str, tuple] = field(default_factory=dict, kw_only=True)
+    scale_bounds: dict[str, AstropyBounds] = field(default_factory=dict, kw_only=True)
     scale_fixed: dict[str, bool] = field(default_factory=dict, kw_only=True)
 
     copies_to: dict[str, list[tuple[int | None, str]]] = field(
-        default_factory=lambda: defaultdict(list), kw_only=True
+        default_factory=lambda: defaultdict(list), 
+        kw_only=True,
     )
+
     i_bounds: dict[str, tuple[float, float]] = field(
         default_factory=dict, kw_only=True
     )
     blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
     _blacklist: dict[str, bool] = field(default_factory=dict, kw_only=True)
 
-    neighbours: tuple[_SpecWindow | None, _SpecWindow | None] = field(
+    neighbours: tuple[int | None, int | None] = field(
         default=(None, None), kw_only=True
     )
     # prev_model: LineModel | None = field(default=None, kw_only=True)
@@ -130,6 +161,69 @@ class LWindow(_SpecWindow):
     def __post_init__(self):
         if self._y_em_contrib is None:
             self._y_em_contrib = zeros_like(self._x, dtype=float64)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["names"] = self.names
+        state["linetypes"] = self.linetypes
+        state["complexes"] = self.complexes
+        state["waves"] = self.waves
+        state["n_maxs"] = self.n_maxs
+        state["needs_line"] = self.needs_line
+        state["strength_bounds"] = self.strength_bounds
+        state["fwhm_v_bounds"] = self.fwhm_v_bounds
+        state["v_off_bounds"] = self.v_off_bounds
+        state["is_copy_of"] = self.is_copy_of
+        state["is_multiplet_of"] = self.is_multiplet_of
+        state["scale_init"] = self.scale_init
+        state["scale_bounds"] = self.scale_bounds
+        state["scale_fixed"] = self.scale_fixed
+        state["copies_to"] = self.copies_to
+        state["i_bounds"] = self.i_bounds
+        state["blacklist"] = self.blacklist
+        state["_blacklist"] = self._blacklist
+        state["neighbours"] = self.neighbours
+        state["model"] = self.model
+        state["fit"] = self.fit
+        state["fit_info"] = self.fit_info
+        state["fits"] = self.fits
+        state["fit_infos"] = self.fit_infos
+        state["cropped"] = self.cropped
+        state["bootstrapper"] = self.bootstrapper
+        state["error_result"] = self.error_result
+        state["_y_em_contrib"] = self._y_em_contrib
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        self.names = state.get("names")
+        self.linetypes = state.get("linetypes")
+        self.complexes = state.get("complexes")
+        self.waves = state.get("waves")
+        self.n_maxs = state.get("n_maxs")
+        self.needs_line = state.get("needs_line")
+        self.strength_bounds = state.get("strength_bounds")
+        self.fwhm_v_bounds = state.get("fwhm_v_bounds")
+        self.v_off_bounds = state.get("v_off_bounds")
+        self.is_copy_of = state.get("is_copy_of")
+        self.is_multiplet_of = state.get("is_multiplet_of")
+        self.scale_init = state.get("scale_init")
+        self.scale_bounds = state.get("scale_bounds")
+        self.scale_fixed = state.get("scale_fixed")
+        self.copies_to = state.get("copies_to")
+        self.i_bounds = state.get("i_bounds")
+        self.blacklist = state.get("blacklist")
+        self._blacklist = state.get("_blacklist")
+        self.neighbours = state.get("neighbours")
+        self.model = state.get("model")
+        self.fit = state.get("fit")
+        self.fit_info = state.get("fit_info")
+        self.fits = state.get("fits")
+        self.fit_infos = state.get("fit_infos")
+        self.cropped = state.get("cropped")
+        self.bootstrapper = state.get("bootstrapper")
+        self.error_result = state.get("error_result")
+        self._y_em_contrib = state.get("_y_em_contrib")
 
     @property
     def sample(self) -> GaussianSampleList | None:
@@ -161,30 +255,24 @@ class LWindow(_SpecWindow):
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        assert len(self.lines) > 0
+        assert len(self.waves) > 0
 
         logger.debug(f"Starting pipeline for {self.__str__(True)}")
 
         with stopwatch() as watch:
-            try:
-                self.prepareLines.__wrapped__(
-                    self,
-                    v_sep=v_sep,
-                    min_fittable_total=min_fittable_total,
-                    min_fittable_ratio=min_fittable_ratio,
-                )
-            except Exception as e:
-                msg = f"Failed pipeline during `prepareLines` due to: {e}"
-                logger.warning(msg)
-                return False
-
+            self.prepareLines.__wrapped__(
+                self,
+                v_sep=v_sep,
+                min_fittable_total=min_fittable_total,
+                min_fittable_ratio=min_fittable_ratio,
+            )
             if with_neighbours:
                 success = self.prepareNeighbours.__wrapped__(
                     self,
                     sigma_res=sigma_res,
                 )
                 if not success:
-                    logger.warning(
+                    logger.info(
                         ">>> Failed pipeline during 'prepareNeighbours'!"
                     )
                     return False
@@ -197,7 +285,7 @@ class LWindow(_SpecWindow):
                 with_neighbours=with_neighbours,
             )
             if not success:
-                logger.warning(
+                logger.info(
                     ">>> Failed pipeline during 'instantiateModels'!"
                 )
                 return False
@@ -212,7 +300,7 @@ class LWindow(_SpecWindow):
                 fitter_kwargs=fitter_kwargs,
             )
             if not success:
-                logger.warning(">>> Failed pipeline during 'makeInitialFit'!")
+                logger.info(">>> Failed pipeline during 'makeInitialFit'!")
                 return False
 
             success = self.makeFinalFit.__wrapped__(
@@ -232,7 +320,7 @@ class LWindow(_SpecWindow):
                 fitter_kwargs=fitter_kwargs,
             )
             if not success:
-                logger.warning(">>> Failed pipeline during 'makeFinalFit'!")
+                logger.info(">>> Failed pipeline during 'makeFinalFit'!")
                 return False
 
         logger.debug(f">>> Finished entire pipeline in {1e3 * watch.elapsed:.1f} ms.")
@@ -244,6 +332,7 @@ class LWindow(_SpecWindow):
     def getMask(
         self,
         *,
+        original: bool = False,
         covered: bool = True,
         without_rejections: bool = False,
         without_absorption: bool = False,
@@ -254,50 +343,63 @@ class LWindow(_SpecWindow):
         complex_name: str | None = None,
         limited: bool = True,
         v_sep: float | None = None,
-    ) -> BoolVector:
-        mask = super().getMask.__wrapped__(
-            self,
+        as_tuple: bool = False,
+    ) -> BoolVector | tuple[BoolVector, BoolVector]:
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
+        suffix = "_original" if original else ""
+
+        primary_mask, secondary_mask = super().getMask.__wrapped__(
+            self, 
+            original=original,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
             valid=valid,
             log_valid=log_valid,
+            as_tuple=True,
         )
         if with_neighbours and self.neighbours != (None, None):
-            for cwindow in filter(lambda w: w is not None, self.neighbours):
-                mask |= cwindow.__wrapped__.getMask(
+            for idx in filter(lambda i: i is not None, self.neighbours):
+                cwindow = self.spectrum.pl[idx]
+                _p, _s = cwindow.getMask.__wrapped__(
                     cwindow,
+                    original=original,
                     covered=covered,
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
                     valid=valid,
                     log_valid=log_valid,
+                    as_tuple=as_tuple,
                 )
+                primary_mask |= _p
+                secondary_mask |= _s
 
+        bounds: tuple[float, float] | None = None
         if complex_name is not None:
             bounds = self.i_bounds[complex_name]
-
         elif line is not None:
             if isinstance(line, str):
                 if limited:
                     # Based on 'i_bounds' -> find complex name
                     bounds = self.i_bounds[self.complexes[line]]
                 else:
-                    _line = self.lines[line]
-                    bounds = (_line * (1 - v_sep), _line * (1 + v_sep))
+                    wave = self.waves[line]
+                    bounds = (wave * (1 - v_sep), wave * (1 + v_sep))
             else:
                 bounds = (line * (1 - v_sep), line * (1 + v_sep))
 
-        if "bounds" in locals():
-            idx_left, idx_right = get_bounds_indices(self._x, bounds)
+        if bounds is not None:
+            x = getattr(self, "_x" + suffix)
+            mask = (bounds[0] <= x) & (x < bounds[1])
+            primary_mask &= mask
+            secondary_mask &= mask
 
-            lmask = mask.copy()
-            lmask[:] = False
-            lmask[idx_left : idx_right + 1] = True
-
-            mask &= lmask
-
-        return mask
+        if as_tuple:
+            return primary_mask, secondary_mask
+        return primary_mask & secondary_mask
 
     @validated_apply_info_to_method(
         subjects=("lines",), specific_kwargs={"v_sep"}
@@ -305,6 +407,7 @@ class LWindow(_SpecWindow):
     def getMaskedCoords(
         self,
         *,
+        original: bool = False,
         mode: Literal["c", "r"] | None = None,
         covered: bool = False,
         without_rejections: bool = False,
@@ -317,12 +420,18 @@ class LWindow(_SpecWindow):
         complex_name: str | None = None,
         limited: bool = True,
         v_sep: float | None = None,
+        shrink: bool | None = None,
     ) -> MaskedCoords | ReadOnlyMaskedCoords | ContiguousMaskedCoords:
+        original = self._update_original_flag(
+            original=original,
+            log=False,
+        )
         if bg_flux is None:
             bg_flux = self.default_bg
 
-        mask = self.getMask.__wrapped__(
+        primary_mask, secondary_mask = self.getMask.__wrapped__(
             self,
+            original=original,
             covered=covered,
             without_rejections=without_rejections,
             without_absorption=without_absorption,
@@ -333,25 +442,29 @@ class LWindow(_SpecWindow):
             complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
+            as_tuple=True,
         )
-        match mode:
-            case "c":
-                return ContiguousMaskedCoords(self, mask, bg_flux=bg_flux)
-            case "r":
-                return ReadOnlyMaskedCoords(self, mask, bg_flux=bg_flux)
-            case None:
-                return MaskedCoords(self, mask, bg_flux=bg_flux)
+        return self._get_masked_coords_helper(
+            original=original,
+            mode=mode,
+            primary_mask=primary_mask,
+            secondary_mask=secondary_mask,
+            log_valid=log_valid,
+            bg_flux=bg_flux,
+            shrink=shrink,
+        )
 
     @validated_apply_info_to_method(subjects=("lines",))
     def add(
         self,
+        *,
         name: str,
         complex_name: str,
-        line: float,
+        wave: float, 
+        linetype: Literal["n", "b"],
         n_max: int,
         needs_line: str | None = None,
         is_copy_of: str | None = None,
-        *,
         strength_bounds: AstropyBounds | None = None,
         v_off_bounds: AstropyBounds | None = None,
         fwhm_v_bounds: AstropyBounds | None = None,
@@ -363,27 +476,13 @@ class LWindow(_SpecWindow):
         """
         Adds a given line to the SubSlice under the condition that it falls
         within the covered wavelength range.
-
-        Parameters
-        ----------
-        line : float
-            Unitless rest wavelength of the emission line.
-        v_off : float
-            Maximum absolute velocity offset of the emission line in units of
-            the speed of light.
-        n_max : int
-            Maximum allowed number of profile functions to model the emission
-            line.
-        name : str
-            Name of the emission line model(s).
         """
-        if (
-            self.x_bounds[0] < line < self.x_bounds[1]
-        ) or force_add:
+        if (self.x_bounds[0] < wave < self.x_bounds[1]) or force_add:
             self.names.add(name)
+            self.linetypes[name] = linetype
             self.complexes[name] = complex_name
 
-            self.lines[name] = line
+            self.waves[name] = wave
             self.n_maxs[name] = n_max
 
             self.strength_bounds[name] = strength_bounds
@@ -419,12 +518,13 @@ class LWindow(_SpecWindow):
     ) -> None:
         success = self.add.__wrapped__(
             self,
-            new_model.pure_name,
-            new_model.pure_name,
-            new_model.wave,
-            1,
-            None,
-            None,
+            name=new_model.pure_name,
+            complex_name=new_model.pure_name,
+            wave=new_model.wave,
+            linetype=new_model.linetype,
+            n_max=1,
+            needs_line=None,
+            is_copy_of=None,
             strength_bounds=new_model.strength.bounds,
             fwhm_v_bounds=new_model.fwhm_v.bounds,
             v_off_bounds=new_model.v_off.bounds,
@@ -435,7 +535,7 @@ class LWindow(_SpecWindow):
         )
         if not success:
             msg = f"Failed to add custom model to `Lwindow` with bounds {self.x_bounds}!"
-            logger.warning(msg)
+            logger.info(msg)
             raise ValueError(msg)
 
         if refit:
@@ -484,53 +584,58 @@ class LWindow(_SpecWindow):
         """
         # STEP 1
 
+        logger.debug(
+            f"Preparing lines: {grade_lines=}, {v_sep=}, {min_fittable_total=}, "
+            f"{min_fittable_ratio=}"
+        )
+
+        logger.debug(">>> Clearing 'i_bounds'/'blacklist'/'_blacklist'")
         self.i_bounds.clear()
         self.blacklist.clear()
         self._blacklist.clear()
 
-        if len(self.lines) == 0:
-            # No lines to consider.
+        if len(self.waves) == 0:
+            logger.debug(">>> No lines to prepare!")
             return self
-
-        elif len(self.lines) == 1:
-            # Only one line to consider.
+        elif len(self.waves) == 1:
+            logger.debug(">>> Only 1 line to prepare!")
             name = next(iter(self.names))
 
-            line = self.lines[name]
+            wave = self.waves[name]
             (lower, upper) = self.v_off_bounds[name]
 
             self.x_bounds = (
-                max(self.x_bounds[0], line * (1 - v_sep)),
-                min(self.x_bounds[1], line * (1 + v_sep)),
+                max(self.x_bounds[0], wave * (1 - v_sep)),
+                min(self.x_bounds[1], wave * (1 + v_sep)),
             )
 
             self.i_bounds[self.complexes[name]] = self.x_bounds
             self.v_off_bounds[name] = (
-                max(lower, self.x_bounds[0] / line - 1),
-                min(upper, self.x_bounds[1] / line - 1),
+                max(lower, (self.x_bounds[0] / wave - 1) * C_KMS),
+                min(upper, (self.x_bounds[1] / wave - 1) * C_KMS),
             )
-
         else:
-            # Create dictionary of complexes' bluest and reddest lines
+            logger.debug(f">>> {len(self.waves)} lines to prepare!")
 
+            # Create dictionary of complexes' bluest and reddest lines
             complex_to_lines: dict[str, set[str]] = defaultdict(set)
             for name, complex_name in self.complexes.items():
                 complex_to_lines[complex_name].add(name)
+            logger.debug(f">>> Using {complex_to_lines=}")
 
             complex_bounds: dict[str, list[float]] = {}
             for complex_name, names in complex_to_lines.items():
-                lines = sorted(self.lines[name] for name in names)
-                complex_bounds[complex_name] = [lines[0], lines[-1]]
+                waves = sorted(self.waves[name] for name in names)
+                complex_bounds[complex_name] = [waves[0], waves[-1]]
+            logger.debug(f">>> Using {complex_bounds=}")
 
             del complex_to_lines
 
             # Validate that complexes do not overlap
-            complex_bounds = dict(
-                sorted(
-                    complex_bounds.items(),
-                    key=lambda item: item[1][0],
-                )
-            )
+            complex_bounds = dict(sorted(
+                complex_bounds.items(),
+                key=lambda item: item[1][0],
+            ))
             complex_lbs = fromiter(
                 (val[0] for val in complex_bounds.values()),
                 float64,
@@ -541,7 +646,7 @@ class LWindow(_SpecWindow):
             )
             if not (complex_lbs[1:] >= complex_ubs[:-1]).all():
                 msg = f"Complexes overlap: {complex_bounds=}"
-                logger.critical(msg)
+                logger.critical(">>>" + msg)
                 raise ValueError(msg)
 
             n_complexes = len(complex_bounds)
@@ -563,54 +668,83 @@ class LWindow(_SpecWindow):
                     )
                 ]
 
-            self.i_bounds = dict(zip(complex_bounds.keys(), pairwise(_i_bounds)))
-            self.x_bounds = (_i_bounds[0], _i_bounds[-1])
+            self.i_bounds = i_bounds = dict(zip(
+                complex_bounds.keys(), 
+                pairwise(_i_bounds),
+            ))
+            self.x_bounds = x_bounds = (_i_bounds[0], _i_bounds[-1])
+            logger.debug(f">>> Found:  {i_bounds=}, {x_bounds=}")
 
-            # Update velocity offset bounds
+            # Update velocity offset bounds:
+            # - Ignore multiplets / velocity profile copies. These are assumed 
+            #   to be constrained enough to not need updating.
 
-            narrow_lines: dict[str, float] = {}
-            broad_lines: dict[str, float] = {}
-            for name, line in self.lines.items():
-                d = narrow_lines if name.startswith("n") else broad_lines
-                d[name] = line
+            _waves: dict[str, float] = {
+                name: wave
+                for name, wave in self.waves.items()
+                if (name not in self.is_copy_of)     # Isn't a copy of ...
+                    and (name not in self.copies_to) # Isn't used to copy to ...
+            }
+            narrow_waves: dict[str, float] = {
+                name: wave
+                for name, wave in _waves.items()
+                if self.linetypes[name] == "n"
+            }
+            broad_waves: dict[str, float] = {
+                name: wave
+                for name, wave in _waves.items()
+                if self.linetypes[name] == "b"
+            }
 
             # Narrow
-            if narrow_lines:
+            if narrow_waves:
+                logger.debug(
+                    ">>> Updating velocity offset bounds for narrow lines: "
+                    f"{narrow_waves}"
+                )
                 update_v_off_bounds(
                     v_off_bounds=self.v_off_bounds,
-                    lines=narrow_lines,
+                    waves=narrow_waves,
                     x_bounds=self.x_bounds,
                 )
             # Broad
-            if broad_lines:
+            if broad_waves:
+                logger.debug(
+                    ">>> Updating velocity offset bounds for broad lines: "
+                    f"{broad_waves}"
+                )
                 update_v_off_bounds(
                     v_off_bounds=self.v_off_bounds,
-                    lines=broad_lines,
+                    waves=broad_waves,
                     x_bounds=self.x_bounds,
                 )
 
         # Check multiplets
-        self.is_multiplet_of.clear()
-        self.copies_to.clear()
-        for mimic, master in filter(
-            lambda item: item[1] in self.names,
-            self.is_copy_of.items(),
-        ):
-            self.is_multiplet_of[mimic] = master
-            self.copies_to[master].append((None, mimic))
+        self.setMultiplets()
 
         # STEP 2
-        for name in self.names:
+        msg = ">>> Populating blacklist: "
+
+        for name in sorted(self.names, key=lambda n: self.waves[n]):
             # Blacklist lines which are:
             # - Limited to a single Gaussian, or
             # - Copies of other lines.
-            self.blacklist[name] = self._blacklist[name] = any(
-                [
-                    self.n_maxs[name] == 1,
-                    name in self.is_copy_of,
-                    name in self.is_multiplet_of,
-                ]
-            )
+            msg += f"('{name}') "
+            val = True
+            if self.n_maxs[name] == 1:
+                msg += "limited to 1 Gaussian "
+            elif self.is_copy_of.get(name, None) in self.names:
+                msg += "copy of another line "
+            elif name in self.is_multiplet_of:
+                msg += "multiplet of another line "
+            else:
+                msg += "not blacklisted "
+                val = False
+
+            self.blacklist[name] = self._blacklist[name] = val
+
+        logger.debug(msg)
+        logger.debug(f">>> Using blacklist={self.blacklist}")
 
         if grade_lines:
             _ = self.gradeLines.__wrapped__(
@@ -623,45 +757,106 @@ class LWindow(_SpecWindow):
 
         return self
 
+    def setMultiplets(self) -> None:
+        """
+        Simplify the `copies_to` dictionary for the special case when line A is 
+        a velocity profile copy of an external line X, while line B is a 
+        multiplet of line A. In this case, the `copies_to` dictionary can be 
+        simplified s.t. line B is tied to line X directly, rather than through 
+        line A.
+
+        Notes
+        -----
+        For each line that is a velocity profile copy of an internal line, do 
+        the following: 
+        (A) if the master line is not a copy, do nothing; 
+        (B) if the master line is a copy of an external line, update the 
+        `copies_to` (and `is_multiplet_of`) dictionary accordingly;
+        (C) if the master line is a copy of an internal line, repeat the same 
+        logic recursively until an external or a non-copy internal line is 
+        found.
+        """
+        logger.debug("Checking for multiplets: clearing 'is_multiplet_of'/'copies_to'")
+        self.is_multiplet_of.clear()
+
+        keys_to_remove: list[str] = []
+        for name, tup in self.copies_to.items():
+            if tup[0] is None:
+                keys_to_remove.append(name)
+        for key in keys_to_remove:
+            self.copies_to.pop(key)
+
+        for mimic, master in self.is_copy_of.items():
+            if master in self.names:
+                scale_inits = [self.scale_init[mimic]]
+                scale_bounds = [self.scale_bounds[mimic]]
+                scale_fixeds = [self.scale_fixed[mimic]]
+
+                while (
+                    master in self.is_copy_of
+                    and self.is_copy_of[master] in self.names
+                ):
+                    scale_inits.append(self.scale_init[master])
+                    scale_bounds.append(self.scale_bounds[master])
+                    scale_fixeds.append(self.scale_fixed[master])
+
+                    master = self.is_copy_of[master]
+
+                self.is_copy_of[mimic] = master
+                self.scale_init[mimic] = prod(scale_inits)
+                self.scale_bounds[mimic] = get_largest_possible_bounds(
+                    scale_bounds, 
+                    min_val=self.info.lines.scale_bounds[0], 
+                    max_val=self.info.lines.scale_bounds[1],
+                )
+                self.scale_fixed[mimic] = any(scale_fixeds)
+
+                if master in self.names:
+                    # Internal copy
+                    logger.debug(f">>> Found internal copy: {mimic=}, {master=}")
+                    self.copies_to[master].append((None, mimic))
+                    self.is_multiplet_of[mimic] = master
+                    continue
+
+            logger.debug(f">>> Found external copy: {mimic=}, {master=}")
+
     @validated_apply_info_to_method(
         subjects=("loading",), specific_kwargs={"sigma_res"}
     )
-    def prepareNeighbours(
-        self,
-        *,
-        sigma_res: float | None = None,
-    ) -> Self:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        if self.spectrum is None:
-            msg = "LWindow must have a `spectrum` attribute to prepare \
-                neighbours!"
-            logger.critical(msg)
-            raise ValueError(msg)
-        elif self.spectrum.pl is None:
-            msg = "LWindow's `spectrum` must have a `continuum_windows` \
-                attribute to prepare neighbours!"
+    def prepareNeighbours(self, *, sigma_res: float | None = None) -> Self:
+        msg = "Preparing neighbours for {}: ".format(
+            self.__str__(simple=True).removesuffix(".")
+        )
+        if self.spectrum.pl is None:
+            msg += "no available continuum windows!"
             logger.critical(msg)
             raise ValueError(msg)
 
+        iterations = sigma_res
         if isinstance(sigma_res, float):
-            iterations = int(sigma_res // self.info.loading["sigma_res"])
-        else:
-            iterations = sigma_res
+            iterations = floor(sigma_res / self.info.loading.sigma_res)
 
         vicinity = binary_dilation(self.mask, iterations=iterations)
 
         left = None
         right = None
-        for cwindow in self.spectrum.continuum_windows:
+        for i, cwindow in enumerate(self.spectrum.pl):
+            if (left is not None) and (right is not None):
+                break
             if not (cwindow.mask & vicinity).any():
                 continue
 
             if cwindow.x_bounds[1] < self.x_bounds[0]:
-                left = cwindow
+                left = i
             elif self.x_bounds[1] < cwindow.x_bounds[0]:
-                right = cwindow
+                right = i
+
+        msg += "no bluewise CWindow found, " \
+            if left is None \
+            else "found bluewise CWindow, "
+        msg += "no redwise CWindow found." \
+            if right is None \
+            else "found redwise CWindow."
 
         self.neighbours = (left, right)
 
@@ -680,7 +875,7 @@ class LWindow(_SpecWindow):
 
         lines_to_remove: set[str] = set()
 
-        for name, line in self.sortLines():
+        for name, wave in self.sortWaves():
             if (name in self.is_copy_of) or (name in self.is_multiplet_of):
                 continue
 
@@ -709,13 +904,15 @@ class LWindow(_SpecWindow):
             )
 
             if f == 0:
-                msg += f"No valid data -> removing line '{name}' at {line:.1f}!"
+                msg += "No valid data -> "\
+                    f"Removing line '{name}' at {wave:.1f}!"
                 lines_to_remove.add(name)
             elif (f / n < min_fittable_ratio) or (f < min_fittable_total):
-                msg += f"Not enough valid data -> blacklisting line '{name}' at {line:.1f}!"
+                msg += "Not enough valid data -> "\
+                    f"Blacklisting line '{name}' at {wave:.1f}!"
                 self.blacklist[name] = True
             else:
-                msg += f"Enough valid data for line '{name}' at {line:.1f}!"
+                msg += f"Enough valid data for line '{name}' at {wave:.1f}!"
 
             logger.debug(msg)
 
@@ -773,24 +970,42 @@ class LWindow(_SpecWindow):
         )
 
         models: dict[str, GaussianModel] = {}
-        for name, line in self.sortLines():
+        for name, wave in self.sortWaves():
+            msg = f">>> Instantiating '{name}' at {wave:.1f}: "
             if name in self.cropped:
+                msg += f"found in cropped lines ({self.cropped}) -> skipping!"
+                logger.debug(msg)
                 continue
 
+            log = logger.debug
             if name in self.is_multiplet_of:
-                models[name] = VProfileCopy1G.from_model(
-                    line,
-                    name,
-                    models[self.is_multiplet_of[name]],
-                    strength_scale_value=self.scale_init[name],
-                    strength_scale_bounds=self.scale_bounds[name],
-                    strength_scale_fixed=self.scale_fixed[name],
-                    freeze=False,
-                )
-                continue
+                master_name = self.is_multiplet_of[name]
+                msg += f"line is a multiplet of '{master_name}', "
+                if master_name in models:
+                    logger.debug(msg + "instantiating as a copy!")
+                    models[name] = model = VProfileCopy1G.from_model(
+                        wave,
+                        name,
+                        self.linetypes[name],
+                        models[self.is_multiplet_of[name]],
+                        strength_scale_value=self.scale_init[name],
+                        strength_scale_bounds=self.scale_bounds[name],
+                        strength_scale_fixed=self.scale_fixed[name],
+                    )
+                    model.v_off_1.bounds = self.v_off_bounds[name]
+                    model.v_off_1.value = apply_bounds.__wrapped__(
+                        model.v_off_1.value, 
+                        model.v_off_1.bounds,
+                    )
+                    continue
+
+                log = logger.info
+                msg += f"could not find '{master_name}', defaulting to "\
+                    "standard instantiation: "
 
             masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
+                original=False,
                 mode="c",
                 covered=True,
                 without_rejections=without_rejections,
@@ -799,33 +1014,34 @@ class LWindow(_SpecWindow):
                 valid=True,
                 log_valid=False,
                 bg_flux=bg_flux,
-                complex_name=self.complexes[
-                    name
-                ],  # Integrate over the complex, not the individual line
+                complex_name=self.complexes[name],  # Integrate over the complex, not the individual line
                 limited=True,
                 v_sep=v_sep,
+                shrink=None,
             )
-            try:
-                models[name] = GaussianModel.instantiate(
-                    line,
-                    masked_coords.x,
-                    masked_coords.y,
-                    masked_coords.y_smooth,
-                    name=name,
-                    strength_bounds=self.strength_bounds[name],
-                    v_off_bounds=self.v_off_bounds[name],
-                    fwhm_v_bounds=self.fwhm_v_bounds[name],
-                    sigma_res=self.info.loading["sigma_res"],
-                    logger=logger,
-                )
-                msg = f">>> Successfully instantiated line '{name}' at {line:.1f}."
-                logger.debug(msg)
-            except Exception as e:
-                msg = f">>> Failed instantiating line '{name}' at {line:.1f} due to: {e}"
-                logger.warning(msg)
-                continue
+            y_smooth = masked_coords.y_smooth
+            if isnan(y_smooth).all():
+                y_smooth = masked_coords.y
+
+            log(msg + f"instantiating model using {masked_coords.size} data points!")
+
+            models[name] = GaussianModel.instantiate.__wrapped__(
+                GaussianModel,
+                wave,
+                masked_coords.x,
+                masked_coords.y,
+                y_smooth,
+                sigma_res=self.info.loading.sigma_res,
+                linetype=self.linetypes[name],
+                name=name,
+                strength_bounds=self.strength_bounds[name],
+                v_off_bounds=self.v_off_bounds[name],
+                fwhm_v_bounds=self.fwhm_v_bounds[name],
+                logger=logger,
+            )
 
         if len(models) == 0:
+            logger.info("Did not instantiate a single model!")
             return False
 
         submodels = list(models.values())
@@ -869,6 +1085,7 @@ class LWindow(_SpecWindow):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=False,
             mode="c",
             covered=True,
             without_rejections=without_rejections,
@@ -877,26 +1094,26 @@ class LWindow(_SpecWindow):
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
+            shrink=None,
         )
         msg += f"no. of Gaussians: {self.model.n_submodels}, "
         msg += f"no. of data points: {masked_coords.size}. "
 
-        with (
-            stopwatch() as watch,
-            PrepareModel(x=masked_coords.x, model=self.model),
-        ):
+        preparer = PrepareModel.fromCoords(masked_coords, self.model)
+        data = preparer.createDataDict(masked_coords)
+        with preparer as (seq_model, where):
             fitter = Fitter()
             fit = fitter(
-                self.model,
-                masked_coords.x,
-                masked_coords.y,
-                dy=masked_coords.dy,
+                seq_model,
+                data["x"],
+                data["y"],
+                dy=data["dy"],
+                where=where,
                 get_model=True,
                 inplace=False,
                 **fitter_kwargs,
             )
 
-        msg += f"Finished fitting in {1e3 * watch.elapsed:.1f} ms."
         logger.debug(msg)
 
         self.applyFit.__wrapped__(
@@ -950,6 +1167,7 @@ class LWindow(_SpecWindow):
         if isinstance(evaluate_initial, (int, float)):
             masked_coords = self.getMaskedCoords.__wrapped__(
                 self,
+                original=False,
                 mode="c",
                 covered=True,
                 without_rejections=without_rejections,
@@ -958,6 +1176,7 @@ class LWindow(_SpecWindow):
                 valid=True,
                 log_valid=False,
                 bg_flux=bg_flux,
+                shrink=None,
             )
 
             fs = (self.fit,) if self.fit.n_submodels == 1 else self.fit
@@ -990,6 +1209,7 @@ class LWindow(_SpecWindow):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=False,
             mode="c",
             covered=True,
             without_rejections=without_rejections,
@@ -998,6 +1218,7 @@ class LWindow(_SpecWindow):
             valid=True,
             log_valid=False,
             bg_flux=bg_flux,
+            shrink=None,
         )
         if self.fit.n_submodels == 1:
             data = (
@@ -1012,12 +1233,10 @@ class LWindow(_SpecWindow):
             h = w // 2
 
             # Filter out blacklisted lines, including velocity profile copies.
-            valid_lines = list(
-                filter(
-                    lambda f: not self.blacklist[f.pure_name],
-                    fs,
-                )
-            )
+            valid_lines = list(filter(
+                lambda f: not self.blacklist[f.pure_name],
+                fs,
+            ))
             waves = [f.wave for f in valid_lines]
 
             z = abs(
@@ -1031,9 +1250,7 @@ class LWindow(_SpecWindow):
             )
             z_interp = interp(waves, masked_coords.x[h:-h], z_convolved)
 
-            submodel: GaussianModel = valid_lines[
-                argmax(z_interp).flatten()[0]
-            ]
+            submodel: GaussianModel = valid_lines[argmax(z_interp).flatten()[0]]
 
             name = submodel.pure_name
             complex_name = self.complexes[name]
@@ -1074,25 +1291,26 @@ class LWindow(_SpecWindow):
 
         # Instantiate if necessary
         if self.fit is None:
-            self.makeInitialFit.__wrapped__(
-                self,
-                bg_flux=bg_flux,
-                without_rejections=without_rejections,
-                without_absorption=without_absorption,
-                with_neighbours=with_neighbours,
-                evaluate_initial=evaluate_initial,
-                fitter_kwargs=fitter_kwargs,
-            )
-
+            msg = "Cannot finalises fit without an initial fit: call "\
+                "`makeInitialFit` first!"
+            logger.critical(msg)
+            raise ValueError(msg)
+        
         continue_fitting: bool = True
 
         # Check if any lines aren't already blacklisted
         if all(self.blacklist.values()):
             # No additional models necessary
+            logger.debug(
+                "All lines are already blacklisted -> no additional models "
+                "necessary!"
+            )
             continue_fitting = False
-
         elif self.fit.n_submodels <= 2:
             # Check if under-fitted
+            logger.debug(
+                "Only 1 or 2 submodels -> checking if they are under-fitted..."
+            )
             continue_fitting = self.isUnderFitted.__wrapped__(
                 self,
                 self.fit.n_submodels,
@@ -1108,9 +1326,13 @@ class LWindow(_SpecWindow):
         current_config = self.getConfiguration()
         all_configs = [tuple(current_config.values())]
 
+        if continue_fitting:
+            logger.debug("Starting component addition loop...")
+
         while continue_fitting:
             self.updateBlacklistFromConfiguration()
             if all(self.blacklist.values()):
+                logger.debug("All lines are blacklisted -> breaking loop!")
                 break
 
             # Add a line component
@@ -1122,32 +1344,63 @@ class LWindow(_SpecWindow):
                 with_neighbours=with_neighbours,
                 w=w,
             )
+
+            current_config[new_model.pure_name] += 1
+            msg = f"Adding line '{new_model.name}': {current_config=}, "
+
+            ms = list(self.fit + new_model)
             current_config[new_model.pure_name] += 1
 
-            self.model = self.fit + new_model
+            # Gaussians used to instantiate the new velocity profile copy/copies
+            _ms: list[GaussianModel] = [
+                m
+                for m in ms
+                if m.pure_name == new_model.pure_name
+            ]
+            master_model = sum(_ms[1:], start=_ms[0])
+            del _ms
+            
             if check_multiplet:
-                # The new model is a master model in a multiplet. Add a Gaussian
-                # component to each mimic line.
+                # The new model is a master model in a multiplet: 
+                # - Replace the existing velocity-profile copy with a new one 
+                #   with one more component.
                 for mimic in (
                     mimic
-                    for window_idx, mimic in self.copies_to[
-                        new_model.pure_name
-                    ]
+                    for window_idx, mimic in self.copies_to[new_model.pure_name]
                     if window_idx is None
                 ):
-                    mimic_model = VProfileCopy1G.from_model(
-                        self.lines[mimic],
+                    # Velocity profile copy to replace
+                    old_mimic: VProfileCopy = next(
+                        m
+                        for m in ms
+                        if m.pure_name == mimic
+                    )
+
+                    assert old_mimic.n_profiles + 1 == master_model.n_submodels
+
+                    new_mimic = create_vprofilecopy(
+                        master_model,
                         mimic,
-                        new_model,
+                        wave=self.waves[mimic],
                         strength_scale_value=self.scale_init[mimic],
                         strength_scale_bounds=self.scale_bounds[mimic],
                         strength_scale_fixed=self.scale_fixed[mimic],
-                        adapt=True,
-                        freeze=False,
                     )
+                    # Replace the old vel.-profile copy with the new one
+                    ms.remove(old_mimic)
+                    ms.append(new_mimic)
 
-                    self.model += mimic_model
-                    current_config[mimic] += 1
+            ms = sorted(ms, key=lambda m: m.sorting_key)
+            self.model = sum(ms[1:], start=ms[0])
+            rename_gaussians(self.model)
+
+            n_prev: int = self.fit.n_submodels
+            n_curr: int = self.model.n_submodels
+
+            if n_curr <= n_prev:
+                raise ValueError(
+                    f"No. of components has not increased: {n_curr=}, {n_prev=}"
+                )
 
             self.fitModel.__wrapped__(
                 self,
@@ -1168,8 +1421,8 @@ class LWindow(_SpecWindow):
             # Check if model is over-fitted
             is_over, _ = self.isOverFitted.__wrapped__(
                 self,
-                self.fit.n_submodels - 1,
-                self.fit.n_submodels,
+                n_prev,
+                n_curr,
                 bg_flux=bg_flux,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
@@ -1178,21 +1431,24 @@ class LWindow(_SpecWindow):
                 limited=limited,
                 v_sep=v_sep,
             )
-            if is_over or False:  # ? 'False' is placeholder for VETO function
+            if is_over:
                 # Check whether models are saturated (blacklisted) or touching
                 # their respective bounds.
-                fs = self.fit if (self.fit.n_submodels > 1) else [self.fit]
+                msg += "model is over-fitted, "
+                fs = (self.fit,) if n_curr == 1 else self.fit
                 is_redundant: list[bool] = [
                     f.isTouchingBounds() & self.blacklist[f.pure_name]
-                    if isinstance(f, GaussianModel)
-                    else False
+                        if isinstance(f, GaussianModel)
+                        else False
                     for f in fs
                 ]
+                msg += f"{is_redundant=}, "
 
                 if all(is_redundant):
+                    msg += "all submodels are redundant -> stopping loop!"
                     continue_fitting = False
-
                 elif any(is_redundant) and crop:
+                    msg += f"some submodels are redundant AND {crop=}-> cropping fit!"
                     submodels = [
                         f
                         for (idx, f) in enumerate(fs)
@@ -1209,13 +1465,20 @@ class LWindow(_SpecWindow):
                         with_neighbours=with_neighbours,
                         fitter_kwargs=fitter_kwargs,
                     )
-
                 else:
+                    if any(is_redundant):
+                        msg += f"some submodels are redundant BUT {crop=}"
+                    else:
+                        msg += "no submodels are redundant"
+                    msg += " -> blacklisting the new model and stopping loop!"
+
                     continue_fitting = False
                     self.blacklist[new_model.pure_name] = True
-
                     if not aggressive:
-                        self.fit = self.fits[self.fit.n_submodels - 1]
+                        self.model = self.fits[n_prev]
+                        self.fit = self.fits[n_prev]
+
+            logger.debug(msg)
 
         # Perform final model cropping
         if crop:
@@ -1318,7 +1581,7 @@ class LWindow(_SpecWindow):
         configuration = self.getConfiguration()
 
         single_lines: list[GaussianModel] = []
-        multiple_lines: list[GaussianModel | _VProfileCopy] = []
+        multiple_lines: list[Union[GaussianModel, VProfileCopy]] = []
         for f in fs:
             if configuration[f.pure_name] == 1 and isinstance(
                 f, GaussianModel
@@ -1399,8 +1662,7 @@ class LWindow(_SpecWindow):
             )
             return True
 
-    @validate_call
-    def getModel(self, thaw: bool = False) -> Optional[CompoundModel_]:
+    def getModel(self) -> Optional[CompoundModel_]:
         """
         Retrieves this 'LWindow's current fit/model if available.
 
@@ -1410,99 +1672,79 @@ class LWindow(_SpecWindow):
         retrieved model inplace will therefore NOT update the 'LWindow's model,
         and the fit will need to be applied using" 'ApplyFit'.
         """
-        fit = self.fit or self.model
-        if fit is None:
-            return None
-
-        if thaw:
-            fit = fit.copy()
-            fs = (fit,) if fit.n_submodels == 1 else fit
-
-            def filter_func(f):
-                # True if submodel is a velocity profile copy, but not a part of
-                # a multiplet.
-                return (
-                    isinstance(f, _VProfileCopy)
-                    and f.pure_name not in self.is_multiplet_of
-                )
-
-            for f in filter(filter_func, fs):
-                f._thaw_velocity_profile(inplace=True)
-                f._remember_ties(inplace=True)
-
-        return fit
-
+        return self.fit or self.model
+    
     @validate_call
     def createVelocityProfileCopy(
         self,
         master: str,
         wave: float,
         mimic: str,
-        freeze: bool = False,
-        model_kwargs: dict | None = None,
-    ) -> _VProfileCopy:
+    ) -> VProfileCopy:
         """
-        ** PYDANTIC VALIDATED METHOD **
+        Create a copy of an emission line velocity profile. 
 
-        Creates a copy of an emission lines velocity profile, with the centre
-        'wave' (float) and gives it the name 'name' (str). All submodels with
-        a 'pure_name' equal to 'master' are used for the velocity profile.
+        Parameters
+        ----------
+        master : str
+            The (pure) name of the emission line components to use to create 
+            the velocity profile copy.
+        wave : float
+            The central wavelength of the velocity profile copy.
+        mimic : str
+            The name of the velocity profile copy. 
         """
         if master not in self.names:
-            msg = f"Line '{master}' not found in {self.__str__(simple=True).removesuffix('.')}!  Available names are: {self.names}"
-            raise ValueError(msg)
-        
-        model = self.getModel.__wrapped__(self, thaw=False)
-        ms = (model,) if model.n_submodels == 1 else model
-        names = {m.pure_name for m in ms}
+            raise ValueError(f"Name '{master}' is not in {self.names}")
 
-        if master not in names:
-            raise ValueError(
-                f"Line '{master}' not found in the current model of "
-                f"{self.__str__(simple=True).removesuffix('.')}! Available "
-                f"lines are: {names}"
-            )
 
-        submodels = [m for m in ms if m.pure_name == master]
+        model = self.getModel()
+        ms = [
+            m
+            for m in ((model,) if model.n_submodels == 1 else model)
+            if m.pure_name == master
+        ]
+        selected_model = sum(ms[1:], start=ms[0])
 
-        return VProfileCopyDict[len(submodels)].from_model(
-            wave,
-            mimic,
-            sum(submodels[1:], start=submodels[0]),
-            freeze=freeze,
-            **(model_kwargs or {}),
-        )
+        return create_vprofilecopy(selected_model, mimic, wave=wave)
 
     @validated_apply_info_to_method(
         subjects=("lines",), specific_kwargs={"adapt_scale"}
     )
     def applyMyself(
         self,
-        line_windows: list[_SpecWindow] | None = None,
         *,
         adapt_scale: bool | None = None,
     ) -> Self:
         """
-        Applies this 'LWindow's velocity profile copies to other 'LWindow's.
+        Apply this `Lwindow` instance's fit to other `LWindow` instances' 
+        models.
 
-        NOTES
+        This method iterates over the `copies_to` attribute dictionary and 
+        locates the `LWindow` instances containing the mimic lines.  
+
+        Parameters
+        ----------
+        adapt_scale : bool
+
+        Returns
+        -------
+        LWindow
+            The current `LWindow` instance after applying the fit.
+
+        Notes
         -----
-        When creating the velocity-profile copy, the keyword argument 'freeze'
-        is set to True.
-
-        This method does not use Pydantic type validation due to the use of:
-        'list[Self]' in the type annotation of 'line_windows'.
+        The `copies_to` dictionary has to element types: either a 2-tuple of 
+        strings or a tuple of a string and None. The latter case indicates that 
+        the corresponding line mimics a line covered by the same `LWindow` 
+        instance.
         """
-        if line_windows is None:
-            assert self.spectrum is not None
-            line_windows = self.spectrum.em
-
         for master, children in self.copies_to.items():
             for idx_d, mimic in filter(
                 lambda item: item[0] is not None,
                 children,
             ):
-                lwindow = line_windows[idx_d]
+                lwindow: LWindow = self.spectrum.em[idx_d]
 
                 # Check if master line has been cropped
                 if master in self.cropped:
@@ -1510,16 +1752,39 @@ class LWindow(_SpecWindow):
                     lwindow.cropped.add(mimic)
                     continue
 
+                vprofilecopy = self.createVelocityProfileCopy.__wrapped__(
+                    self,
+                    master,
+                    lwindow.waves[mimic],
+                    mimic,
+                )
                 lwindow.applyVelocityProfileCopy.__wrapped__(
                     lwindow,
-                    self.createVelocityProfileCopy(
-                        master,
-                        lwindow.lines[mimic],
-                        mimic,
-                        freeze=True,
-                    ),
+                    vprofilecopy,
                     adapt_scale=adapt_scale,
                 )
+
+                submimics: list[str] = [
+                    submimic
+                    for idx, submimic in lwindow.copies_to.get(mimic, [])
+                    if idx is None
+                ]
+                for submimic in submimics:
+                    # Create velocity profile copy of the 'master' velocity 
+                    # profile copy
+                    subcopy = create_vprofilecopy(
+                        vprofilecopy,
+                        submimic,
+                        wave=lwindow.waves[submimic],
+                        strength_scale_value=lwindow.scale_init[submimic],
+                        strength_scale_bounds=lwindow.scale_bounds[submimic],
+                        strength_scale_fixed=lwindow.scale_fixed[submimic],
+                    )
+                    lwindow.applyVelocityProfileCopy.__wrapped__(
+                        lwindow,
+                        subcopy,
+                        adapt_scale=adapt_scale,
+                    )
 
         return self
 
@@ -1528,67 +1793,51 @@ class LWindow(_SpecWindow):
     )
     def applyVelocityProfileCopy(
         self,
-        master_model: _VProfileCopy,
+        model: VProfileCopy,
         *,
         adapt_scale: bool | None = None,
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
-        Applies a velocity profile copy, 'master_model', to this 'LWindow'. This
-        velocity profile copy replaces the existant submodels with same
-        'pure_name' attribute.
-
-        Successfully applying the velocity profile copy resets 'blacklist',
-        'fits' and 'fit_infos' attributes, and sets the default blacklist
-        value of the velocity profile to 'True' and 'n_max' to 1, i.e. no
-        additional Gaussians will be placed on top of the velocity profile copy.
+        Apply a velocity profile copy to the current `LWindow` instance and 
+        update the `strength_scale` parameter. 
+        
+        If `adapt_scale` is True and the `strength_scale` parameter is not 
+        fixed, the strength scale will be adapted s.t. the integrated flux of 
+        the velocity profile copy matches that of the replaced Gaussian 
+        functions.  
         """
-        mimic = master_model.pure_name
+        mimic = model.pure_name
         assert mimic in self.names
         assert self.model is not None
 
         ms = self.model if (self.model.n_submodels > 1) else [self.model]
-        replaced_ms = list(
-            filter(
-                lambda m: m.pure_name == mimic,
-                ms,
-            )
-        )
-        other_ms = list(
-            filter(
-                lambda m: m.pure_name != mimic,
-                ms,
-            )
-        )
-        val = apply_bounds(
-            self.scale_init[mimic],
-            bounds := self.scale_bounds[mimic],
-        )
-        master_model.strength_scale.value = val
-        master_model.strength_scale.bounds = bounds
-        master_model.strength_scale.fixed = bool(val == bounds[0] == bounds[1])
+        replaced_ms = [m for m in ms if m.pure_name == model.pure_name]
+        other_ms = [m for m in ms if m.pure_name != model.pure_name]
 
-        if adapt_scale and not master_model.strength_scale.fixed:
-            master_model.adaptStrengthScale(replaced_ms)
+        scale = model.strength_scale
+        scale.value = apply_bounds.__wrapped__(
+            self.scale_init[model.pure_name],
+            self.scale_bounds[model.pure_name],
+        )
+        scale.bounds = self.scale_bounds[model.pure_name]
+        scale.fixed = self.scale_fixed[model.pure_name] \
+            or (scale.bounds[0] == scale.bounds[1])
+
+        if adapt_scale and not model.strength_scale.fixed:
+            model.adaptStrengthScale(replaced_ms)
 
         new_ms = sorted(
-            other_ms + [master_model],
+            sum(other_ms, start=model),
             key=lambda m: m.sorting_key,
         )
-
-        self.model = (
-            new_ms[0]
-            if (len(new_ms) == 1)
-            else sum(new_ms[1:], start=new_ms[0])
-        )
+        self.model = sum(new_ms[1:], start=new_ms[0])
 
         # Remove current fit if existant
         self.fit = None
 
         # Reset blacklist and previous fits
-        self._blacklist[master_model.pure_name] = True
-        self.n_maxs[master_model.pure_name] = 1
+        self._blacklist[model.pure_name] = True
+        self.n_maxs[model.pure_name] = 1
 
         self.blacklist = self._blacklist.copy()
         self.fits.clear()
@@ -1601,8 +1850,8 @@ class LWindow(_SpecWindow):
         self,
         fit: Union[
             GaussianModel,
-            type[_VProfileCopy],
-            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
+            VProfileCopy,
+            CompoundModel_[Union[GaussianModel, VProfileCopy]],
         ],
         *,
         fit_info: FitInfo | None = None,
@@ -1648,28 +1897,16 @@ class LWindow(_SpecWindow):
         self,
         fit: Union[
             GaussianModel,
-            type[_VProfileCopy],
-            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
+            VProfileCopy,
+            CompoundModel_[Union[GaussianModel, VProfileCopy]],
         ],
         *,
         fit_info: FitInfo | None = None,
-        freeze: bool = False,
         update_emission: bool = False,
     ) -> Self:
         """
         Applies the 'fit' and 'fit_info' values to this 'LWindow' class.
-
-        NOTES
-        -----
-        If 'freeze' is True, a copy of the 'fit' value is applied.
         """
-        if freeze:
-            fit = fit.copy()
-            fs = (fit,) if fit.n_submodels == 1 else fit
-            for f in (f for f in fs if isinstance(f, _VProfileCopy)):
-                f._freeze_velocity_profile(inplace=True)
-                f._forget_ties(inplace=True)
-
         n = fit.n_submodels
         self.fits[n] = self.fit = fit
         self.fit_infos[n] = self.fit_info = fit_info
@@ -1685,8 +1922,6 @@ class LWindow(_SpecWindow):
         model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]],
     ) -> Self:
         """
-        ** PYDANTIC VALIDATED METHOD **
-
         Updates the '_y_em' attribute to account for a new emission line model,
         'model'. If no previous model is found, '_y_em' is updated directly. If
         a previous model is found, this model's '_y_em' contribution is first
@@ -1696,17 +1931,29 @@ class LWindow(_SpecWindow):
         is removed.
         """
         # Subtract previous contribution
-        self._y_em -= self._y_em_contrib
+        self._y_em[:] -= self._y_em_contrib
 
         # Calculate new contribution
-        self._y_em_contrib[:] = 0
-
+        self._y_em_contrib[:] = 0.0
         if model is not None:
-            mask = isfinite(self._x)
-            self._y_em_contrib[mask] = model(self._x[mask])
+            eval_mask = isfinite(self._x)
+            x = self._x[eval_mask]
 
+            preparer = PrepareModel(
+                x=self._x,
+                model=model,
+                eval_mask=eval_mask,
+                comp_mask=eval_mask,
+                kernels=self._kernels,
+                is_logbinned=True,
+            )
+            with preparer as (seq_model, _):
+                f = seq_model(x)
+
+            # Store the new emission line contribution
+            self._y_em_contrib[eval_mask] = f
             # Add current contribution
-            self._y_em[mask] += self._y_em_contrib[mask]
+            self._y_em[eval_mask] += f
 
         return self
 
@@ -1718,9 +1965,10 @@ class LWindow(_SpecWindow):
             raise ValueError(f"line '{name}' not in 'self.names'!")
 
         self.names.remove(name)
+        self.linetypes.pop(name)
         self.complexes.pop(name)
 
-        del self.lines[name]
+        del self.waves[name]
         del self.n_maxs[name]
 
         del self.strength_bounds[name]
@@ -1736,14 +1984,14 @@ class LWindow(_SpecWindow):
 
         return self
 
-    def sortLines(self) -> list[tuple[str, float]]:
+    def sortWaves(self) -> list[tuple[str, float]]:
         def sorting_key(item: tuple[str, float]) -> tuple[float, float]:
             return (
                 0.0 if item[0] in self.is_multiplet_of.values() else 1.0,
                 item[1],
             )
 
-        return sorted(self.lines.items(), key=sorting_key)
+        return sorted(self.waves.items(), key=sorting_key)
 
     def getConfiguration(
         self,
@@ -1774,22 +2022,10 @@ class LWindow(_SpecWindow):
         return self
 
     def reformatFit(self) -> Self:
-        # ! Make this method inplace, i.e. no final 'sum'?
-        assert self.fit is not None
-
-        if self.fit.n_submodels == 1:
-            self.fit.name = self.fit.pure_name
-        else:
-            fs = order_submodels(self.fit, combine=False)
-            current_count = defaultdict(lambda: 1)
-            max_count = self.getConfiguration()
-
-            for f in filter(lambda f: max_count[f.pure_name] > 1, fs):
-                f.name = f"{f.pure_name}#{current_count[f.pure_name]}"
-                current_count[f.pure_name] += 1
-
-            self.fit = sum(fs[1:], start=fs[0])
-
+        if self.model is not None:
+            rename_gaussians(self.model)
+        if self.fit is not None:
+            rename_gaussians(self.fit)
         return self
 
     @validated_apply_info_to_method(
@@ -1816,6 +2052,7 @@ class LWindow(_SpecWindow):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=False,
             mode=None,
             covered=True,
             without_rejections=without_rejections,
@@ -1828,6 +2065,7 @@ class LWindow(_SpecWindow):
             complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
+            shrink=None,
         )
         under = Under(
             masked_coords.x,
@@ -1865,6 +2103,7 @@ class LWindow(_SpecWindow):
 
         masked_coords = self.getMaskedCoords.__wrapped__(
             self,
+            original=False,
             mode=None,
             covered=True,
             without_rejections=without_rejections,
@@ -1877,6 +2116,7 @@ class LWindow(_SpecWindow):
             complex_name=complex_name,
             limited=limited,
             v_sep=v_sep,
+            shrink=None,
         )
         over = Over(
             masked_coords.x,
@@ -1890,7 +2130,7 @@ class LWindow(_SpecWindow):
 
     ### Error estimation
 
-    @validated_apply_info_to_method(subjects=("error", "nonlinear"))
+    @validated_apply_info_to_method(subjects=("error", "nonlinear", "random"))
     def instantiateBootstrapper(
         self,
         *,
@@ -1909,12 +2149,11 @@ class LWindow(_SpecWindow):
         vary_lines: VaryLines | None = None,
         cfit: ContinuumFitResult | None = None,
         iterations: int | None = None,
-        random_state: RandomState_ | None = None,
-        renew_rng: bool | None = None,
         replace_missing: bool | None = None,
         tqdm_disable: bool | None = None,
         tqdm_leave: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
+        random_state: RandomState_ | None = None,
     ) -> BaseBootstrapper:
         """
         ** PYDANTIC VALIDATED METHOD **
@@ -1943,7 +2182,6 @@ class LWindow(_SpecWindow):
             cfit=cfit,
             iterations=iterations,
             random_state=random_state,
-            renew_rng=renew_rng,
             replace_missing=replace_missing,
             tqdm_disable=tqdm_disable,
             tqdm_leave=tqdm_leave,
@@ -2095,111 +2333,31 @@ class LWindow(_SpecWindow):
             logp=logp,
         )
 
-    def fitplot(
+    def componentsplot(
         self,
-        *,
-        plot_components: bool = False,
-        plot_type: Literal["difference", "residual"] = "difference",
-        figure: tuple[Figure, list[Axes, Axes]] | None = None,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-        height_ratio: float = 3.0,
-        n_sigma: float = 2.0,
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-        dlabel: str | None = None,
-        zlabel: str | None = None,
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        dlim: tuple[float, float] | None = None,
-        zlim: tuple[float, float] | None = (-5, 5),
-        pl_color: str | None = DEFAULT_COLORS["pl"],
-        fe_color: str | None = DEFAULT_COLORS["fe"],
-        ba_color: str | None = DEFAULT_COLORS["ba"],
-        hg_color: str | None = DEFAULT_COLORS["hg"],
-        em_color: str | None = DEFAULT_COLORS["em"],
-        sm_color: str | None = DEFAULT_COLORS["sm"],
-        ab_color: str | None = DEFAULT_COLORS["ab"],
-        xticks: tuple[float, float] | None = None,
-        yticks: tuple[float, float] | None = None,
-        dticks: tuple[float, float] | None = None,
-        zticks: tuple[float, float] | None = None,
-        logx: bool = False,
-        logy: bool = False,
-        cmap_name: str = "tab20",
-        distinguish_narrow: bool = True,
-    ) -> tuple[Figure, list[Axes, Axes]]:
-        xlim = xlim or self.x_bounds
-        model = (self.spectrum or self).getModel() if plot_components else None
-        coords = get_coords(self, x_bounds=xlim, replace_with_nan=False)
-        if model is not None:
-            ms = (model,) if model.n_submodels == 1 else model
+        pattern: str | Pattern[str],
+        dv: float,
+        mode: Literal["simple", "difference", "residual"],
+        lazy: bool = False,
+        **plotter_kwargs,
+    ) -> Union[
+        SimpleEmissionLineComponents,
+        EmissionLineComponentsWithDifferences,
+        EmissionLineComponentsWithResiduals,
+    ]:
 
-            def func(m):
-                return m.model_type in ("pl", "fe", "ba", "hg") \
-                    or m.pure_name in self.names
-
-            submodels = list(filter(func, ms))
-            if submodels:
-                model = sum(submodels[1:], start=submodels[0])
-            else:
-                model = None
-
-        kwargs = {
-            'plot_type': plot_type,
-            'figure': figure,
-            'figsize': figsize,
-            'dpi': dpi,
-            'title': title or self.__str__(),
-            'height_ratio': height_ratio,
-            'n_sigma': n_sigma,
-            'xlabel': xlabel or "auto",
-            'ylabel': ylabel or "auto",
-            'dlabel': dlabel or "auto",
-            'zlabel': zlabel or "auto",
-            'xlim': xlim or "auto",
-            'ylim': ylim or "auto",
-            'dlim': dlim or "auto",
-            'zlim': zlim or "auto",
-            'pl_color': pl_color,
-            'fe_color': fe_color,
-            'ba_color': ba_color,
-            'hg_color': hg_color,
-            'em_color': em_color,
-            'sm_color': sm_color,
-            'ab_color': ab_color,
-            'xticks': xticks or "auto",
-            'yticks': yticks or "auto",
-            'dticks': dticks or "auto",
-            'zticks': zticks or "auto",
-            'logx': logx,
-            'logy': logy,
-            'cmap_name': cmap_name,
-            'distinguish_narrow': distinguish_narrow,
-        }
-        if plot_components:
-            model = (self.spectrum or self).getModel()
-            submodels = [
-                m
-                for m in ((model,) if model.n_submodels == 1 else model)
-                if (m.model_type in {"pl", "fe", "ba", "hg"})
-                or (m.pure_name in self.names)
-            ]
-            model = (
-                sum(submodels[1:], start=submodels[0]) if submodels else None
-            )
-            with PrepareModel(x=coords.x, model=model):
-                return fitplot(
-                    coords,
-                    self.info,
-                    model=model,
-                    **kwargs,
-                )
-
-        return fitplot(
-            coords,
-            self.info,
-            model=None,
-            **kwargs,
-        )
+        # key = "ylim" if mode == "simple" else "y0lim"
+        # if key not in plotter_kwargs:
+        #     ymin = self.y[self.valid_pixels].min()
+        #     ymax = self.y[self.valid_pixels].max()
+        #     dy = (ymax - ymin) * get_ymargin()
+        #     plotter_kwargs[key] = (ymin - dy, ymax + dy)
+                    
+        args = (self, self.getModel(), pattern, dv)
+        cls = {
+            "simple": SimpleEmissionLineComponents,
+            "difference": EmissionLineComponentsWithDifferences,
+            "residual": EmissionLineComponentsWithResiduals,
+        }[mode]
+        plotter = cls(*args, **plotter_kwargs)
+        return plotter if lazy else plotter.plot()

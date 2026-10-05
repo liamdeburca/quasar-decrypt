@@ -1,12 +1,15 @@
 __all__ = [
+    "CachedGetMask",
     "ContiguousMaskedCoords",
     "MaskedCoords",
+    "OriginalContiguousMaskedCoords",
+    "OriginalMaskedCoords",
+    "OriginalReadOnlyMaskedCoords",
     "ReadOnlyMaskedCoords",
     "_BaseSpec",
     "_Spec",
     "_SpecWindow",
     "_SpecWindowList",
-    "create_cached_get_mask",
     "get_bounds_indices",
     "get_log",
     "get_mask",
@@ -21,6 +24,9 @@ from .general import get_bounds_indices, stopwatch
 from .masked_coords import (
     ContiguousMaskedCoords,
     MaskedCoords,
+    OriginalContiguousMaskedCoords,
+    OriginalMaskedCoords,
+    OriginalReadOnlyMaskedCoords,
     ReadOnlyMaskedCoords,
 )
-from .utils import create_cached_get_mask, get_log, get_mask
+from .utils import CachedGetMask, get_log, get_mask

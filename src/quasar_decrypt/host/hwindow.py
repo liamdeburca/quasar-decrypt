@@ -13,6 +13,6 @@ from ..utils import _SpecWindow
 logger = getLogger(__name__)
 
 
-@dataclass(init=False)
+@dataclass
 class HWindow(_SpecWindow):
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "hg"})

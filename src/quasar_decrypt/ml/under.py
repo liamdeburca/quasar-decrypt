@@ -18,7 +18,7 @@ from numpy import (
     zeros_like,
 )
 from quasar_typing.numpy import FloatVector
-from quasar_utils.absorption.absorption import fft
+from quasar_utils.absorption.absorption import fft_test
 from scipy.stats import chi2
 
 ### Load 'is under-fitted models'
@@ -102,7 +102,7 @@ class Under:
 
     @cached_property
     def fft(self) -> float:
-        return fft(self.z, log=False)[1]
+        return fft_test(self.z)[1]
 
     @cached_property
     def cov(self) -> float:

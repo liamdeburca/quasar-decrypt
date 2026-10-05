@@ -21,7 +21,7 @@ from numpy import (
 )
 from quasar_typing.astropy import CompoundModel_, Model_
 from quasar_typing.numpy import FloatVector
-from quasar_utils.absorption.absorption import fft
+from quasar_utils.absorption.absorption import log_fft_test
 from scipy.stats import chi2
 
 logger = getLogger(__name__)
@@ -158,8 +158,8 @@ class Over:
     @cached_property
     def log_fft(self) -> tuple[float, float]:
         return (
-            log(10) * fft(self.z_initial, log=True)[1],
-            log(10) * fft(self.z_final, log=True)[1],
+            log_fft_test(self.z_initial)[1],
+            log_fft_test(self.z_final)[1],
         )
 
     @cached_property
@@ -187,10 +187,10 @@ class Over:
         return features[None, :]
 
     def __call__(self, n: int | None = None, n_default: int = 2) -> bool:
-        classifier = self.classifiers.get(
-            n or self.n_final, self.classifiers[n_default]
-        )
-        X = self.getFeatures(as_dict=False)
+        # classifier = self.classifiers.get(
+        #     n or self.n_final, self.classifiers[n_default]
+        # )
+        # X = self.getFeatures(as_dict=False)
 
         dchi2n = self.chi2n[1] - self.chi2n[0]
         y = not (dchi2n < 0)
