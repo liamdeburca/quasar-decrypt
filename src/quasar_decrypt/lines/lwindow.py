@@ -1,38 +1,19 @@
 __all__ = ["LWindow"]
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import field
 from itertools import pairwise
 from logging import getLogger
 from math import floor, prod
 from re import Pattern
 from typing import Any, ClassVar, Literal, Optional, Self, Union
 
+import numpy as np
+import pydantic
 from astropy.constants import c
-from matplotlib.axes import Axes
-from matplotlib.figure import Figure
-from numpy import (
-    argmax,
-    convolve,
-    empty,
-    exp,
-    float64,
-    fromiter,
-    interp,
-    invert,
-    isfinite,
-    isnan,
-    linspace,
-    zeros_like,
-)
-from quasar_errors.bootstrapping import BaseBootstrapper
-from quasar_errors.error_result import ErrorResult
-from quasar_errors.model_samples import GaussianSampleList
-from quasar_errors.spectrum_utils.format_bootstrapping_kwargs_for_lwindow import (
-    format_bootstrapping_kwargs_for_lwindow,
-)
 from quasar_models import (
     BalmerModel,
+    EmModel,
     GaussianModel,
     HostGalaxyModel,
     IronModel,
@@ -50,51 +31,36 @@ from quasar_models.utils.astropy import (
     apply_bounds,
     get_largest_possible_bounds,
 )
-from quasar_plotting import absorptionplot, quickplot
-from quasar_plotting.colors import DEFAULT_COLORS
-from quasar_plotting.utils import get_coords
-from quasar_typing.astropy import CompoundModel_, FitInfo
+from quasar_typing.astropy import CompoundModelType
 from quasar_typing.bounds import AstropyBounds
-from quasar_typing.misc import (
+from quasar_typing.literals import BootstrapType, Scale, Variant
+from quasar_typing.multiprocessing import PoolType
+from quasar_typing.numpy import BoolVector, FloatVector, RandomStateType
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import (
     BackgroundFlux,
-    BootstrapType,
     ModelTypes,
-    Scale,
-    Variant,
     VaryLines,
 )
-from quasar_typing.misc.pool import Pool_
-from quasar_typing.numpy import BoolVector, FloatVector, RandomState_
 from quasar_utils.continuum_fit_result import ContinuumFitResult
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.setup import FitterKwargs
-from scipy.ndimage import binary_dilation
 
-from ..ml import Over, Under
-from ..plotting.diagnostics import (
-    EmissionLineComponentsWithDifferences,
-    EmissionLineComponentsWithResiduals,
-    SimpleEmissionLineComponents,
-)
-from ..utils import (
+from quasar_decrypt.utils import (
     ContiguousMaskedCoords,
     MaskedCoords,
     ReadOnlyMaskedCoords,
     _SpecWindow,
     stopwatch,
 )
-from .utils import common_middle, update_v_off_bounds
 
 logger = getLogger(__name__)
 C_KMS: float = c.to("km/s").value
 
-type LineModel = Union[GaussianModel, CompoundModel_[GaussianModel]]
+type LineModel = Union[EmModel, CompoundModelType[EmModel]]
 
 
-@dataclass(kw_only=True)
+@pydantic.dataclasses.dataclass(kw_only=True)
 class LWindow(_SpecWindow):
     names: set[str] = field(default_factory=set, kw_only=True)
 
@@ -144,15 +110,12 @@ class LWindow(_SpecWindow):
     # prev_model: LineModel | None = field(default=None, kw_only=True)
     model: LineModel | None = field(default=None, kw_only=True)
     fit: LineModel | None = field(default=None, kw_only=True)
-    fit_info: FitInfo | None = field(default=None, kw_only=True)
+    fit_info: OptimizeResultType | None = field(default=None, kw_only=True)
 
     fits: dict[int, LineModel] = field(default_factory=dict, kw_only=True)
-    fit_infos: dict[int, FitInfo] = field(default_factory=dict, kw_only=True)
+    fit_infos: dict[int, OptimizeResultType] = field(default_factory=dict, kw_only=True)
 
     cropped: set[str] = field(default_factory=set, kw_only=True)
-
-    bootstrapper: BaseBootstrapper | None = field(default=None, init=False)
-    error_result: ErrorResult | None = field(default=None, init=False)
 
     _y_em_contrib: FloatVector | None = field(default=None, init=False)
 
@@ -160,7 +123,7 @@ class LWindow(_SpecWindow):
 
     def __post_init__(self):
         if self._y_em_contrib is None:
-            self._y_em_contrib = zeros_like(self._x, dtype=float64)
+            self._y_em_contrib = np.zeros_like(self._x, dtype=np.float64)
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
@@ -189,8 +152,6 @@ class LWindow(_SpecWindow):
         state["fits"] = self.fits
         state["fit_infos"] = self.fit_infos
         state["cropped"] = self.cropped
-        state["bootstrapper"] = self.bootstrapper
-        state["error_result"] = self.error_result
         state["_y_em_contrib"] = self._y_em_contrib
         return state
 
@@ -221,12 +182,11 @@ class LWindow(_SpecWindow):
         self.fits = state.get("fits")
         self.fit_infos = state.get("fit_infos")
         self.cropped = state.get("cropped")
-        self.bootstrapper = state.get("bootstrapper")
-        self.error_result = state.get("error_result")
         self._y_em_contrib = state.get("_y_em_contrib")
 
     @property
-    def sample(self) -> GaussianSampleList | None:
+    def sample(self):
+        from quasar_errors.model_samples import GaussianSampleList
         if (model := self.getModel()) is None:
             return None
         return GaussianSampleList.fromGaussianModels(model)
@@ -505,7 +465,7 @@ class LWindow(_SpecWindow):
     @validated_apply_info_to_method(subjects=("nonlinear",))
     def addCustomModel(
         self,
-        new_model: GaussianModel,
+        new_model: EmModel,
         *,
         force_add: bool = False,
         refit: bool = False,
@@ -582,6 +542,7 @@ class LWindow(_SpecWindow):
             absorbed, and are limited to a single profile function. If None, no
             emission lines are limited based on absorption. Default is 'self.default_kwargs['crit_abs_ratio'].
         """
+        from .utils import common_middle, update_v_off_bounds
         # STEP 1
 
         logger.debug(
@@ -636,13 +597,13 @@ class LWindow(_SpecWindow):
                 complex_bounds.items(),
                 key=lambda item: item[1][0],
             ))
-            complex_lbs = fromiter(
+            complex_lbs = np.fromiter(
                 (val[0] for val in complex_bounds.values()),
-                float64,
+                dtype=np.float64,
             )
-            complex_ubs = fromiter(
+            complex_ubs = np.fromiter(
                 (val[1] for val in complex_bounds.values()),
-                float64,
+                dtype=np.float64,
             )
             if not (complex_lbs[1:] >= complex_ubs[:-1]).all():
                 msg = f"Complexes overlap: {complex_bounds=}"
@@ -650,7 +611,7 @@ class LWindow(_SpecWindow):
                 raise ValueError(msg)
 
             n_complexes = len(complex_bounds)
-            _i_bounds = empty(n_complexes + 1)
+            _i_bounds = np.empty(n_complexes + 1)
 
             _i_bounds[0] = max(
                 complex_lbs[0] * (1 - v_sep),
@@ -824,6 +785,8 @@ class LWindow(_SpecWindow):
         subjects=("loading",), specific_kwargs={"sigma_res"}
     )
     def prepareNeighbours(self, *, sigma_res: float | None = None) -> Self:
+        from scipy.ndimage import binary_dilation
+
         msg = "Preparing neighbours for {}: ".format(
             self.__str__(simple=True).removesuffix(".")
         )
@@ -892,9 +855,9 @@ class LWindow(_SpecWindow):
             valid_pixels = self._valid_pixels[mask]
 
             n = mask.sum()
-            f = (valid_pixels & invert(absorbed_pixels)).sum()
+            f = (valid_pixels & ~absorbed_pixels).sum()
             a = (valid_pixels & absorbed_pixels).sum()
-            i = invert(valid_pixels).sum()
+            i = (~valid_pixels).sum()
 
             msg = (
                 ">>> [{:.1f} <-> {:.1f}] w/ {}/{n} (fit.),"
@@ -1020,7 +983,7 @@ class LWindow(_SpecWindow):
                 shrink=None,
             )
             y_smooth = masked_coords.y_smooth
-            if isnan(y_smooth).all():
+            if np.isnan(y_smooth).all():
                 y_smooth = masked_coords.y
 
             log(msg + f"instantiating model using {masked_coords.size} data points!")
@@ -1111,7 +1074,7 @@ class LWindow(_SpecWindow):
                 where=where,
                 get_model=True,
                 inplace=False,
-                **fitter_kwargs,
+                **(fitter_kwargs or {}),
             )
 
         logger.debug(msg)
@@ -1185,7 +1148,7 @@ class LWindow(_SpecWindow):
                 fs,
             ):
                 # Interpolate noise level and compare with peak flux density
-                crit_val = evaluate_initial * interp(
+                crit_val = evaluate_initial * np.interp(
                     f.mu,
                     masked_coords.x,
                     masked_coords.dy,
@@ -1243,14 +1206,14 @@ class LWindow(_SpecWindow):
                 (masked_coords.y - self.fit(masked_coords.x))
                 / masked_coords.dy
             )
-            z_convolved = convolve(
+            z_convolved = np.convolve(
                 z,
-                exp(-(linspace(-3, 3, w) ** 2)),
+                np.exp(-(np.linspace(-3, 3, w) ** 2)),
                 mode="valid",
             )
-            z_interp = interp(waves, masked_coords.x[h:-h], z_convolved)
+            z_interp = np.interp(waves, masked_coords.x[h:-h], z_convolved)
 
-            submodel: GaussianModel = valid_lines[argmax(z_interp).flatten()[0]]
+            submodel: GaussianModel = valid_lines[np.argmax(z_interp).flatten()[0]]
 
             name = submodel.pure_name
             complex_name = self.complexes[name]
@@ -1662,7 +1625,7 @@ class LWindow(_SpecWindow):
             )
             return True
 
-    def getModel(self) -> Optional[CompoundModel_]:
+    def getModel(self) -> Optional[LineModel]:
         """
         Retrieves this 'LWindow's current fit/model if available.
 
@@ -1674,7 +1637,7 @@ class LWindow(_SpecWindow):
         """
         return self.fit or self.model
     
-    @validate_call
+    @pydantic.validate_call
     def createVelocityProfileCopy(
         self,
         master: str,
@@ -1845,16 +1808,12 @@ class LWindow(_SpecWindow):
 
         return self
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
-        fit: Union[
-            GaussianModel,
-            VProfileCopy,
-            CompoundModel_[Union[GaussianModel, VProfileCopy]],
-        ],
+        fit: LineModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         self.fits.clear()
@@ -1892,16 +1851,12 @@ class LWindow(_SpecWindow):
         if update_emission:
             self.updateLinesEmission.__wrapped__(self, fit)
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: Union[
-            GaussianModel,
-            VProfileCopy,
-            CompoundModel_[Union[GaussianModel, VProfileCopy]],
-        ],
+        fit: LineModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -1916,10 +1871,10 @@ class LWindow(_SpecWindow):
 
         return self
 
-    @validate_call
+    @pydantic.validate_call
     def updateLinesEmission(
         self,
-        model: Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]],
+        model: Union[LineModel, None],
     ) -> Self:
         """
         Updates the '_y_em' attribute to account for a new emission line model,
@@ -1936,7 +1891,7 @@ class LWindow(_SpecWindow):
         # Calculate new contribution
         self._y_em_contrib[:] = 0.0
         if model is not None:
-            eval_mask = isfinite(self._x)
+            eval_mask = np.isfinite(self._x)
             x = self._x[eval_mask]
 
             preparer = PrepareModel(
@@ -1996,9 +1951,7 @@ class LWindow(_SpecWindow):
     def getConfiguration(
         self,
         *,
-        model: Optional[
-            Union[GaussianModel, CompoundModel_[GaussianModel]]
-        ] = None,
+        model: Union[LineModel, None] = None,
     ) -> dict[str, int]:
         """
         Counts the number of submodels with the same `pure_name` attribute in
@@ -2047,6 +2000,7 @@ class LWindow(_SpecWindow):
         """
         ** PYDANTIC VALIDATED METHOD **
         """
+        from ..ml import Under
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -2096,6 +2050,8 @@ class LWindow(_SpecWindow):
         """
         ** PYDANTIC VALIDATED METHOD **
         """
+        from ..ml import Over
+
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -2141,7 +2097,7 @@ class LWindow(_SpecWindow):
         model_types: ModelTypes | None = None,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        pool: Pool_ | None = None,
+        pool: PoolType | None = None,
         scale: Scale | None = None,
         variant: Variant | None = None,
         bootstrap_type: BootstrapType | None = None,
@@ -2153,11 +2109,11 @@ class LWindow(_SpecWindow):
         tqdm_disable: bool | None = None,
         tqdm_leave: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
-        random_state: RandomState_ | None = None,
-    ) -> BaseBootstrapper:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
+        random_state: RandomStateType | None = None,
+    ):
+        from quasar_errors.spectrum_utils.format_bootstrapping_kwargs_for_lwindow import (
+            format_bootstrapping_kwargs_for_lwindow,
+        )
         assert scale == "local" or scale == "semilocal"
 
         if self.bootstrapper is not None:
@@ -2187,177 +2143,39 @@ class LWindow(_SpecWindow):
             tqdm_leave=tqdm_leave,
             logger=logger,
         )
-        self.bootstrapper = cls(*args, **kwargs)
-        return self.bootstrapper
-
-    @validate_call
-    def runBootstrapper(self) -> ErrorResult:
-        """
-        ** PYDANTIC VALIDATED METHOD **
-        """
-        if self.bootstrapper is None:
-            msg = "No bootstrapper instance found! \
-                Run 'instantiateBootstrapper()' method first!"
-            logger.critical(msg)
-            raise RuntimeError(msg)
-        if self.error_result is not None:
-            logger.debug("Existing 'error_result' will be overwritten.")
-
-        out = self.bootstrapper.run()
-        self.error_result = self.bootstrapper.toErrorResult(out)
-        return self.error_result
-
-    def quickplot(
-        self,
-        *,
-        figure: tuple[Figure, Axes] | None = None,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-        n_sigma: float = 2.0,
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        pl_color: str | None = DEFAULT_COLORS["pl"],
-        fe_color: str | None = DEFAULT_COLORS["fe"],
-        ba_color: str | None = DEFAULT_COLORS["ba"],
-        hg_color: str | None = DEFAULT_COLORS["hg"],
-        em_color: str | None = DEFAULT_COLORS["em"],
-        sm_color: str | None = DEFAULT_COLORS["sm"],
-        ab_color: str | None = DEFAULT_COLORS["ab"],
-        xticks: tuple[float, float] | None = None,
-        yticks: tuple[float, float] | None = None,
-        logx: bool = False,
-        logy: bool = False,
-    ) -> tuple[Figure, Axes]:
-        """
-        Basic plotting routing for 'Spectrum' classes.
-
-        NOTES
-        -----
-        This method overwrites but still calls the inherited '_quickplot'
-        method, setting 'title' equal to 'self.title' by default.
-        """
-        xlim = xlim or self.x_bounds
-        return quickplot(
-            get_coords(self, x_bounds=xlim, replace_with_nan=False),
-            self.info,
-            figure=figure,
-            figsize=figsize,
-            dpi=dpi,
-            title=title or self.__str__(simple=True).removesuffix("."),
-            n_sigma=n_sigma,
-            xlabel=xlabel or "auto",
-            ylabel=ylabel or "auto",
-            xlim=xlim,
-            ylim=ylim or "auto",
-            pl_color=pl_color,
-            fe_color=fe_color,
-            ba_color=ba_color,
-            hg_color=hg_color,
-            em_color=em_color,
-            sm_color=sm_color,
-            ab_color=ab_color,
-            xticks=xticks or "auto",
-            yticks=yticks or "auto",
-            logx=logx,
-            logy=logy,
-        )
-
-    def absorptionplot(
-        self,
-        *,
-        figure: tuple[Figure, list[Axes, Axes, Axes]] | None = None,
-        figsize: tuple[float, float] = (8, 6),
-        dpi: int = 300,
-        title: str | None = None,
-        height_ratio: float = 3.0,
-        n_sigma: float = 2.0,
-        xlabel: str | None = None,
-        ylabel: str | None = None,
-        zlabel: str | None = None,
-        plabel: str | None = None,
-        xlim: tuple[float, float] | None = None,
-        ylim: tuple[float, float] | None = None,
-        zlim: tuple[float, float] | None = (-5, 5),
-        plim: tuple[float, float] | None = (-5, 0),
-        pl_color: str | None = DEFAULT_COLORS["pl"],
-        fe_color: str | None = DEFAULT_COLORS["fe"],
-        ba_color: str | None = DEFAULT_COLORS["ba"],
-        hg_color: str | None = DEFAULT_COLORS["hg"],
-        em_color: str | None = DEFAULT_COLORS["em"],
-        sm_color: str | None = DEFAULT_COLORS["sm"],
-        ab_color: str | None = DEFAULT_COLORS["ab"],
-        xticks: tuple[float, float] | None = None,
-        yticks: tuple[float, float] | None = None,
-        zticks: tuple[float, float] | None = None,
-        pticks: tuple[float, float] | None = None,
-        logx: bool = False,
-        logy: bool = False,
-        logp: bool = True,
-    ) -> tuple[Figure, list[Axes]]:
-        xlim = xlim or self.x_bounds
-        return absorptionplot(
-            get_coords(self, x_bounds=xlim, replace_with_nan=False),
-            self.info,
-            figure=figure,
-            figsize=figsize,
-            dpi=dpi,
-            title=title or self.__str__(simple=True).removesuffix("."),
-            height_ratio=height_ratio,
-            n_sigma=n_sigma,
-            z_crit=self.info.absorption.z_crit,
-            p_crit=self.info.absorption.p_crit,
-            xlabel=xlabel or "auto",
-            ylabel=ylabel or "auto",
-            zlabel=zlabel or "auto",
-            plabel=plabel or "auto",
-            xlim=xlim or "auto",
-            ylim=ylim or "auto",
-            zlim=zlim or "auto",
-            plim=plim or "auto",
-            pl_color=pl_color,
-            fe_color=fe_color,
-            ba_color=ba_color,
-            hg_color=hg_color,
-            em_color=em_color,
-            sm_color=sm_color,
-            ab_color=ab_color,
-            xticks=xticks or "auto",
-            yticks=yticks or "auto",
-            zticks=zticks or "auto",
-            pticks=pticks or "auto",
-            logx=logx,
-            logy=logy,
-            logp=logp,
-        )
+        return cls(*args, **kwargs)
+    
 
     def componentsplot(
         self,
         pattern: str | Pattern[str],
         dv: float,
         mode: Literal["simple", "difference", "residual"],
+        model: Union[LineModel, None] = None,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> Union[
-        SimpleEmissionLineComponents,
-        EmissionLineComponentsWithDifferences,
-        EmissionLineComponentsWithResiduals,
-    ]:
+    ):
+        from quasar_decrypt.plotting.diagnostics import (
+            EmissionLineComponentsWithDifferences,
+            EmissionLineComponentsWithResiduals,
+            SimpleEmissionLineComponents,
+        )
+        if model is None:
+            model = self.getModel()
+        
+        args = (self, model, pattern, dv)
+        if mode == "simple":
+            plotter_cls = SimpleEmissionLineComponents
+        elif mode == "difference":
+            plotter_cls = EmissionLineComponentsWithDifferences
+        elif mode == "residual":
+            plotter_cls = EmissionLineComponentsWithResiduals
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
 
-        # key = "ylim" if mode == "simple" else "y0lim"
-        # if key not in plotter_kwargs:
-        #     ymin = self.y[self.valid_pixels].min()
-        #     ymax = self.y[self.valid_pixels].max()
-        #     dy = (ymax - ymin) * get_ymargin()
-        #     plotter_kwargs[key] = (ymin - dy, ymax + dy)
-                    
-        args = (self, self.getModel(), pattern, dv)
-        cls = {
-            "simple": SimpleEmissionLineComponents,
-            "difference": EmissionLineComponentsWithDifferences,
-            "residual": EmissionLineComponentsWithResiduals,
-        }[mode]
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot()
+        return self._plot_helper(
+            plotter_cls=plotter_cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

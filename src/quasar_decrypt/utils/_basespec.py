@@ -2,41 +2,31 @@ __all__ = ["_BaseSpec"]
 
 from abc import abstractmethod
 from dataclasses import field
+from functools import wraps
 from logging import getLogger
 from typing import Any, Literal, Optional, Self, Union
 
-from numpy import invert, isfinite
-from pydantic.dataclasses import dataclass
+import numpy as np
+import pydantic
 from quasar_models import (
     BalmerModel,
-    GaussianModel,
+    EmModel,
     HostGalaxyModel,
     IronModel,
     PowerLawModel,
 )
-from quasar_models.modeling import PrepareModel
-from quasar_typing.astropy import CompoundModel_
+from quasar_typing.astropy import CompoundModelType
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc import BackgroundFlux
 from quasar_typing.numpy import BoolVector, FloatMatrix, FloatVector
-from quasar_typing.scipy import csr_matrix_
-from quasar_utils.decorators import validate_call
-from quasar_utils.resolving import mask_kernels
+from quasar_typing.scipy import CSRMatrix
+from quasar_typing.string_selections import BackgroundFlux
 
-from .masked_coords import (
-    ContiguousMaskedCoords,
-    MaskedCoords,
-    OriginalContiguousMaskedCoords,
-    OriginalMaskedCoords,
-    OriginalReadOnlyMaskedCoords,
-    ReadOnlyMaskedCoords,
-)
 from .utils import CachedGetMask
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class _BaseSpec:
     """
     Base class for '_Spec', '_SpecWindow', and '_SpecWindowList' classes.
@@ -145,16 +135,18 @@ class _BaseSpec:
     # The matrix of resolution kernels (corrects for instrumental broadening)
 
     @property
-    def kernels(self) -> FloatMatrix | csr_matrix_:
+    def kernels(self) -> FloatMatrix | CSRMatrix:
         """Masked matrix of resolution kernels."""
+        from quasar_utils.resolving import mask_kernels
         return mask_kernels(
             self._kernels,
             self.mask,
         )
 
     @property
-    def kernels_original(self) -> FloatMatrix | csr_matrix_:
+    def kernels_original(self) -> FloatMatrix | CSRMatrix:
         """Masked matrix of original resolution kernels."""
+        from quasar_utils.resolving import mask_kernels
         return mask_kernels(
             self._kernels_original,
             self.mask_original,
@@ -495,7 +487,9 @@ class _BaseSpec:
             return False
         return bool(original)
 
-    @validate_call
+    ### getMask
+
+    @pydantic.validate_call
     def getMask(
         self,
         *,
@@ -511,6 +505,28 @@ class _BaseSpec:
         Get the total mask for the current object, corresponding to the window 
         mask with additional filtering options.
         """
+        return self._getMask(
+            original=original,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=valid,
+            log_valid=log_valid,
+            as_tuple=as_tuple,
+        )
+
+    @wraps(getMask)
+    def _getMask(
+        self,
+        *,
+        original: bool = False,
+        covered: bool = True,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        valid: bool = False,
+        log_valid: bool = False,
+        as_tuple: bool = False,
+    ) -> BoolVector | tuple[BoolVector, BoolVector]:
         original = self._update_original_flag(
             original=original,
             log=True,
@@ -523,9 +539,9 @@ class _BaseSpec:
     
         secondary_mask = primary_mask.copy(order="C")
         if without_rejections:
-            secondary_mask &= invert(getattr(self, "_rejected_pixels" + suffix))
+            secondary_mask &= ~getattr(self, "_rejected_pixels" + suffix)
         if without_absorption:
-            secondary_mask &= invert(getattr(self, "_absorbed_pixels" + suffix))
+            secondary_mask &= ~getattr(self, "_absorbed_pixels" + suffix)
 
         if log_valid:
             secondary_mask &= getattr(self, "_log_valid_pixels" + suffix)
@@ -535,6 +551,8 @@ class _BaseSpec:
         if as_tuple:
             return primary_mask, secondary_mask
         return primary_mask & secondary_mask
+
+    ### getMaskedCoords
 
     def _get_masked_coords_helper(
         self,
@@ -546,7 +564,15 @@ class _BaseSpec:
         log_valid: bool,
         bg_flux: BackgroundFlux | None,
         shrink: bool | None,
-    ) -> MaskedCoords:
+    ):
+        from .masked_coords import (
+            ContiguousMaskedCoords,
+            MaskedCoords,
+            OriginalContiguousMaskedCoords,
+            OriginalMaskedCoords,
+            OriginalReadOnlyMaskedCoords,
+            ReadOnlyMaskedCoords,
+        )
         original = self._update_original_flag(
             original=original,
             log=False,
@@ -566,19 +592,17 @@ class _BaseSpec:
                 cls = MaskedCoords
 
         coords = cls(
-            self, 
-            primary_mask, secondary_mask, 
+            self, primary_mask, secondary_mask, 
             bg_flux=bg_flux, 
-            original=original,
         )
         if log_valid:
             coords = coords.ensureLogValid()
         if shrink is not None:
             coords = coords.limitLoss(shrink=shrink)
         return coords
-    
 
-    @validate_call
+
+    @pydantic.validate_call
     def getMaskedCoords(
         self,
         *,
@@ -591,7 +615,34 @@ class _BaseSpec:
         log_valid: bool = False,
         bg_flux: BackgroundFlux | None = None,
         shrink: bool | None = None,
-    ) -> MaskedCoords:
+    ):
+        return self._getMaskedCoords(
+            original=original,
+            mode=mode,
+            covered=covered,
+            without_rejections=without_rejections,
+            without_absorption=without_absorption,
+            valid=valid,
+            log_valid=log_valid,
+            bg_flux=bg_flux,
+            shrink=shrink,
+        )
+
+
+    @wraps(getMaskedCoords)
+    def _getMaskedCoords(
+        self,
+        *,
+        original: bool = False,
+        mode: Literal["r", "c"] | None = None,
+        covered: bool = False,
+        without_rejections: bool = False,
+        without_absorption: bool = False,
+        valid: bool = False,
+        log_valid: bool = False,
+        bg_flux: BackgroundFlux | None = None,
+        shrink: bool | None = None,
+    ):
         original = self._update_original_flag(
             original=original,
             log=False,
@@ -615,6 +666,8 @@ class _BaseSpec:
             bg_flux=bg_flux,
             shrink=shrink,
         )
+
+    ###
 
     def resetRejections(self) -> None:
         msg = "Resetting rejection mask for "
@@ -658,7 +711,9 @@ class _BaseSpec:
 
         logger.debug(msg)
 
-    @validate_call
+    ### applyRejections
+
+    @pydantic.validate_call
     def applyRejections(
         self,
         mask: BoolVector,
@@ -668,6 +723,19 @@ class _BaseSpec:
         """
         Update the rejection mask with the provided boolean mask.
         """
+        return self._applyRejections(
+            mask,
+            enforce=enforce,
+            original=original,
+        )
+
+    @wraps(applyRejections)
+    def _applyRejections(
+        self,
+        mask: BoolVector,
+        enforce: bool = True,
+        original: bool = False,
+    ) -> Self:
         suffix = "_original" if original else ""
 
         msg = "[ORIGINAL] " if original else ""
@@ -700,7 +768,9 @@ class _BaseSpec:
 
         return self
 
-    @validate_call
+    ### applyAbsorption
+
+    @pydantic.validate_call
     def applyAbsorption(
         self,
         mask: BoolVector,
@@ -712,6 +782,21 @@ class _BaseSpec:
         Update the absorption mask with the provided boolean mask, and 
         optionally the array of smoothed flux density values.
         """
+        return self._applyAbsorption(
+            mask,
+            y_smooth=y_smooth,
+            enforce=enforce,
+            original=original,
+        )
+
+    @wraps(applyAbsorption)
+    def _applyAbsorption(
+        self,
+        mask: BoolVector,
+        y_smooth: FloatVector | None = None,
+        enforce: bool = True,
+        original: bool = False,
+    ) -> Self:
         suffix = "_original" if original else ""
 
         msg = "[ORIGINAL] " if original else ""
@@ -757,12 +842,14 @@ class _BaseSpec:
         original: bool,
         data_type: str,
     ) -> Self:
+        from quasar_models.modeling import PrepareModel
+
         original = self._update_original_flag(original, False)
 
         arr: FloatVector = getattr(self, f"_y_{data_type}")
         arr[:] = 0.0
         if model is not None:
-            eval_mask = isfinite(self._x)
+            eval_mask = np.isfinite(self._x)
             x = self._x[eval_mask]
 
             preparer = PrepareModel(
@@ -781,7 +868,7 @@ class _BaseSpec:
             arr_original[:] = 0.0
 
             if model is not None:
-                eval_mask = isfinite(self._x_original)
+                eval_mask = np.isfinite(self._x_original)
                 x = self._x_original[eval_mask]
 
                 preparer = PrepareModel(
@@ -797,42 +884,92 @@ class _BaseSpec:
 
         return self
 
-    @validate_call
+    ### updateContinuumEmission
+
+    @pydantic.validate_call
     def updateContinuumEmission(
+        self,
+        model: Optional[PowerLawModel] = None,
+        original: bool = False,
+    ) -> Self:
+        return self._updateContinuumEmission(model=model, original=original)
+
+    @wraps(updateContinuumEmission)
+    def _updateContinuumEmission(
         self,
         model: Optional[PowerLawModel] = None,
         original: bool = False,
     ) -> Self:
         return self._update_emission_helper(model, original, "pl")
 
-    @validate_call
+    ### updateIronEmission
+
+    @pydantic.validate_call
     def updateIronEmission(
         self,
-        model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        model: Union[IronModel, CompoundModelType[IronModel], None] = None,
+        original: bool = False,
+    ) -> Self:
+        return self._updateIronEmission(model=model, original=original)
+
+    @wraps(updateIronEmission)
+    def _updateIronEmission(
+        self,
+        model: Union[IronModel, CompoundModelType[IronModel], None] = None,
         original: bool = False,
     ) -> Self:
         return self._update_emission_helper(model, original, "fe")
 
-    @validate_call
+    ### updateBalmerEmission
+
+    @pydantic.validate_call
     def updateBalmerEmission(
+        self,
+        model: Optional[BalmerModel] = None,
+        original: bool = False,
+    ) -> Self:
+        return self._updateBalmerEmission(model=model, original=original)
+
+    @wraps(updateBalmerEmission)
+    def _updateBalmerEmission(
         self,
         model: Optional[BalmerModel] = None,
         original: bool = False,
     ) -> Self:
         return self._update_emission_helper(model, original, "ba")
 
-    @validate_call
+    ### updateHostGalaxyEmission
+
+    @pydantic.validate_call
     def updateHostGalaxyEmission(
         self,
         model: Optional[HostGalaxyModel] = None,
         original: bool = False,
     ) -> Self:
-        return self._update_emission_helper(model, original, "hg")
+        return self._updateHostGalaxyEmission(model=model, original=original)
 
-    @validate_call
+    @wraps(updateHostGalaxyEmission)
+    def _updateHostGalaxyEmission(
+        self,
+        model: Optional[HostGalaxyModel] = None,
+        original: bool = False,
+    ) -> Self:
+        return self._update_emission_helper(model, original, "hg")
+    
+    ### updateLinesEmission
+
+    @pydantic.validate_call
     def updateLinesEmission(
         self,
-        model: Union[GaussianModel, CompoundModel_[GaussianModel], None] = None,
+        model: Union[EmModel, CompoundModelType[EmModel], None] = None,
+        original: bool = False,
+    ) -> Self:
+        return self._updateLinesEmission(model=model, original=original)
+
+    @wraps(updateLinesEmission)
+    def _updateLinesEmission(
+        self,
+        model: Union[EmModel, CompoundModelType[EmModel], None] = None,
         original: bool = False,
     ) -> Self:
         return self._update_emission_helper(model, original, "em")

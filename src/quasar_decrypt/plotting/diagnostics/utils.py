@@ -10,7 +10,7 @@ from quasar_errors.measures.exact import (
     get_right_edge_at_height,
 )
 from quasar_models import GaussianModel
-from quasar_typing.misc import FWHMStrategy
+from quasar_typing.literals import FWHMStrategy
 from quasar_typing.numpy import BoolVector, FloatMatrix, FloatVector
 from quasar_utils.setup import Info
 

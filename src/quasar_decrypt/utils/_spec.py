@@ -1,33 +1,23 @@
 __all__ = ["_Spec"]
 
+import math
 from dataclasses import field
 from logging import getLogger
-from typing import Any, Self, TypedDict, TypeVar
+from typing import Any, Self, TypedDict
 
-from numpy import (
-    array_equal,
-    bool_,
-    float64,
-    full,
-    inf,
-    isfinite,
-    nan,
-    ones,
-    zeros,
-)
-from pydantic.dataclasses import dataclass
+import numpy as np
+import pydantic
 from quasar_typing.bounds import CoordBounds
 from quasar_typing.numpy import (
-    Array_,
+    Array,
     BoolArray,
     BoolVector,
     FloatArray,
     FloatMatrix,
     FloatVector,
 )
-from quasar_typing.pathlib import AbsoluteFilePath
-from quasar_typing.scipy import csr_matrix_
-from quasar_utils.decorators import validate_call
+from quasar_typing.pathlib import FilePath
+from quasar_typing.scipy import CSRMatrix
 from quasar_utils.setup import Info
 
 from ._basespec import _BaseSpec
@@ -40,76 +30,74 @@ def _asreadonlyarray(arr: FloatArray) -> FloatArray:
     """
     Convert a numpy array to a contiguous, read-only contiguous array.
     """
-    arr = arr.astype(float64, order="C", copy=True)
+    arr = arr.astype(np.float64, order="C", copy=True)
     arr.setflags(write=False)
     return arr
 
-def _asfcontig(arr: Array_) -> FloatArray:
-    return arr.astype(float64, order="C", copy=True)
+def _asfcontig(arr: Array) -> FloatArray:
+    return arr.astype(np.float64, order="C", copy=True)
 
-def _asbcontig(arr: Array_) -> BoolArray:
-    return arr.astype(bool_, order="C", copy=True)
+def _asbcontig(arr: Array) -> BoolArray:
+    return arr.astype(np.bool_, order="C", copy=True)
 
 
-N = TypeVar("N", bound=int)
-O = TypeVar("O", bound=int)
+class _SpecKwargs(TypedDict):
+    _x: FloatVector
+    _y: FloatVector
+    _dy: FloatVector
+    _dx: FloatVector
+    _kernels: FloatMatrix | CSRMatrix
 
-class _SpecKwargs[N, O](TypedDict):
-    _x: FloatVector[N]
-    _y: FloatVector[N]
-    _dy: FloatVector[N]
-    _dx: FloatVector[N]
-    _kernels: FloatMatrix | csr_matrix_
+    _x_original: FloatVector
+    _y_original: FloatVector
+    _dy_original: FloatVector
+    _dx_original: FloatVector
+    _kernels_original: FloatMatrix | CSRMatrix
 
-    _x_original: FloatVector[O]
-    _y_original: FloatVector[O]
-    _dy_original: FloatVector[O]
-    _dx_original: FloatVector[O]
-    _kernels_original: FloatMatrix | csr_matrix_
+    _y_smooth: FloatVector
+    _y_pl: FloatVector
+    _y_fe: FloatVector
+    _y_ba: FloatVector
+    _y_hg: FloatVector
+    _y_em: FloatVector
 
-    _y_smooth: FloatVector[N]
-    _y_pl: FloatVector[N]
-    _y_fe: FloatVector[N]
-    _y_ba: FloatVector[N]
-    _y_hg: FloatVector[N]
-    _y_em: FloatVector[N]
+    _y_smooth_original: FloatVector
+    _y_pl_original: FloatVector
+    _y_fe_original: FloatVector
+    _y_ba_original: FloatVector
+    _y_hg_original: FloatVector
+    _y_em_original: FloatVector
 
-    _y_smooth_original: FloatVector[O]
-    _y_pl_original: FloatVector[O]
-    _y_fe_original: FloatVector[O]
-    _y_ba_original: FloatVector[O]
-    _y_hg_original: FloatVector[O]
-    _y_em_original: FloatVector[O]
+    _rejected_pixels: BoolVector
+    _absorbed_pixels: BoolVector
+    _valid_pixels: BoolVector
+    _log_valid_pixels: BoolVector
+    _p_absorbed: FloatVector
 
-    _rejected_pixels: BoolVector[N]
-    _absorbed_pixels: BoolVector[N]
-    _valid_pixels: BoolVector[N]
-    _log_valid_pixels: BoolVector[N]
-    _p_absorbed: FloatVector[N]
-
-    _rejected_pixels_original: BoolVector[O]
-    _absorbed_pixels_original: BoolVector[O]
-    _valid_pixels_original: BoolVector[O]
-    _log_valid_pixels_original: BoolVector[O]
-    _p_absorbed_original: FloatVector[O]
+    _rejected_pixels_original: BoolVector
+    _absorbed_pixels_original: BoolVector
+    _valid_pixels_original: BoolVector
+    _log_valid_pixels_original: BoolVector
+    _p_absorbed_original: FloatVector
 
     x0: float
     y0: float
 
-    _x_log: FloatVector[N]
-    _y_log: FloatVector[N]
-    _dy_log: FloatVector[N]
+    _x_log: FloatVector
+    _y_log: FloatVector
+    _dy_log: FloatVector
 
-    _x_log_original: FloatVector[O]
-    _y_log_original: FloatVector[O]
-    _dy_log_original: FloatVector[O]
+    _x_log_original: FloatVector
+    _y_log_original: FloatVector
+    _dy_log_original: FloatVector
 
     info: Info
     get_mask: CachedGetMask
     get_mask_original: CachedGetMask
+    _no_original: bool
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class _Spec(_BaseSpec):
     """
     Parent class used for inheriting properties and methods. Designed for
@@ -119,13 +107,13 @@ class _Spec(_BaseSpec):
     _y: FloatVector = field(kw_only=True)
     _dy: FloatVector = field(kw_only=True)
     _dx: FloatVector = field(kw_only=True)
-    _kernels: FloatMatrix | csr_matrix_ = field(kw_only=True)
+    _kernels: FloatMatrix | CSRMatrix = field(kw_only=True)
 
     _x_original: FloatVector = field(kw_only=True)
     _y_original: FloatVector = field(kw_only=True)
     _dy_original: FloatVector = field(kw_only=True)
     _dx_original: FloatVector = field(kw_only=True)
-    _kernels_original: FloatMatrix | csr_matrix_ = field(kw_only=True)
+    _kernels_original: FloatMatrix | CSRMatrix = field(kw_only=True)
 
     _y_smooth: FloatVector = field(kw_only=True)
     _y_pl: FloatVector = field(kw_only=True)
@@ -321,11 +309,11 @@ class _Spec(_BaseSpec):
         self._validate_fields()
 
     @classmethod
-    @validate_call
+    @pydantic.validate_call
     def create(
         cls,
         *,
-        path: AbsoluteFilePath,
+        path: FilePath,
         title: str,
         x: FloatVector,
         y: FloatVector,
@@ -337,8 +325,8 @@ class _Spec(_BaseSpec):
         dy_original: FloatVector,
         dx_original: FloatVector,
 
-        kernels: FloatMatrix | csr_matrix_,
-        kernels_original: FloatMatrix | csr_matrix_,
+        kernels: FloatMatrix | CSRMatrix,
+        kernels_original: FloatMatrix | CSRMatrix,
 
         y_smooth: FloatVector | None = None,
         y_pl: FloatVector | None = None,
@@ -382,7 +370,7 @@ class _Spec(_BaseSpec):
         get_mask: CachedGetMask | None = None,
         get_mask_original: CachedGetMask | None = None,
     ) -> Self:
-        if array_equal(x, x_original):
+        if np.array_equal(x, x_original):
             kwargs = cls.get_kwargs_simple.__wrapped__(
                 cls,
                 path=path,
@@ -418,7 +406,6 @@ class _Spec(_BaseSpec):
                 info=info,
                 get_mask=get_mask,
             )
-            kwargs["_no_original"] = True
         else:
             kwargs = cls.get_kwargs.__wrapped__(
                 cls,
@@ -479,18 +466,17 @@ class _Spec(_BaseSpec):
                 get_mask=get_mask,
                 get_mask_original=get_mask_original,
             )
-            kwargs["_no_original"] = False
             
         spec = cls(**kwargs)
         spec._validate_fields()
         return spec
 
     @classmethod
-    @validate_call
+    @pydantic.validate_call
     def get_kwargs(
         cls,
         *,
-        path: AbsoluteFilePath,
+        path: FilePath,
         title: str,
 
         x: FloatVector,
@@ -502,8 +488,8 @@ class _Spec(_BaseSpec):
         dy_original: FloatVector,
         dx_original: FloatVector,
 
-        kernels: FloatMatrix | csr_matrix_,
-        kernels_original: FloatMatrix | csr_matrix_,
+        kernels: FloatMatrix | CSRMatrix,
+        kernels_original: FloatMatrix | CSRMatrix,
 
         y_smooth: FloatVector | None = None,
         y_pl: FloatVector | None = None,
@@ -575,65 +561,65 @@ class _Spec(_BaseSpec):
         kwargs["_kernels"] = kernels
 
         kwargs['_y_smooth'] = \
-            full(n, nan, dtype=float64, order="C") \
+            np.full(n, np.nan, dtype=np.float64, order="C") \
             if y_smooth is None \
             else _asfcontig(y_smooth)
         kwargs["_y_pl"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_pl is None \
             else _asfcontig(y_pl)
         kwargs["_y_fe"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_fe is None \
             else _asfcontig(y_fe)
         kwargs["_y_ba"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_ba is None \
             else _asfcontig(y_ba)
         kwargs["_y_hg"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_hg is None \
             else _asfcontig(y_hg)
         kwargs["_y_em"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_em is None \
             else _asfcontig(y_em)
 
         kwargs["_y_smooth_original"] = \
-            full(n_original, nan, dtype=float64, order="C") \
+            np.full(n_original, np.nan, dtype=np.float64, order="C") \
             if y_smooth_original is None \
             else _asfcontig(y_smooth_original)
         kwargs["_y_pl_original"] = \
-            zeros(n_original, dtype=float64, order="C") \
+            np.zeros(n_original, dtype=np.float64, order="C") \
             if y_pl_original is None \
             else _asfcontig(y_pl_original)
         kwargs["_y_fe_original"] = \
-            zeros(n_original, dtype=float64, order="C") \
+            np.zeros(n_original, dtype=np.float64, order="C") \
             if y_fe_original is None \
             else _asfcontig(y_fe_original)
         kwargs["_y_ba_original"] = \
-            zeros(n_original, dtype=float64, order="C") \
+            np.zeros(n_original, dtype=np.float64, order="C") \
             if y_ba_original is None \
             else _asfcontig(y_ba_original)
         kwargs["_y_hg_original"] = \
-            zeros(n_original, dtype=float64, order="C") \
+            np.zeros(n_original, dtype=np.float64, order="C") \
             if y_hg_original is None \
             else _asfcontig(y_hg_original)
         kwargs["_y_em_original"] = \
-            zeros(n_original, dtype=float64, order="C") \
+            np.zeros(n_original, dtype=np.float64, order="C") \
             if y_em_original is None \
             else _asfcontig(y_em_original)
 
         kwargs["_rejected_pixels"] = \
-            zeros(n, dtype=bool_, order="C") \
+            np.zeros(n, dtype=np.bool_, order="C") \
             if rejected_pixels is None \
             else _asbcontig(rejected_pixels)
         kwargs["_absorbed_pixels"] = \
-            zeros(n, dtype=bool_, order="C") \
+            np.zeros(n, dtype=np.bool_, order="C") \
             if absorbed_pixels is None \
             else _asbcontig(absorbed_pixels)
         kwargs["_valid_pixels"] = valid_pixels = _asbcontig(
-            isfinite(x) & isfinite(y) & (dy > 0)
+            np.isfinite(x) & np.isfinite(y) & (dy > 0)
             if valid_pixels is None
             else valid_pixels
         )
@@ -643,20 +629,20 @@ class _Spec(_BaseSpec):
             else log_valid_pixels
         )
         kwargs["_p_absorbed"] = \
-            ones(n, dtype=float64, order="C") \
+            np.ones(n, dtype=np.float64, order="C") \
             if p_absorbed is None \
             else _asfcontig(p_absorbed)
 
         kwargs["_rejected_pixels_original"] = \
-            zeros(n_original, dtype=bool_, order="C") \
+            np.zeros(n_original, dtype=np.bool_, order="C") \
             if rejected_pixels_original is None \
             else _asbcontig(rejected_pixels_original)
         kwargs["_absorbed_pixels_original"] = \
-            zeros(n_original, dtype=bool_, order="C") \
+            np.zeros(n_original, dtype=np.bool_, order="C") \
             if absorbed_pixels_original is None \
             else _asbcontig(absorbed_pixels_original)
         kwargs["_valid_pixels_original"] = valid_pixels_original = _asbcontig(
-            isfinite(x_original) & isfinite(y_original) & (dy_original > 0)
+            np.isfinite(x_original) & np.isfinite(y_original) & (dy_original > 0)
             if valid_pixels_original is None
             else valid_pixels_original
         )
@@ -666,7 +652,7 @@ class _Spec(_BaseSpec):
             else log_valid_pixels_original
         )
         kwargs["_p_absorbed_original"] = \
-            ones(n_original, dtype=float64, order="C") \
+            np.ones(n_original, dtype=np.float64, order="C") \
             if p_absorbed_original is None \
             else _asfcontig(p_absorbed_original)
 
@@ -675,7 +661,7 @@ class _Spec(_BaseSpec):
             if n_valid < 2:
                 msg = "No. of valid pixels is less than 2!"
                 logger.critical(msg)
-                x_bounds = (0, inf)
+                x_bounds = (0, math.inf)
             else:
                 x_bounds = (
                     x[valid_pixels][0] * (1 - info.loading.sigma_res / 2),
@@ -722,22 +708,23 @@ class _Spec(_BaseSpec):
         kwargs["info"] = info
         kwargs["get_mask"] = get_mask or CachedGetMask.create(x)
         kwargs["get_mask_original"] = get_mask_original or CachedGetMask.create(x_original)
+        kwargs["_no_original"] = False
 
         return kwargs
 
     @classmethod
-    @validate_call
+    @pydantic.validate_call
     def get_kwargs_simple(
         cls,
         *,
-        path: AbsoluteFilePath,
+        path: FilePath,
         title: str,
 
         x: FloatVector,
         y: FloatVector,
         dy: FloatVector,
         dx: FloatVector,
-        kernels: FloatMatrix | csr_matrix_,
+        kernels: FloatMatrix | CSRMatrix,
 
         y_smooth: FloatVector | None = None,
         y_pl: FloatVector | None = None,
@@ -796,27 +783,27 @@ class _Spec(_BaseSpec):
         kwargs["_kernels_original"] = kernels
 
         kwargs['_y_smooth'] = \
-            full(n, nan, dtype=float64, order="C") \
+            np.full(n, np.nan, dtype=np.float64, order="C") \
             if y_smooth is None \
             else _asfcontig(y_smooth)
         kwargs["_y_pl"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_pl is None \
             else _asfcontig(y_pl)
         kwargs["_y_fe"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_fe is None \
             else _asfcontig(y_fe)
         kwargs["_y_ba"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_ba is None \
             else _asfcontig(y_ba)
         kwargs["_y_hg"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_hg is None \
             else _asfcontig(y_hg)
         kwargs["_y_em"] = \
-            zeros(n, dtype=float64, order="C") \
+            np.zeros(n, dtype=np.float64, order="C") \
             if y_em is None \
             else _asfcontig(y_em)
 
@@ -828,15 +815,15 @@ class _Spec(_BaseSpec):
         kwargs["_y_em_original"] = kwargs["_y_em"]
 
         kwargs["_rejected_pixels"] = \
-            zeros(n, dtype=bool_, order="C") \
+            np.zeros(n, dtype=np.bool_, order="C") \
             if rejected_pixels is None \
             else _asbcontig(rejected_pixels)
         kwargs["_absorbed_pixels"] = \
-            zeros(n, dtype=bool_, order="C") \
+            np.zeros(n, dtype=np.bool_, order="C") \
             if absorbed_pixels is None \
             else _asbcontig(absorbed_pixels)
         kwargs["_valid_pixels"] = valid_pixels = _asbcontig(
-            isfinite(x) & isfinite(y) & (dy > 0)
+            np.isfinite(x) & np.isfinite(y) & (dy > 0)
             if valid_pixels is None
             else valid_pixels
         )
@@ -846,7 +833,7 @@ class _Spec(_BaseSpec):
             else log_valid_pixels
         )
         kwargs["_p_absorbed"] = \
-            ones(n, dtype=float64, order="C") \
+            np.ones(n, dtype=np.float64, order="C") \
             if p_absorbed is None \
             else _asfcontig(p_absorbed)
 
@@ -861,7 +848,7 @@ class _Spec(_BaseSpec):
             if n_valid < 2:
                 msg = "No. of valid pixels is less than 2!"
                 logger.critical(msg)
-                x_bounds = (0, inf)
+                x_bounds = (0, math.inf)
             else:
                 x_bounds = (
                     x[valid_pixels][0] * (1 - info.loading.sigma_res / 2),
@@ -896,6 +883,7 @@ class _Spec(_BaseSpec):
         kwargs["info"] = info
         kwargs["get_mask"] = get_mask or CachedGetMask.create(x)
         kwargs["get_mask_original"] = kwargs["get_mask"]
+        kwargs["_no_original"] = True
 
         return kwargs
 

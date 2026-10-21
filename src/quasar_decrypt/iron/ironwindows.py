@@ -1,46 +1,30 @@
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import field
 from itertools import repeat
 from logging import getLogger
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional, Self, Union
 
+import pydantic
 from numpy import isfinite
-from pydantic import ValidationError
-from quasar_errors.model_samples import IronSampleList
 from quasar_models.iron import IronModel, IronTemplate
-from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.modeling.utils import LinearTie
-from quasar_models.utils.astropy import get_free_params
-from quasar_typing.astropy import CompoundModel_, FitInfo
+from quasar_typing.astropy import CompoundModelType
 from quasar_typing.bounds import AstropyBounds, CoordBounds
-from quasar_typing.misc import BackgroundFlux
 from quasar_typing.numpy import FloatVector
-from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_typing.pathlib import FITSPath
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import BackgroundFlux
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.setup import FitterKwargs
-from scipy.ndimage import binary_fill_holes
 
-from ..plotting.windows_and_templates_plots import (
-    IronTemplatesWithDifferencesPlot,
-    IronTemplatesWithResidualsPlot,
-    IronWindowsAndTemplatesWithDifferencesPlot,
-    IronWindowsAndTemplatesWithResidualsPlot,
-)
-from ..plotting.windows_plots import (
-    IronWindowsPlotWithDifferences,
-    IronWindowsPlotWithResiduals,
-)
-from ..utils import _SpecWindowList
+from quasar_decrypt.utils import _SpecWindowList
+
 from .iwindow import IWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class IronWindows(_SpecWindowList[IWindow]):
     templates: dict[str, IronTemplate] = field(
         default_factory=dict, 
@@ -50,7 +34,7 @@ class IronWindows(_SpecWindowList[IWindow]):
         default_factory=dict, 
         kw_only=True,
     )
-    fit_info: FitInfo | None = field(
+    fit_info: OptimizeResultType | None = field(
         default=None, 
         kw_only=True,
     )
@@ -71,7 +55,8 @@ class IronWindows(_SpecWindowList[IWindow]):
         self.fit_info = state.get("fit_info", None)
 
     @property
-    def sample(self) -> IronSampleList | None:
+    def sample(self):
+        from quasar_errors.model_samples import IronSampleList
         if (model := self.getModel()) is None:
             return None
         return IronSampleList.fromIronModels(model)
@@ -103,10 +88,10 @@ class IronWindows(_SpecWindowList[IWindow]):
         original: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
-        template_model: Union[IronModel, CompoundModel_[IronModel], None] = None,
+        template_model: Union[IronModel, CompoundModelType[IronModel], None] = None,
         bg_flux: BackgroundFlux | None = None,
         shrink: float | None = None,
-        template_files: list[AbsoluteFITSPath | str] | None = None,
+        template_files: list[FITSPath | str] | None = None,
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -182,7 +167,7 @@ class IronWindows(_SpecWindowList[IWindow]):
     def loadTemplates(
         self,
         *,
-        template_files: list[AbsoluteFITSPath | str] | None = None,
+        template_files: list[FITSPath | str] | None = None,
         resample: bool | None = None,
         split: FloatVector | None = None,
         fwhm: FloatVector | None = None,
@@ -204,6 +189,8 @@ class IronWindows(_SpecWindowList[IWindow]):
         Should adapt the templates to the current spectrum covered by the
         respective templates.
         """
+        from scipy.ndimage import binary_fill_holes
+
         if template_files is None:
             f = self.info.iron.or_default(locals())
             template_files = list(map(Path, f("template_files")))
@@ -302,7 +289,7 @@ class IronWindows(_SpecWindowList[IWindow]):
 
             # Resample template if necessary
             if resample:
-                template.resample(fwhm, inplace=True)
+                template.resample(fwhm)
 
             if template.x[0] < s < template.x[-1]:
                 logger.debug(
@@ -344,6 +331,8 @@ class IronWindows(_SpecWindowList[IWindow]):
         """
         from collections import Counter
 
+        from quasar_models.modeling import LinearTie
+
         # Get prefixes for models w/o fixed fwhm parameters
         prefix_counts = Counter(
             name.split("_")[0]
@@ -367,8 +356,10 @@ class IronWindows(_SpecWindowList[IWindow]):
             master_model = models.pop(0)
             for model in models:
                 model.fwhm.tied = LinearTie(
-                    a=1.0, b=0.0,
-                    model_name=master_model.name, parameter_name="fwhm",
+                    a=1.0, 
+                    b=0.0,
+                    model_name=master_model.name, 
+                    parameter_name="fwhm",
                 )
 
     @validated_apply_info_to_method(subjects=("iron",))
@@ -433,7 +424,7 @@ class IronWindows(_SpecWindowList[IWindow]):
 
     def getModel(
         self,
-    ) -> Optional[Union[IronModel, CompoundModel_[IronModel]]]:
+    ) -> Optional[Union[IronModel, CompoundModelType[IronModel]]]:
         """
         Combines the available templates into a single (Split) TemplateModel or
         AstroPy compound model.
@@ -441,12 +432,12 @@ class IronWindows(_SpecWindowList[IWindow]):
         submodels = list(self.template_models.values())
         return sum(submodels[1:], start=submodels[0]) if submodels else None
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
-        fit: Union[IronModel, CompoundModel_[IronModel]],
+        fit: Union[IronModel, CompoundModelType[IronModel]],
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         self.fit_info = fit_info
@@ -466,22 +457,21 @@ class IronWindows(_SpecWindowList[IWindow]):
 
         return self
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: Union[IronModel, CompoundModel_[IronModel]],
+        fit: Union[IronModel, CompoundModelType[IronModel], None],
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         self.fit_info = fit_info
-        for template_model in (fit,) if fit.n_submodels == 1 else fit:
-            self.template_models[template_model.name] = template_model
+        if fit is not None:
+            for template_model in (fit,) if fit.n_submodels == 1 else fit:
+                self.template_models[template_model.name] = template_model
 
         if update_emission:
             self.updateIronEmission.__wrapped__(self, fit)
-            for iwindow in filter(lambda w: w._y_fe is not self._y_fe, self):
-                iwindow.updateIronEmission.__wrapped__(iwindow, fit)
 
         return self
 
@@ -500,6 +490,9 @@ class IronWindows(_SpecWindowList[IWindow]):
         """
         Fits the available templates using a nonlinear optimiser.
         """
+        from quasar_models.modeling import Fitter, PrepareModel
+        from quasar_models.utils.astropy import _get_free_params
+
         logger.debug("Performing fine tuning:")
 
         original = self._update_original_flag(
@@ -537,7 +530,7 @@ class IronWindows(_SpecWindowList[IWindow]):
             raise ValueError(msg)
 
         n_pix = masked_coords.size
-        n_free_params = sum(get_free_params(model).values())
+        n_free_params = sum(_get_free_params(model).values())
 
         if n_pix <= n_free_params:
             msg = "Cancelling fine-tuning due to insufficient number of data "\
@@ -559,12 +552,12 @@ class IronWindows(_SpecWindowList[IWindow]):
                     where=where,
                     get_model=True,
                     inplace=False,
-                    **fitter_kwargs,
+                    **(fitter_kwargs or {}),
                 )
                 fit_info = fitter.fit_info
 
             logger.debug(">>> Successfully fitted model!")
-        except ValidationError as e:
+        except pydantic.ValidationError as e:
             logger.critical(
                 f">>> Failed fitting model due to validation error: {e}"
             )
@@ -581,59 +574,66 @@ class IronWindows(_SpecWindowList[IWindow]):
     def windowsplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Union[IronModel, CompoundModelType[IronModel], None] = None,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> IronWindowsPlotWithResiduals | IronWindowsPlotWithDifferences:
+    ):
         """
         ...
         """
-        args = (self.getModel(), self.window_bounds, self.spectrum)
+        from quasar_decrypt.plotting.windows_plots import (
+            IronWindowsPlotWithDifferences,
+            IronWindowsPlotWithResiduals,
+        )
+        if model is None:
+            model = self.getModel()
+
+        args = (model, self.window_bounds, self.spectrum)
         cls = IronWindowsPlotWithResiduals \
             if mode == "residual" \
             else IronWindowsPlotWithDifferences
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "IronWindows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot() 
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )
 
     def templatesplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Union[IronModel, CompoundModelType[IronModel], None] = None,
         with_windows: bool = True,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> Union[
-        IronWindowsAndTemplatesWithResidualsPlot,
-        IronWindowsAndTemplatesWithDifferencesPlot,
-        IronTemplatesWithResidualsPlot,
-        IronTemplatesWithDifferencesPlot,
-    ]:
+    ):
         """
         ...
         """
+        from quasar_decrypt.plotting.windows_and_templates_plots import (
+            IronTemplatesWithDifferencesPlot,
+            IronTemplatesWithResidualsPlot,
+            IronWindowsAndTemplatesWithDifferencesPlot,
+            IronWindowsAndTemplatesWithResidualsPlot,
+        )
+        if model is None:
+            model = self.getModel()
+            
         if with_windows:
-            args = (self.getModel(), self.window_bounds, self.spectrum)
+            args = (model, self.window_bounds, self.spectrum)
             cls = IronWindowsAndTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else IronWindowsAndTemplatesWithDifferencesPlot
         else:
-            args = (self.getModel(), self.spectrum)
+            args = (model, self.spectrum)
             cls = IronTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else IronTemplatesWithDifferencesPlot
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "IronTemplates/Windows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot()
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

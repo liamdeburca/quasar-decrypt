@@ -1,39 +1,31 @@
 __all__ = ["LineWindows"]
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from itertools import product
 from logging import getLogger
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Optional, Self, Union
+from typing import Any, ClassVar, Literal, Optional, Self
 
+import pydantic
 from numpy import bool_, zeros_like
-from quasar_errors.model_samples import GaussianSampleList
-from quasar_models.line import GaussianModel, _VProfileCopy
-from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.utils.astropy import get_free_params
-from quasar_typing.astropy import CompoundModel_, FitInfo
-from quasar_typing.misc import BackgroundFlux
 from quasar_typing.numpy import BoolVector, FloatVector
-from quasar_typing.pathlib import AbsoluteFilePath
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_typing.pathlib import FilePath
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import BackgroundFlux
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.linelist import LineList
 from quasar_utils.setup import FitterKwargs
 from scipy.optimize import OptimizeResult
 
-from ..utils import (
-    MaskedCoords,
-    _SpecWindowList,
-)
+from quasar_decrypt.utils import MaskedCoords, _SpecWindowList
+
 from .graph_utils import Graph
-from .lwindow import LWindow
+from .lwindow import LineModel, LWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class LineWindows(_SpecWindowList[LWindow]):
     graph: Graph | None = field(default=None, init=False)
 
@@ -49,7 +41,8 @@ class LineWindows(_SpecWindowList[LWindow]):
         self.graph = state.get("graph")
 
     @property
-    def sample(self) -> GaussianSampleList | None:
+    def sample(self):
+        from quasar_errors.model_samples.line import GaussianSampleList
         if (model := self.getModel()) is None:
             return None
         return GaussianSampleList.fromGaussianModels(model)
@@ -125,11 +118,9 @@ class LineWindows(_SpecWindowList[LWindow]):
     @validated_apply_info_to_method(subjects=("loading", "lines", "nonlinear"))
     def __call__(
         self,
-        linelist: AbsoluteFilePath | LineList,
+        linelist: FilePath | LineList,
         *,
-        template_model: Optional[
-            Union[GaussianModel, CompoundModel_[GaussianModel]]
-        ] = None,
+        template_model: Optional[LineModel] = None,
         original: bool = False,
         shrink: float | None = None,
         bg_flux: BackgroundFlux | None = None,
@@ -188,7 +179,7 @@ class LineWindows(_SpecWindowList[LWindow]):
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
                     with_neighbours=with_neighbours,
-                    fitter_kwargs=fitter_kwargs,
+                    fitter_kwargs=(fitter_kwargs or {}),
                 )
         else:
             ### 'instantiateModels'
@@ -295,6 +286,8 @@ class LineWindows(_SpecWindowList[LWindow]):
         shrink: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
+        from quasar_models.modeling import Fitter, PrepareModel
+
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -325,7 +318,7 @@ class LineWindows(_SpecWindowList[LWindow]):
                 where=where,
                 get_model=True,
                 inplace=False,
-                **fitter_kwargs,
+                **(fitter_kwargs or {}),
             )
 
         self.applyFit.__wrapped__(
@@ -390,7 +383,7 @@ class LineWindows(_SpecWindowList[LWindow]):
     @validated_apply_info_to_method(subjects=("loading", "lines"))
     def applyLineList(
         self,
-        linelist: AbsoluteFilePath | LineList,
+        linelist: FilePath | LineList,
         *,
         sigma_res: float | None = None,
         v_sep: float | None = None,
@@ -474,10 +467,10 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def checkLineDependencies(
         self, 
-        linelist: AbsoluteFilePath | LineList,
+        linelist: FilePath | LineList,
     ) -> bool:
         """
         ...
@@ -605,7 +598,7 @@ class LineWindows(_SpecWindowList[LWindow]):
 
     def getModel(
         self,
-    ) -> Optional[Union[GaussianModel, CompoundModel_[GaussianModel]]]:
+    ) -> Optional[LineModel]:
         """
         Retrieves and combines each 'LWindow's current fit/model, combining them
         into a single model.
@@ -618,18 +611,15 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         return sum(models[1:], start=models[0]) if models else None
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
-        fit: Union[
-            GaussianModel,
-            _VProfileCopy,
-            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
-        ],
+        fit: LineModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
+        from quasar_models.utils.astropy import _get_free_params
         submodels = (fit,) if (fit.n_submodels == 1) else fit
 
         count: int = 0
@@ -644,7 +634,7 @@ class LineWindows(_SpecWindowList[LWindow]):
             if fit_info is None:
                 finfo = None
             else:
-                n_free = sum(get_free_params(model).values())
+                n_free = sum(_get_free_params(model).values())
                 sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
                     x=fit_info.x[sel],
@@ -669,21 +659,19 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         return self
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: Union[
-            GaussianModel,
-            _VProfileCopy,
-            CompoundModel_[Union[GaussianModel, _VProfileCopy]],
-        ],
+        fit: LineModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
         Applies the 'fit' and 'fit_info' values to all 'LWindow' classes.
         """
+        from quasar_models.utils.astropy import _get_free_params
+
         submodels = fit if (fit.n_submodels > 1) else [fit]
 
         count: int = 0
@@ -698,7 +686,7 @@ class LineWindows(_SpecWindowList[LWindow]):
             if fit_info is None:
                 finfo = None
             else:
-                n_free = sum(get_free_params(model).values())
+                n_free = sum(_get_free_params(model).values())
                 sel = slice(count, count + n_free)
                 finfo = OptimizeResult(
                     x=fit_info.x[sel],

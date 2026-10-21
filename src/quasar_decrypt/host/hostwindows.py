@@ -1,45 +1,28 @@
 from collections.abc import Iterable
 from dataclasses import field
 from logging import getLogger
-from typing import Any, ClassVar, Literal, Optional, Self, Union
+from typing import Any, ClassVar, Literal, Optional, Self
 
-from numpy import dot, inf
-from pydantic.dataclasses import dataclass
+import pydantic
 from quasar_models.host import (
     HostGalaxyModel,
     HostGalaxyTemplate,
 )
-from quasar_models.host.io import convert_params_to_name
-from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.utils.astropy import get_free_params
-from quasar_typing.astropy import FitInfo
 from quasar_typing.bounds import AstropyBounds, CoordBounds
-from quasar_typing.misc import BackgroundFlux
-from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_typing.scipy import OptimizeResult_
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_typing.pathlib import FITSPath
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import BackgroundFlux
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.setup import FitterKwargs
 
-from ..plotting.windows_and_templates_plots import (
-    HostTemplatesWithDifferencesPlot,
-    HostTemplatesWithResidualsPlot,
-    HostWindowsAndTemplatesWithDifferencesPlot,
-    HostWindowsAndTemplatesWithResidualsPlot,
-)
-from ..plotting.windows_plots import (
-    HostWindowsPlotWithDifferences,
-    HostWindowsPlotWithResiduals,
-)
-from ..utils import _SpecWindowList
+from quasar_decrypt.utils import _SpecWindowList
+
 from .hwindow import HWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class HostWindows(_SpecWindowList[HWindow]):
     templates: dict[str, HostGalaxyTemplate] = field(
         default_factory=dict, kw_only=True
@@ -50,7 +33,7 @@ class HostWindows(_SpecWindowList[HWindow]):
 
     model: Optional[HostGalaxyModel] = field(default=None, init=False)
     fit: Optional[HostGalaxyModel] = field(default=None, init=False)
-    fit_info: FitInfo | None = field(default=None, init=False)
+    fit_info: OptimizeResultType | None = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "hg"})
 
@@ -72,8 +55,11 @@ class HostWindows(_SpecWindowList[HWindow]):
         self.fit_info = state.get("fit_info", None)
 
     @property
-    def sample(self) -> None:
-        raise NotImplementedError
+    def sample(self):
+        from quasar_errors.model_samples import HostGalaxySample
+        if (model := self.getModel()) is None:
+            return None
+        return HostGalaxySample.fromHostGalaxyModel(model)
 
     @validated_apply_info_to_method(
         subjects=("host",),
@@ -107,7 +93,7 @@ class HostWindows(_SpecWindowList[HWindow]):
         covered: bool = False,
         shrink: float | None = None,
         x_min: float | None = None,
-        template_files: list[str | AbsoluteFITSPath] | None = None,
+        template_files: list[FITSPath] | None = None,
         sources: list[Literal["bc2003"]] | None = None,
         ages: list[int] | None = None,
         default_source: Literal["bc2003"] | None = None,
@@ -122,6 +108,8 @@ class HostWindows(_SpecWindowList[HWindow]):
         fine_tune: bool = True,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> bool:
+        from quasar_models.host.io import convert_params_to_name
+
         if bg_flux is None:
             bg_flux = self.default_bg
 
@@ -191,13 +179,13 @@ class HostWindows(_SpecWindowList[HWindow]):
 
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def loadHostGalaxyTemplate(
         self,
         *,
         source: Literal["bc2003"] | None = None,
         age: float | None = None,
-        template_file: str | AbsoluteFITSPath | None = None,
+        template_file: str | FITSPath | None = None,
     ) -> HostGalaxyTemplate:
         """
         Loads a HostGalaxyTemplate instance.
@@ -226,7 +214,7 @@ class HostWindows(_SpecWindowList[HWindow]):
         if not template.is_logspace:
             template = template.createLogspace(
                 sigma_res=self.info.loading.sigma_res,
-                xr=self._x,
+                # xr=self._x,
                 keep_x=True,
             )
 
@@ -238,12 +226,14 @@ class HostWindows(_SpecWindowList[HWindow]):
         *,
         sources: Iterable[Literal["bc2003"]] | None = None,
         ages: Iterable[int] | None = None,
-        template_files: Iterable[str | AbsoluteFITSPath] | None = None,
+        template_files: Iterable[str | FITSPath] | None = None,
     ) -> dict[str, HostGalaxyTemplate]:
         """
         Loads all HostGalaxyTemplate instances and adds them to the
         'templates' dict attribute.
         """
+        from quasar_models.host.io import convert_params_to_name
+
         self.templates.clear()
 
         if not template_files and not (sources and ages):
@@ -319,7 +309,7 @@ class HostWindows(_SpecWindowList[HWindow]):
 
         return self.models
 
-    @validate_call
+    @pydantic.validate_call
     def chooseModel(self, name: str) -> HostGalaxyModel:
         """
         Choose a HostGalaxyModel from the 'models' dict by name and set it as
@@ -337,7 +327,7 @@ class HostWindows(_SpecWindowList[HWindow]):
         self.model = self.models[name]
         return self.model
 
-    @validate_call
+    @pydantic.validate_call
     def getRasterFit(
         self,
         *,
@@ -349,6 +339,7 @@ class HostWindows(_SpecWindowList[HWindow]):
         """
         Performs a raster fit on the Balmer pseudo-continuum model.
         """
+        from numpy import dot
         if self.models:
             if bg_flux is None:
                 bg_flux = self.default_bg
@@ -417,6 +408,11 @@ class HostWindows(_SpecWindowList[HWindow]):
         shrink: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> Self:
+        from math import inf
+
+        from quasar_models.modeling import Fitter, PrepareModel
+        from quasar_models.utils.astropy import _get_free_params
+        
         logger.debug("Performing fine tuning:")
 
         original = self._update_original_flag(
@@ -456,14 +452,14 @@ class HostWindows(_SpecWindowList[HWindow]):
 
         _model = next(iter(self.models.values()))
         n_pix = masked_coords.x.size
-        n_free_params = sum(get_free_params(_model).values())
+        n_free_params = sum(_get_free_params(_model).values())
         if n_pix <= n_free_params:
             msg = "Cancelling fine-tuning due to insufficient number of data "\
                 f"points: {n_pix=} <= {n_free_params=}"
             logger.critical(">>> " + msg)
             raise ValueError(msg)
 
-        fit_infos: dict[str, OptimizeResult_ | None] = {}
+        fit_infos: dict[str, OptimizeResultType | None] = {}
         chi2s: dict[str, float] = {}
 
         was_successful_once = False
@@ -481,7 +477,7 @@ class HostWindows(_SpecWindowList[HWindow]):
                         where=where,
                         get_model=True,
                         inplace=True,
-                        **fitter_kwargs,
+                        **(fitter_kwargs or {}),
                     )
                     fit_infos[name] = fitter.fit_info
                     chi2s[name] = (fit_infos[name].fun ** 2).mean()
@@ -523,12 +519,12 @@ class HostWindows(_SpecWindowList[HWindow]):
         """
         return self.fit or self.model
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
         fit: HostGalaxyModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -541,12 +537,12 @@ class HostWindows(_SpecWindowList[HWindow]):
             update_emission=update_emission,
         )
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: HostGalaxyModel,
+        fit: Optional[HostGalaxyModel],
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -563,59 +559,66 @@ class HostWindows(_SpecWindowList[HWindow]):
     def windowsplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Optional[HostGalaxyModel] = None,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> HostWindowsPlotWithResiduals | HostWindowsPlotWithDifferences:
+    ):
         """
         ...
         """
-        args = (self.getModel(), self.window_bounds, self.spectrum)
+        from quasar_decrypt.plotting.windows_plots import (
+            HostWindowsPlotWithDifferences,
+            HostWindowsPlotWithResiduals,
+        )
+        if model is None:
+            model = self.getModel()
+
+        args = (model, self.window_bounds, self.spectrum)
         cls = HostWindowsPlotWithResiduals \
             if mode == "residual" \
             else HostWindowsPlotWithDifferences
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "HostWindows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot()
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )
 
     def templatesplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Optional[HostGalaxyModel] = None,
         with_windows: bool = True,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> Union[
-        HostWindowsAndTemplatesWithResidualsPlot,
-        HostWindowsAndTemplatesWithDifferencesPlot,
-        HostTemplatesWithResidualsPlot,
-        HostTemplatesWithDifferencesPlot,
-    ]:
+    ):
         """
         ...
         """
+        from quasar_decrypt.plotting.windows_and_templates_plots import (
+            HostTemplatesWithDifferencesPlot,
+            HostTemplatesWithResidualsPlot,
+            HostWindowsAndTemplatesWithDifferencesPlot,
+            HostWindowsAndTemplatesWithResidualsPlot,
+        )
+        if model is None:
+            model = self.getModel()
+
         if with_windows:
-            args = (self.getModel(), self.window_bounds, self.spectrum)
+            args = (model, self.window_bounds, self.spectrum)
             cls = HostWindowsAndTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else HostWindowsAndTemplatesWithDifferencesPlot
         else:
-            args = (self.getModel(), self.spectrum)
+            args = (model, self.spectrum)
             cls = HostTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else HostTemplatesWithDifferencesPlot
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "HostTemplates/Windows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot()
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

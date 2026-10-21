@@ -2,17 +2,17 @@
 The Balmer window class: 'BWindow'.
 """
 
-from dataclasses import dataclass
 from logging import getLogger
 from typing import ClassVar
 
-from quasar_typing.misc import BackgroundFlux
+import pydantic
+from quasar_typing.string_selections import BackgroundFlux
 
-from ..utils import _SpecWindow
+from quasar_decrypt.utils import _SpecWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class BWindow(_SpecWindow):
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "ba"})

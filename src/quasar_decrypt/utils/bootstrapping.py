@@ -14,16 +14,14 @@ from quasar_models import (
     FeModel,
     HgModel,
 )
-from quasar_typing.astropy import CompoundModel_
-from quasar_typing.misc import (
+from quasar_typing.astropy import CompoundModelType
+from quasar_typing.literals import (
     BootstrapType,
-    DataTypes,
-    ModelTypes,
-    Pool_,
     Variant,
-    VaryLines,
 )
-from quasar_typing.numpy import RandomState_
+from quasar_typing.multiprocessing import PoolType
+from quasar_typing.numpy import RandomStateType
+from quasar_typing.string_selections import DataTypes, ModelTypes, VaryLines
 from quasar_utils.continuum_fit_result import ContinuumFitResult
 from quasar_utils.setup import FitterKwargs, Info
 
@@ -72,18 +70,18 @@ def args_and_kwargs_helper(
 
     cfit: ContinuumFitResult | None,
     pl: Optional[BaModel] = None,
-    fe: Union[FeModel, CompoundModel_[FeModel], None] = None,
+    fe: Union[FeModel, CompoundModelType[FeModel], None] = None,
     ba: Optional[BaModel] = None,
     hg: Optional[HgModel] = None,
-    em: Union[EmModel, CompoundModel_[EmModel], None] = None,
+    em: Union[EmModel, CompoundModelType[EmModel], None] = None,
 
     fitter_kwargs: FitterKwargs,
     iterations: int = 100,
-    random_state: RandomState_ = None,
+    random_state: RandomStateType = None,
     bootstrap_type: BootstrapType = "model",
     n_sigmas: float = 2.0,
     vary_lines: VaryLines | None = None,
-    pool: Pool_ | None = None,
+    pool: PoolType | None = None,
     replace_missing: bool = True,
     tqdm_disable: bool = False,
     tqdm_leave: bool = False,

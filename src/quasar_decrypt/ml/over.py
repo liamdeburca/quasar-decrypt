@@ -6,7 +6,7 @@ from functools import cached_property, lru_cache
 from logging import getLogger
 from pathlib import Path
 from pickle import load
-from typing import ClassVar, Union
+from typing import ClassVar
 
 from numpy import (
     dot,
@@ -19,7 +19,7 @@ from numpy import (
     nan_to_num,
     zeros_like,
 )
-from quasar_typing.astropy import CompoundModel_, Model_
+from quasar_typing.astropy import ModelType
 from quasar_typing.numpy import FloatVector
 from quasar_utils.absorption.absorption import log_fft_test
 from scipy.stats import chi2
@@ -45,7 +45,7 @@ def _get_classifiers() -> dict[int, Callable]:
 ###
 
 
-def _number_of_free_params(model: Union[Model_, CompoundModel_]) -> int:
+def _number_of_free_params(model: ModelType) -> int:
     n = 0
     ms = (model,) if model.n_submodels == 1 else model
     for m in ms:

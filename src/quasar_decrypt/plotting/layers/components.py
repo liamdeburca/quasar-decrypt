@@ -28,7 +28,7 @@ class ComponentsLayer:
                 label="Sm.",
             )[0]
 
-        if self.pl_color and not (self.y_pl == 0).all():
+        if self.pl_color and (self.y_pl != 0).any():
             self._pl_line = self[0].step(
                 self.x, 
                 self.y_pl, 
@@ -39,7 +39,7 @@ class ComponentsLayer:
                 label="P.L.",
             )[0]
 
-        if self.fe_color and not (self.y_fe == 0).all():
+        if self.fe_color and (self.y_fe != 0).any():
             self._fe_line = self[0].step(
                 self.x, 
                 self.y_pl + self.y_fe, 
@@ -50,7 +50,7 @@ class ComponentsLayer:
                 label="Fe C.",
             )[0]
 
-        if self.ba_color and not (self.y_ba == 0).all():
+        if self.ba_color and (self.y_ba != 0).any():
             self._ba_line = self[0].step(
                 self.x, 
                 self.y_pl + self.y_ba, 
@@ -61,7 +61,7 @@ class ComponentsLayer:
                 label="Ba.C.",
             )[0]
 
-        if self.hg_color and not (self.y_hg == 0).all():
+        if self.hg_color and (self.y_hg != 0).any():
             self._hg_line = self[0].step(
                 self.x, 
                 self.y_pl + self.y_hg, 
@@ -72,7 +72,7 @@ class ComponentsLayer:
                 label="Gal.",
             )[0]
 
-        if self.em_color and not (self.y_em == 0).all():
+        if self.em_color and (self.y_em != 0).any():
             self._em_line = self[0].step(
                 self.x, 
                 self.y_pl + self.y_em, 

@@ -1,15 +1,15 @@
 __all__ = ["_SpecWindow"]
 
 from dataclasses import field
+from functools import wraps
 from logging import getLogger
-from typing import ClassVar, Self
+from typing import Any, ClassVar, Self
 
-from pydantic.dataclasses import dataclass
+import pydantic
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc import BackgroundFlux
 from quasar_typing.numpy import BoolVector, FloatMatrix, FloatVector
-from quasar_typing.scipy import csr_matrix_
-from quasar_utils.decorators import validate_call
+from quasar_typing.scipy import CSRMatrix
+from quasar_typing.string_selections import BackgroundFlux
 from quasar_utils.setup import Info
 
 from ._basespec import _BaseSpec
@@ -19,7 +19,7 @@ from .utils import CachedGetMask
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class _SpecWindow(_BaseSpec):
     """
     Class for storing spectral windows. 
@@ -46,8 +46,10 @@ class _SpecWindow(_BaseSpec):
         if getattr(self, "get_mask_original", None) is None:
             self.get_mask_original = CachedGetMask.create(self.spectrum._x_original)
 
+    ### create
+
     @classmethod
-    @validate_call
+    @pydantic.validate_call
     def create(
         cls,
         *,
@@ -59,6 +61,23 @@ class _SpecWindow(_BaseSpec):
         """
         Creates a '_SpecWindow' object from a '_Spec' object and x_bounds.
         """
+        return cls._create(
+            spectrum=spectrum,
+            x_bounds=x_bounds,
+            get_mask=get_mask,
+            get_mask_original=get_mask_original,
+        )
+
+    @classmethod
+    @wraps(create)
+    def _create(
+        cls,
+        *,
+        spectrum: _Spec,
+        x_bounds: CoordBounds,
+        get_mask: CachedGetMask | None = None,
+        get_mask_original: CachedGetMask | None = None,
+    ) -> Self:
         if get_mask is None:
             get_mask = CachedGetMask.create(spectrum._x)
 
@@ -119,7 +138,7 @@ class _SpecWindow(_BaseSpec):
         return self.spectrum._dx
 
     @property
-    def _kernels(self) -> FloatMatrix | csr_matrix_: 
+    def _kernels(self) -> FloatMatrix | CSRMatrix: 
         return self.spectrum._kernels
 
     @property
@@ -139,7 +158,7 @@ class _SpecWindow(_BaseSpec):
         return self.spectrum._dx_original
 
     @property
-    def _kernels_original(self) -> FloatMatrix | csr_matrix_: 
+    def _kernels_original(self) -> FloatMatrix | CSRMatrix: 
         return self.spectrum._kernels_original
 
     ###
@@ -405,3 +424,26 @@ class _SpecWindow(_BaseSpec):
     @info.setter
     def info(self, value: Info) -> None:
         self.spectrum.info = value
+
+    ###
+
+    def _plot_helper[P](
+        self,
+        *,
+        plotter_cls: type[P],
+        lazy: bool,
+        args: tuple[Any, ...],
+        plotter_kwargs: dict[str, Any],
+    ) -> P:
+        plotter = plotter_cls(*args, **plotter_kwargs)
+
+        if "title_prefix" not in plotter_kwargs:
+            plotter_kwargs["title_prefix"] = f"{self.__class__.__name__} of: "
+        if "title" not in plotter_kwargs:
+            plotter_kwargs["title"] = self.spectrum.title
+        if "xlim" not in plotter_kwargs:
+            plotter_kwargs["xlim"] = self.x_bounds
+        if "original" in plotter_kwargs:
+            plotter_kwargs["original"] &= not self._no_original
+
+        return plotter if lazy else plotter.plot()

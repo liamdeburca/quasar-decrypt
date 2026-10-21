@@ -1,47 +1,33 @@
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import field
 from logging import getLogger
-from typing import Any, ClassVar, Literal, Optional, Self, Union
+from typing import Any, ClassVar, Literal, Optional, Self
 
-from numpy import invert
-from quasar_errors.model_samples import BalmerSample
+import pydantic
 from quasar_models.balmer import (
     BalmerContinuumTemplate,
     BalmerModel,
     BalmerSeriesTemplate,
 )
-from quasar_models.modeling import Fitter, PrepareModel
-from quasar_typing.astropy import FitInfo
 from quasar_typing.bounds import AstropyBounds, CoordBounds
-from quasar_typing.misc import BackgroundFlux
-from quasar_typing.pathlib import AbsoluteFITSPath
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_typing.pathlib import FITSPath
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import BackgroundFlux
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.setup import FitterKwargs
 
-from ..plotting.windows_and_templates_plots import (
-    BalmerTemplatesWithDifferencesPlot,
-    BalmerTemplatesWithResidualsPlot,
-    BalmerWindowsAndTemplatesWithDifferencesPlot,
-    BalmerWindowsAndTemplatesWithResidualsPlot,
-)
-from ..plotting.windows_plots import (
-    BalmerWindowsPlotWithDifferences,
-    BalmerWindowsPlotWithResiduals,
-)
-from ..utils import _SpecWindowList
+from quasar_decrypt.utils import _SpecWindowList
+
 from .bwindow import BWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class BalmerWindows(_SpecWindowList[BWindow]):
     model: Optional[BalmerModel] = field(default=None, init=False)
     fit: Optional[BalmerModel] = field(default=None, init=False)
-    fit_info: FitInfo | None = field(default=None, init=False)
+    fit_info: OptimizeResultType | None = field(default=None, init=False)
 
     default_bg: ClassVar[BackgroundFlux] = BackgroundFlux({"all", "ba"})
 
@@ -59,7 +45,8 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         self.fit_info = state.get("fit_info", None)
 
     @property
-    def sample(self) -> BalmerSample | None:
+    def sample(self):
+        from quasar_errors.model_samples import BalmerSample
         if (model := self.getModel()) is None:
             return None
         return BalmerSample.fromBalmerModel(model)
@@ -177,7 +164,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
 
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def loadBalmerSeriesTemplate(
         self,
         *,
@@ -186,7 +173,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         dens: float | None = None,
         n_u_min: int | None = None,
         n_u_max: int | None = None,
-        template_file: str | AbsoluteFITSPath | None = None,
+        template_file: str | FITSPath | None = None,
     ) -> BalmerSeriesTemplate:
         """
         Loads a BalmerSeriesTemplate instance.
@@ -230,14 +217,14 @@ class BalmerWindows(_SpecWindowList[BWindow]):
 
         return template
 
-    @validate_call
+    @pydantic.validate_call
     def loadBalmerContinuumTemplate(
         self,
         *,
         temp: float | None = None,
         tau: float | None = None,
         scale: float | None = None,
-        template_file: str | AbsoluteFITSPath | None = None,
+        template_file: str | FITSPath | None = None,
     ) -> BalmerContinuumTemplate:
         """
         Loads a BalmerContinuumTemplate instance.
@@ -382,7 +369,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         cond1 = (r_blue < min_fittable_ratio) or (n_blue < min_fittable_total)
 
         # The red side: Balmer series contribution
-        is_red = invert(is_blue)
+        is_red = ~is_blue
         n_red: int = fittable_pixels[is_red].sum()
         r_red: float = fittable_pixels[is_red].mean() if n_red > 0 else 0.0
         cond2 = (r_red < min_fittable_ratio) or (n_red < min_fittable_total)
@@ -416,7 +403,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
 
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def getRasterFit(
         self,
         *,
@@ -471,6 +458,8 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         shrink: bool | None = None,
         fitter_kwargs: FitterKwargs | None = None,
     ) -> Self:
+        from quasar_models.modeling import Fitter, PrepareModel
+        
         msg = f"Performing fine-tuning fit on {self.__str__(True)}: "
 
         original = self._update_original_flag(
@@ -517,7 +506,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
                 where=where,
                 get_model=True,
                 inplace=False,
-                **fitter_kwargs,
+                **(fitter_kwargs or {}),
             )
             fit_info = fitter.fit_info
 
@@ -540,12 +529,12 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         """
         return self.fit or self.model
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
         fit: BalmerModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -558,12 +547,12 @@ class BalmerWindows(_SpecWindowList[BWindow]):
             update_emission=update_emission,
         )
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: BalmerModel,
+        fit: Optional[BalmerModel],
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -575,70 +564,72 @@ class BalmerWindows(_SpecWindowList[BWindow]):
         if update_emission:
             self.updateBalmerEmission.__wrapped__(self, fit)
 
-            for bwindow in filter(lambda w: w._y_ba is not self._y_ba, self):
-                bwindow.updateBalmerEmission.__wrapped__(
-                    bwindow,
-                    fit,
-                )
-
         return self
 
     def windowsplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Optional[BalmerModel] = None,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> BalmerWindowsPlotWithResiduals | BalmerWindowsPlotWithDifferences:
+    ):
         """
         ...
         """
-        args = (self.getModel(), self.window_bounds, self)
+        from quasar_decrypt.plotting.windows_plots import (
+            BalmerWindowsPlotWithDifferences,
+            BalmerWindowsPlotWithResiduals,
+        )
+        if model is None:
+            model = self.getModel()
+        
+        args = (model, self.window_bounds, self)
         cls = BalmerWindowsPlotWithResiduals \
             if mode == "residual" \
             else BalmerWindowsPlotWithDifferences
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "BalmerWindows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot() 
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )
 
     def templatesplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Optional[BalmerModel] = None,
         with_windows: bool = True,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> Union[
-        BalmerWindowsAndTemplatesWithResidualsPlot,
-        BalmerWindowsAndTemplatesWithDifferencesPlot,
-        BalmerTemplatesWithResidualsPlot,
-        BalmerTemplatesWithDifferencesPlot,
-    ]:
+    ):
         """
         ...
         """
+        from quasar_decrypt.plotting.windows_and_templates_plots import (
+            BalmerTemplatesWithDifferencesPlot,
+            BalmerTemplatesWithResidualsPlot,
+            BalmerWindowsAndTemplatesWithDifferencesPlot,
+            BalmerWindowsAndTemplatesWithResidualsPlot,
+        )
+
+        if model is None:
+            model = self.getModel()
+
         if with_windows:
-            args = (self.getModel(), self.window_bounds, self.spectrum)
+            args = (model, self.window_bounds, self.spectrum)
             cls = BalmerWindowsAndTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else BalmerWindowsAndTemplatesWithDifferencesPlot
         else:
-            args = (self.getModel(), self.spectrum)
+            args = (model, self.spectrum)
             cls = BalmerTemplatesWithResidualsPlot \
                 if mode == "residual" \
                 else BalmerTemplatesWithDifferencesPlot
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "BalmerTemplates/Windows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot()
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

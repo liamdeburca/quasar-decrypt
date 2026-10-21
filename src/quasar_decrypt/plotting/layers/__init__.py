@@ -1,30 +1,38 @@
-__all__ = [
-    "BalmerTemplatesLayer",
-    "ComponentsLayer",
-    "DataLayer",
-    "DataWithComponentsLayer",
-    "DifferenceLayer",
-    "HostTemplatesLayer",
-    "IronTemplatesLayer",
-    "ResidualLayer",
-    "WindowsLayer",
-]
-from dataclasses import dataclass
+import sys
+from typing import TYPE_CHECKING
 
-from .components import ComponentsLayer
-from .misc import (
-    DataLayer,
-    DifferenceLayer,
-    ResidualLayer,
-)
-from .templates import (
-    BalmerTemplatesLayer,
-    HostTemplatesLayer,
-    IronTemplatesLayer,
-)
-from .windows import WindowsLayer
+from lazy_imports import LazyImporter
 
+_import_structure: dict[str, list[str]] = {
+    "components": ["ComponentsLayer"],
+    "composite": ["DataWithComponentsLayer"],
+    "data": ["DataLayer"],
+    "difference": ["DifferenceLayer"],
+    "residual": ["ResidualLayer"],
+    "templates": [
+        "BalmerTemplatesLayer",
+        "HostTemplatesLayer",
+        "IronTemplatesLayer",
+    ],
+    "windows": ["WindowsLayer"],
+}
 
-@dataclass
-class DataWithComponentsLayer(DataLayer, ComponentsLayer):
-    """Dataclass responsible for plotting the data and the modelled components."""
+if TYPE_CHECKING:
+    from .components import ComponentsLayer  # noqa: F401
+    from .composite import DataWithComponentsLayer  # noqa: F401
+    from .data import DataLayer  # noqa: F401
+    from .difference import DifferenceLayer  # noqa: F401
+    from .residual import ResidualLayer  # noqa: F401
+    from .templates import (  # noqa: F401
+        BalmerTemplatesLayer,
+        HostTemplatesLayer,
+        IronTemplatesLayer,
+    )
+    from .windows import WindowsLayer  # noqa: F401
+
+else:
+    sys.modules[__name__] = LazyImporter(
+        __name__,
+        __file__,
+        _import_structure,
+    )

@@ -12,20 +12,19 @@ from dataclasses import field
 from functools import wraps
 from typing import ClassVar, Literal, Self, TypeVar
 
-from numpy import bool_, float64, log, ones_like, zeros
-from pydantic.dataclasses import dataclass
-from quasar_typing.misc import BackgroundFlux
+import numpy as np
+import pydantic
 from quasar_typing.numpy import (
-    Array_,
+    Array,
     BoolVector,
     CoordsTuple,
     FloatMatrix,
     FloatVector,
 )
-from quasar_typing.scipy import csr_matrix_
-from quasar_utils.resolving import limit_loss, mask_kernels
+from quasar_typing.scipy import CSRMatrix
+from quasar_typing.string_selections import BackgroundFlux
 
-A = TypeVar("A", bound=Array_)
+A = TypeVar("A", bound=Array)
 P = TypeVar("P", bound=Callable)
 
 
@@ -41,7 +40,7 @@ def formatted_property[P, A](p: Callable[[P], A]) -> A:
     return property(formatted_property)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class BaseMaskedCoords(ABC):
     """
     This class contains arrays of a masked `SpecData` instance.
@@ -51,7 +50,7 @@ class BaseMaskedCoords(ABC):
     secondary_mask: BoolVector
     bg_flux: BackgroundFlux | None = None
 
-    _cache: dict[str, Array_] = field(default_factory=dict, kw_only=True)
+    _cache: dict[str, Array] = field(default_factory=dict, kw_only=True)
     mask: BoolVector = field(init=False)
 
     _original: ClassVar[bool] = False
@@ -65,7 +64,7 @@ class BaseMaskedCoords(ABC):
 
     @classmethod
     @abstractmethod
-    def _format(cls, arr: Array_ | None) -> Array_ | None:
+    def _format(cls, arr: Array | None) -> Array | None:
         pass
 
     ### Context
@@ -75,13 +74,13 @@ class BaseMaskedCoords(ABC):
             return self.__class__(
                 self.spec,
                 self.primary_mask,
-                ones_like(self._x, dtype=bool_),
+                np.ones_like(self._x, dtype=np.bool_),
                 bg_flux=self.bg_flux,
             )
         else:
             return self.__class__(
                 self.spec,
-                ones_like(self._x, dtype=bool_),
+                np.ones_like(self._x, dtype=np.bool_),
                 self.secondary_mask,
                 bg_flux=self.bg_flux,
             )
@@ -150,7 +149,9 @@ class BaseMaskedCoords(ABC):
         the model is evaluated, to an extent where the edges of the secondary 
         mask are well-resolved. 
         """
-        _mask = limit_loss(self._kernels, self.primary_mask, shrink)
+        from quasar_utils.resolving import _limit_loss
+
+        _mask = _limit_loss(self._kernels, self.primary_mask, shrink)
         if shrink:
             primary_mask = self.primary_mask.copy()
             secondary_mask = self.secondary_mask & _mask # Contraction
@@ -186,7 +187,7 @@ class BaseMaskedCoords(ABC):
     @property
     def _y_bg(self) -> FloatVector:
         if self.bg_flux is None:
-            return zeros(self.mask.size, dtype=float64)
+            return np.zeros(self.mask.size, dtype=np.float64)
 
         return sum(
             getattr(self.spec, f"_y_{b}{self._suffix}") 
@@ -230,12 +231,13 @@ class BaseMaskedCoords(ABC):
     ###
 
     @property
-    def _kernels(self) -> FloatMatrix | csr_matrix_:
+    def _kernels(self) -> FloatMatrix | CSRMatrix:
         return getattr(self.spec, "_kernels" + self._suffix)
 
     @formatted_property
-    def kernels(self) -> FloatMatrix | csr_matrix_:
-        return mask_kernels(self._kernels, self.mask)
+    def kernels(self) -> FloatMatrix | CSRMatrix:
+        from quasar_utils.resolving import _mask_kernels
+        return _mask_kernels(self._kernels, self.mask)
 
     ###
 
@@ -361,12 +363,12 @@ class BaseMaskedCoords(ABC):
 
     @property
     def _y_log(self) -> FloatVector:
-        return log(self._y / self.spec.y0)
+        return np.log(self._y / self.spec.y0)
 
     @formatted_property
     def y_log(self) -> FloatVector:
         assert self.y.min() > 0.0, self.y.min()
-        return log(self.y / self.spec.y0)
+        return np.log(self.y / self.spec.y0)
 
     ###
 
@@ -380,7 +382,7 @@ class BaseMaskedCoords(ABC):
 
 ###
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class MaskedCoords(BaseMaskedCoords):
     """
     This class contains arrays of a masked `SpecData` instance.
@@ -389,11 +391,11 @@ class MaskedCoords(BaseMaskedCoords):
     _suffix: ClassVar[str] = ""
 
     @classmethod
-    def _format(cls, arr: Array_ | None) -> Array_ | None:
+    def _format(cls, arr: Array | None) -> Array | None:
         return arr    
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class ReadOnlyMaskedCoords(BaseMaskedCoords):
     """
     This class contains read-only arrays of a masked `SpecData` instance.
@@ -402,7 +404,7 @@ class ReadOnlyMaskedCoords(BaseMaskedCoords):
     _suffix: ClassVar[str] = ""
 
     @staticmethod
-    def _format(arr: Array_ | None) -> Array_ | None:
+    def _format(arr: Array | None) -> Array | None:
         if arr is None:
             return None
         _arr = arr.copy(order="C")
@@ -410,7 +412,7 @@ class ReadOnlyMaskedCoords(BaseMaskedCoords):
         return _arr
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class ContiguousMaskedCoords(BaseMaskedCoords):
     """
     This class contains contiguous, read-only arrays of a masked `SpecData`
@@ -420,7 +422,7 @@ class ContiguousMaskedCoords(BaseMaskedCoords):
     _suffix: ClassVar[str] = ""
 
     @staticmethod
-    def _format(arr: Array_ | None) -> Array_ | None:
+    def _format(arr: Array | None) -> Array | None:
         if arr is None:
             return None
         _arr = arr.copy(order="C")
@@ -428,7 +430,7 @@ class ContiguousMaskedCoords(BaseMaskedCoords):
 
 ###
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class OriginalMaskedCoords(MaskedCoords):
     """
     This class contains read-only arrays of a masked `SpecData` instance.
@@ -437,7 +439,7 @@ class OriginalMaskedCoords(MaskedCoords):
     _suffix: ClassVar[Literal["_original"]] = "_original"
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class OriginalReadOnlyMaskedCoords(ReadOnlyMaskedCoords):
     """
     This class contains read-only arrays of a masked `SpecData` instance.
@@ -446,7 +448,7 @@ class OriginalReadOnlyMaskedCoords(ReadOnlyMaskedCoords):
     _suffix: ClassVar[Literal["_original"]] = "_original"
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class OriginalContiguousMaskedCoords(ContiguousMaskedCoords):
     """
     This class contains contiguous, read-only arrays of a masked `SpecData`

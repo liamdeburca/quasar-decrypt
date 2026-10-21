@@ -1,21 +1,20 @@
 from abc import abstractmethod
 from dataclasses import field
+from functools import wraps
 from typing import Any, ClassVar, Self, TypeVar
 
-from numpy import bool_, zeros_like
-from pydantic.dataclasses import dataclass
+import numpy as np
+import pydantic
 from quasar_typing.bounds import CoordBounds
-from quasar_typing.misc import BackgroundFlux
 from quasar_typing.numpy import BoolVector
-from quasar_utils.decorators import validate_call
+from quasar_typing.string_selections import BackgroundFlux
 
 from ._spec import _Spec
 from ._specwindow import _SpecWindow
 
 T = TypeVar("T", bound="_SpecWindow")    
 
-
-@dataclass
+@pydantic.dataclasses.dataclass
 class _SpecWindowList(_SpecWindow, list[T]):
     """
     Class for storing lists of spectral windows. 
@@ -58,13 +57,22 @@ class _SpecWindowList(_SpecWindow, list[T]):
             s += f"{self.n_logval}/{n} (log-val.)"
         return s
 
+    ### create
+
     @classmethod
-    @validate_call
+    @pydantic.validate_call
     def create(cls, *, spectrum: _Spec) -> Self:
+        return cls._create(spectrum=spectrum)
+
+    @classmethod
+    @wraps(create)
+    def _create(cls, *, spectrum: _Spec) -> Self:
         return cls(
             spectrum=spectrum,
             x_bounds=spectrum.x_bounds,
         )
+
+    ###
 
     @property
     def is_empty(self) -> bool:
@@ -72,14 +80,14 @@ class _SpecWindowList(_SpecWindow, list[T]):
 
     @property
     def mask(self) -> BoolVector:
-        mask = zeros_like(self._x, dtype=bool_, order="C")
+        mask = np.zeros_like(self._x, dtype=np.bool_, order="C")
         for window in self:
             mask |= window.mask
         return mask
 
     @property
     def mask_original(self) -> BoolVector:
-        mask = zeros_like(self._x_original, dtype=bool_, order="C")
+        mask = np.zeros_like(self._x_original, dtype=np.bool_, order="C")
         for window in self:
             mask |= window.mask_original
         return mask
@@ -100,3 +108,21 @@ class _SpecWindowList(_SpecWindow, list[T]):
     @abstractmethod
     def sample(self):
         pass
+
+    def _plot_helper[P](
+        self,
+        *,
+        plotter_cls: type[P],
+        lazy: bool,
+        args: tuple[Any, ...],
+        plotter_kwargs: dict[str, Any],
+    ) -> P:
+        if "xlim" not in plotter_kwargs:
+            plotter_kwargs["xlim"] = self.spectrum.x_bounds
+
+        return super()._plot_helper(
+            plotter_cls=plotter_cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

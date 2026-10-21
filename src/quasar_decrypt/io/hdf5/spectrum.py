@@ -1,125 +1,163 @@
+from pathlib import Path
 from typing import Any
 
-from h5py import File, Group, string_dtype
-from numpy import dtype, float64, ones
+from h5py import File, Group
+from numpy import dtype, float32, float64, ones
 from quasar_utils.setup import Info
 
-from ...spectrum import Spectrum
-from .utils import spec_to_hdf5, specwindowlist_to_hdf5
+from quasar_decrypt.spectrum import Spectrum
 
+from .balmer_windows import balmer_windows_to_hdf5, hdf5_to_balmer_windows
+from .continuum_windows import (
+    continuum_windows_to_hdf5,
+    hdf5_to_continuum_windows,
+)
+from .host_windows import hdf5_to_host_windows, host_windows_to_hdf5
+from .iron_windows import hdf5_to_iron_windows, iron_windows_to_hdf5
+from .line_windows import hdf5_to_line_windows, line_windows_to_hdf5
+from .utils import spec_to_hdf5
+
+
+def _validate(grp: File | Group, info: Info) -> Group:
+    if not str(grp.name).endswith("spectrum"):
+        if "spectrum" not in grp:
+            raise ValueError(f"Missing group 'spectrum': {list(grp.keys())}")
+        grp = grp["spectrum"]
+
+    assert "version" in grp.attrs
+    assert "class" in grp.attrs
+    assert "path" in grp.attrs
+    assert "title" in grp.attrs
+    assert "units_hash_algo" in grp.attrs
+    assert "units_hash" in grp.attrs
+
+    hash_algo = grp.attrs["units_hash_algo"]
+    curr_hash = grp.attrs["units_hash"]
+    my_hash = info.units.create_hash(hash_algo)
+    if curr_hash != my_hash:
+        raise ValueError(f"UnitsInfo has mismatch: {hash_algo}")
+
+    if "spec" not in grp:
+        raise ValueError(f"Spectrum group {grp.name!r} missing 'spec' sub-group")
+
+    return grp
 
 def spectrum_to_hdf5(
     spectrum: Spectrum,
     f: File | Group,
-    group_name: str | None = None,
-    _dtype: str | dtype = "f",
+    _dtype: str | dtype = float32,
     force: bool = False,
-    compression: str | None = None,
-    compression_opts: int | None = None,
+    **compression_kwargs,
 ) -> Group:
-    if group_name is None:
-        group_name = spectrum.__class__.__name__
+    """
+    Creates a `h5py.Group` with the following structure:
 
-    if group_name in f:
+    spectrum/
+             spec/ (see `spec_to_hdf5`)
+             pl/   (see `continuum_windows_to_hdf5`)
+             fe/   (see `iron_windows_to_hdf5`)
+             ba/   (see `balmer_windows_to_hdf5`)
+             hg/   (see `host_windows_to_hdf5`)
+             em/   (see `line_windows_to_hdf5`)
+    """
+    if "spectrum" in f:
         if not force:
-            raise ValueError(f"Group '{group_name}' already exists in the HDF5 file.")
-        del f[group_name]
+            raise ValueError("Group 'spectrum' already exists in the HDF5 file.")
+        del f["spectrum"]
 
-    grp = f.create_group(group_name)
+    grp = f.create_group("spectrum")
+    grp.attrs["version"] = 1
+    grp.attrs["class"] = "Spectrum"
+
+    # Metadata
+    grp.attrs["path"] = str(spectrum.path)
+    grp.attrs["title"] = spectrum.title
+
+    grp.attrs["units_hash_algo"] = "sha256"
+    grp.attrs["units_hash"] = spectrum.info.units.create_hash("sha256")
     
-    if "meta" in f:
-        if not force:
-            raise ValueError("Group 'meta' already exists in the HDF5 file.")
-        del f["meta"]
-    
-    meta = grp.create_group("meta")
-
-    str_dt = string_dtype(encoding="utf-8")
-    meta.create_dataset("path", data=str(spectrum.path), dtype=str_dt)
-    meta.create_dataset("title", data=spectrum.title, dtype=str_dt)
-
     spec_to_hdf5(
-        spectrum,
         grp,
-        group_name="spec",
+        spectrum,
         _dtype=_dtype,
         force=force,
-        compression=compression,
-        compression_opts=compression_opts,
+        **compression_kwargs,
     )
-
     if spectrum.pl is not None:
-        specwindowlist_to_hdf5(
-            spectrum.pl,
+        continuum_windows_to_hdf5(
             grp,
-            group_name="pl",
+            spectrum.pl,
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
     if spectrum.fe is not None:
-        specwindowlist_to_hdf5(
-            spectrum.fe,
+        iron_windows_to_hdf5(
             grp,
-            group_name="fe",
+            spectrum.fe,
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
     if spectrum.ba is not None:
-        specwindowlist_to_hdf5(
-            spectrum.ba,
+        balmer_windows_to_hdf5(
             grp,
-            group_name="ba",
+            spectrum.ba,
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
     if spectrum.hg is not None:
-        specwindowlist_to_hdf5(
-            spectrum.hg,
+        host_windows_to_hdf5(
             grp,
-            group_name="hg",
+            spectrum.hg,
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
     if spectrum.em is not None:
-        specwindowlist_to_hdf5(
-            spectrum.em,
+        line_windows_to_hdf5(
             grp,
-            group_name="em",
+            spectrum.em,
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
 
+    _validate(grp, spectrum.info)
     return grp
+
 
 
 def hdf5_to_spectrum(
     f: File | Group,
     info: Info,
-    group_name: str | None = None,
 ) -> Spectrum:
-    if group_name is None:
-        group_name = "Spectrum"
+    """Load a Spectrum from an HDF5 group.
 
-    if group_name not in f:
-        raise ValueError(f"Group '{group_name}' does not exist in the HDF5 file.")
+    The structure of the HDF5 group is expected to match the layout created by 
+    `spectrum_to_hdf5`.
 
-    grp = f[group_name]
-    meta = grp["meta"]
+    Parameters
+    ----------
+    f : h5py.File | h5py.Group
+        The HDF5 file or group containing the spectrum group.
+    info : Info
+        Setup/info object used to create the Spectrum.
+    group_name : str | None
+        Name of the group to read; defaults to "spectrum".
+
+    Returns
+    -------
+    Spectrum
+        The instantiated Spectrum object populated from HDF5.
+    """
+    grp = _validate(f, info)
 
     kwargs: dict[str, Any] = {
         "info": info,
-        "path": meta["path"].asstr()[()],
-        "title": meta["title"].asstr()[()],
+        "path": Path(grp.attrs["path"]),
+        "title": str(grp.attrs["title"]),
     }
 
     spec: Group = grp["spec"]
@@ -163,8 +201,8 @@ def hdf5_to_spectrum(
         kwargs["absorbed_pixels"] = spec["absorbed_pixels"][()]
     if "valid_pixels" in spec:
         kwargs["valid_pixels"] = spec["valid_pixels"][()]
-    if "invalid_pixels" in spec:
-        kwargs["invalid_pixels"] = spec["invalid_pixels"][()]
+    if "log_valid_pixels" in spec:
+        kwargs["log_valid_pixels"] = spec["log_valid_pixels"][()]
 
     if "original" not in spec:
         # No original data, i.e. rebinned and original data are identical
@@ -188,6 +226,9 @@ def hdf5_to_spectrum(
 
         if "kernels" in original:
             kwargs["kernels_original"] = original["kernels"][()]
+        else:
+            kwargs["kernels_original"] = kwargs["kernels"]
+            
         if "y_smooth" in original:
             kwargs["y_smooth_original"] = original["y_smooth"][()]
         if "p_absorbed" in original:
@@ -213,31 +254,17 @@ def hdf5_to_spectrum(
         if "log_valid_pixels" in original:
             kwargs["log_valid_pixels_original"] = original["log_valid_pixels"][()]
 
-    spectrum = Spectrum.create.__wrapped__(Spectrum, **kwargs)
+    spectrum = Spectrum.create(**kwargs)
 
     if "pl" in grp:
-        windows = [
-            tuple(window["x_bounds"][()]) 
-            for window in grp["pl"].values()
-        ]
-        spectrum.instantiateContinuum(windows=windows)
+        hdf5_to_continuum_windows(grp["pl"], spectrum)
     if "fe" in grp:
-        windows = [
-            tuple(window["x_bounds"][()]) 
-            for window in grp["fe"].values()
-        ]
-        spectrum.instantiateIron(windows=windows)
+        hdf5_to_iron_windows(grp["fe"], spectrum)
     if "ba" in grp:
-        windows = [
-            tuple(window["x_bounds"][()]) 
-            for window in grp["ba"].values()
-        ]
-        spectrum.instantiateBalmer(windows=windows)
+        hdf5_to_balmer_windows(grp["ba"], spectrum)
     if "hg" in grp:
-        windows = [
-            tuple(window["x_bounds"][()]) 
-            for window in grp["hg"].values()
-        ]
-        spectrum.instantiateHost(windows=windows)
+        hdf5_to_host_windows(grp["hg"], spectrum)
+    if "em" in grp:
+        hdf5_to_line_windows(grp["em"], spectrum)
 
     return spectrum

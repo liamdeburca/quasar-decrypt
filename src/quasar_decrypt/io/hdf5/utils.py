@@ -1,6 +1,12 @@
-"""
-Utilities for extracting data arrays from a `_Spec` object and storing them in a 
-HDF5 group.
+"""Utilities for serializing parts of a ``_Spec`` object into HDF5 groups.
+
+Parameters
+----------
+None
+
+Returns
+-------
+None
 """
 from functools import partial
 from typing import Any
@@ -9,9 +15,9 @@ from h5py import File, Group
 from numpy import bool_, dtype, float32, isfinite
 from scipy.sparse import issparse
 
-from ...utils._spec import _Spec
-from ...utils._specwindow import _SpecWindow
-from ...utils._specwindowlist import _SpecWindowList
+from quasar_decrypt.utils._spec import _Spec
+from quasar_decrypt.utils._specwindow import _SpecWindow
+from quasar_decrypt.utils._specwindowlist import _SpecWindowList
 
 
 def _cd_f(
@@ -19,63 +25,66 @@ def _cd_f(
     name: str, 
     data: Any, 
     _dtype: str | dtype, 
-    compression: str | None, 
-    compression_opts: int | None,
+    **compression_kwargs,
 ) -> None:
-    grp.create_dataset(
-        name, 
-        data=data, 
-        dtype=_dtype, 
-        compression=compression, 
-        compression_opts=compression_opts,
-    )
+    grp.create_dataset(name, data=data, dtype=_dtype, **compression_kwargs)
 
 def _cd_b(
     grp: Group, 
     name: str, 
     data: Any, 
-    compression: str | None, 
-    compression_opts: int | None,
+    **compression_kwargs,
 ) -> None:
-    grp.create_dataset(
-        name, 
-        data=data, 
-        dtype=bool_, 
-        compression=compression, 
-        compression_opts=compression_opts,
-    )
+    grp.create_dataset(name, data=data, dtype=bool_, **compression_kwargs)
 
 def spec_to_hdf5(
-    spec: _Spec,
     f: File | Group,
-    group_name: str | None = None,
+    spec: _Spec,
     _dtype: str | dtype = float32,
     force: bool = False,
-    compression: str | None = "gzip",
-    compression_opts: int | None = None,
-) -> Group:
-    if group_name is None:
-        group_name = spec.__class__.__name__
+    **compression_kwargs,
+)-> Group:
+    """Create a `h5py.Group` with the following structure:
 
-    if group_name in f:
+    Spec/
+        array datasets
+        original/
+                original array datasets
+
+    Parameters
+    ----------
+    f : h5py.File | h5py.Group
+        Destination HDF5 file or group.
+    spec : _Spec
+        The spec object to serialize.
+    group_name : str | None
+        Name for the created group. If None the spec class name is used.
+    _dtype : str | numpy.dtype
+        Numeric datatype for float datasets.
+    force : bool
+        Overwrite an existing group when True.
+
+    Returns
+    -------
+    h5py.Group
+        The created HDF5 group containing the serialized spec.
+    
+    Notes
+    -----
+    The created group contains datasets for bounds and rebinned arrays
+    (x, y, dy, dx), optional original subgroup 'original' with the same
+    structure, and optional support datasets such as 'kernels',
+    'y_smooth', 'p_absorbed', and pixel masks.
+    """
+    if "spec" in f:
         if not force:
-            raise ValueError(f"Group '{group_name}' already exists in the HDF5 file.")
-        del f[group_name]
+            raise ValueError("Group 'spec' already exists in the HDF5 file.")
+        del f["spec"]
 
-    grp = f.create_group(group_name)
+    grp = f.create_group("spec")
 
-    cd_f = partial(
-        _cd_f, 
-        _dtype=_dtype, 
-        compression=compression, 
-        compression_opts=compression_opts,
-    )
-    cd_b = partial(
-        _cd_b, 
-        _dtype=bool_,
-        compression=compression, 
-        compression_opts=compression_opts,
-    )
+    cd_f = partial(_cd_f, _dtype=_dtype, **compression_kwargs)
+    cd_b = partial(_cd_b, **compression_kwargs)
 
     cd_f(grp, "x_bounds", spec.x_bounds)
     cd_f(grp, "x0", spec.x0)
@@ -177,75 +186,136 @@ def spec_to_hdf5(
 
         if spec._rejected_pixels_original.any():
             # Only save rejected_pixels if there are any
-            cd_f(orig, "rejected_pixels", spec._rejected_pixels_original)
+            cd_b(orig, "rejected_pixels", spec._rejected_pixels_original)
         if spec._absorbed_pixels_original.any():
             # Only save absorbed_pixels if there are any
-            cd_f(orig, "absorbed_pixels", spec._absorbed_pixels_original)
+            cd_b(orig, "absorbed_pixels", spec._absorbed_pixels_original)
         if not spec._valid_pixels_original.all():
             # Only save valid_pixels if there are non-valid pixels
-            cd_f(orig, "valid_pixels", spec._valid_pixels_original)
+            cd_b(orig, "valid_pixels", spec._valid_pixels_original)
         if not spec._log_valid_pixels_original.all():
             # Only save log_valid_pixels if there are non-log-valid pixels
-            cd_f(orig, "log_valid_pixels", spec._log_valid_pixels_original)
+            cd_b(orig, "log_valid_pixels", spec._log_valid_pixels_original)
 
     return grp
 
 
 def specwindow_to_hdf5(
-    specwindow: _SpecWindow,
     f: File | Group,
+    specwindow: _SpecWindow,
     group_name: str | None = None,
     _dtype: str | dtype = float32,
     force: bool = False,
-    compression: str | None = None,
-    compression_opts: int | None = None,
-) -> Group:
+    **compression_kwargs,
+)-> Group:
+    """
+    Create a `h5py.Group` with the following structure:
+
+    group_name/
+              x_bounds : dataset (2,)
+
+    Parameters
+    ----------
+    specwindow : _SpecWindow
+        The spec window to serialize.
+    f : h5py.File | h5py.Group
+        Destination HDF5 file or group.
+    group_name : str | None
+        Name for the created subgroup. If None uses the specwindow class name.
+    _dtype : str | numpy.dtype
+        Numeric datatype for float datasets.
+    force : bool
+        Overwrite an existing group when True.
+
+    Returns
+    -------
+    h5py.Group
+        The created subgroup representing the spec window.
+    
+    Notes
+    -----
+    The created subgroup is named <SpecWindowClass>_N and contains a
+    single dataset 'x_bounds'.
+    """
     if group_name is None:
         group_name = specwindow.__class__.__name__
 
+    group_name = group_name.lower()
     if group_name in f:
         if not force:
             raise ValueError(f"Group '{group_name}' already exists in the HDF5 file.")
         del f[group_name]
 
     grp = f.create_group(group_name)
+    grp.attrs["class"] = specwindow.__class__.__name__
+
     grp.create_dataset(
         "x_bounds",
         data=specwindow.x_bounds,
         dtype=_dtype,
-        compression=compression,
-        compression_opts=compression_opts,
+        **compression_kwargs,
     )
     return grp
 
 
 def specwindowlist_to_hdf5(
-    specwindowlist: _SpecWindowList[_SpecWindow],
     f: File | Group,
+    specwindowlist: _SpecWindowList[_SpecWindow],
     group_name: str | None = None,
     _dtype: str | dtype = float32,
     force: bool = False,
-    compression: str | None = None,
-    compression_opts: int | None = None,
-) -> Group:
+    **compression_kwargs,
+)-> Group:
+    """Create a `h5py.Group` with the following structure:
+
+    group_name/
+              group_0 : Group, see `specwindow_to_hdf5`
+              group_1 : ...
+
+    Parameters
+    ----------
+    f : h5py.File | h5py.Group
+        Destination HDF5 file or group.
+    specwindowlist : _SpecWindowList[_SpecWindow]
+        Iterable of spec windows to serialize.
+    group_name : str | None
+        Name for the created parent group. If None the class name is used.
+    _dtype : str | numpy.dtype
+        Numeric datatype for float datasets.
+    force : bool
+        Overwrite an existing group when True.
+
+    Returns
+    -------
+    h5py.Group
+        The created group that contains the serialized spec windows.
+    
+    Notes
+    -----
+    The parent group (named by group_name) contains subgroups named
+    '<SpecWindowClass>_0', '<SpecWindowClass>_1', ... each with
+    an 'x_bounds' dataset.
+    """
     if group_name is None:
         group_name = specwindowlist.__class__.__name__
 
+    group_name = group_name.lower()
     if group_name in f:
         if not force:
             raise ValueError(f"Group '{group_name}' already exists in the HDF5 file.")
         del f[group_name]
 
     grp = f.create_group(group_name)
+    grp.attrs["class"] = specwindowlist.__class__.__name__
+
     for i, specwindow in enumerate(specwindowlist):
         specwindow_to_hdf5(
-            specwindow,
             grp,
-            group_name=f"{specwindow.__class__.__name__}_{i}",
+            specwindow,
+            group_name=f"{specwindow.__class__.__name__}_{i}".lower(),
             _dtype=_dtype,
             force=force,
-            compression=compression,
-            compression_opts=compression_opts,
+            **compression_kwargs,
         )
 
     return grp

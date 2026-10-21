@@ -4,21 +4,20 @@ from typing import Optional, Union
 
 from quasar_models import (
     BalmerModel,
-    GaussianModel,
+    EmModel,
     HostGalaxyModel,
     IronModel,
     PowerLawModel,
 )
-from quasar_models.line import _VProfileCopy
 from quasar_models.modeling import SequentialModel
 from quasar_models.modeling.base_model import BaseModel
-from quasar_typing.astropy import CompoundModel_
+from quasar_typing.astropy import CompoundModelType
 
 
 @dataclass
 class ModelManager:
     """Dataclass for managing an Astropy model."""
-    model: Union[BaseModel, CompoundModel_[BaseModel], SequentialModel]
+    model: Union[BaseModel, CompoundModelType[BaseModel], SequentialModel]
 
     @cached_property
     def _submodels(self) -> list[BaseModel]:
@@ -52,7 +51,7 @@ class ModelManager:
         )
 
     @cached_property
-    def em_models(self) -> Optional[list[Union[GaussianModel, _VProfileCopy]]]:
+    def em_models(self) -> Optional[list[EmModel]]:
         return [m for m in self._submodels if m.model_type == 'em'] or None
 
 
@@ -65,22 +64,22 @@ class PowerLawModelManager(ModelManager):
 @dataclass
 class IronModelManager(ModelManager):
     """Dataclass for managing an IronModel."""
-    model: Union[IronModel, CompoundModel_[IronModel], SequentialModel]
+    model: Union[IronModel, CompoundModelType[IronModel], SequentialModel]
 
 
 @dataclass
 class BalmerModelManager(ModelManager):
     """Dataclass for managing a BalmerModel."""
-    model: Union[BalmerModel, CompoundModel_[BalmerModel], SequentialModel]
+    model: Union[BalmerModel, CompoundModelType[BalmerModel], SequentialModel]
 
 
 @dataclass
 class HostGalaxyModelManager(ModelManager):
     """Dataclass for managing a HostGalaxyModel."""
-    model: Union[HostGalaxyModel, CompoundModel_[HostGalaxyModel], SequentialModel]
+    model: Union[HostGalaxyModel, CompoundModelType[HostGalaxyModel], SequentialModel]
 
 
 @dataclass
 class EmissionLineModelManager(ModelManager):
     """Dataclass for managing an EmissionLineModel."""
-    model: Union[GaussianModel, _VProfileCopy, CompoundModel_[Union[GaussianModel, _VProfileCopy]], SequentialModel]
+    model: Union[EmModel, CompoundModelType[EmModel], SequentialModel]

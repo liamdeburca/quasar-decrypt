@@ -1,40 +1,32 @@
 __all__ = ["ContinuumWindows"]
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import field
 from logging import getLogger
 from typing import Any, ClassVar, Literal, Optional, Self
 
-from pydantic import ValidationError
-from quasar_errors.model_samples import PowerLawSample
+import pydantic
 from quasar_models.continuum import PowerLawModel
-from quasar_models.modeling import Fitter, PrepareModel
-from quasar_models.utils.astropy import apply_bounds, get_free_params
-from quasar_typing.astropy import FitInfo
 from quasar_typing.bounds import AstropyBounds, CoordBounds
 from quasar_typing.errors import MissingModelError, OutsideBoundsError
-from quasar_typing.misc import BackgroundFlux, Suffix
+from quasar_typing.literals import Suffix
+from quasar_typing.scipy import OptimizeResultType
+from quasar_typing.string_selections import BackgroundFlux
 from quasar_utils.continuum_fit_result import ContinuumFitResult
-from quasar_utils.decorators import (
-    validate_call,
-    validated_apply_info_to_method,
-)
+from quasar_utils.decorators import validated_apply_info_to_method
 from quasar_utils.logging import flag
 from quasar_utils.setup import FitterKwargs
 
-from ..plotting.windows_plots import (
-    ContinuumWindowsPlotWithDifferences,
-    ContinuumWindowsPlotWithResiduals,
-)
-from ..utils import _SpecWindowList, stopwatch
+from quasar_decrypt.utils import _SpecWindowList, stopwatch
+
 from .cwindow import CWindow
 
 logger = getLogger(__name__)
 
 
-@dataclass
+@pydantic.dataclasses.dataclass
 class ContinuumWindows(_SpecWindowList[CWindow]):
-    fit_info: FitInfo | None = field(default=None, init=False)
+    fit_info: OptimizeResultType | None = field(default=None, init=False)
 
     fit_raw: Optional[PowerLawModel] = field(default=None, init=False)
     fit_sc: Optional[PowerLawModel] = field(default=None, init=False)
@@ -58,7 +50,8 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
         self.fit = state.get("fit", None)
 
     @property
-    def sample(self) -> PowerLawSample | None:
+    def sample(self):
+        from quasar_errors.model_samples import PowerLawSample
         if (model := self.getModel()) is None:
             return None
         return PowerLawSample.fromPowerLawModel(model)
@@ -202,7 +195,7 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
 
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def instantiateModel(
         self,
         *,
@@ -214,6 +207,8 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
         flux_bounds: AstropyBounds | None = None,
         alpha_bounds: AstropyBounds | None = None,
     ) -> None:
+        from quasar_models.utils.astropy import _apply_bounds
+
         msg = f"Instantiating model for {self.__str__(simple=True)}: "
         if bg_flux is None:
             bg_flux = self.default_bg
@@ -239,7 +234,7 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
 
         msg += f"Instantiating model using {masked_coords.size} points: "
 
-        flux = apply_bounds.__wrapped__(masked_coords.y.mean(), flux_bounds)
+        flux = _apply_bounds(masked_coords.y.mean(), flux_bounds)
         msg += f"{flux=:.1f} ({flux_bounds[0]:.1f},{flux_bounds[1]:.1f}), "
         alpha = sum(alpha_bounds) / 2
         msg += f"{alpha=:.2f} ({alpha_bounds[0]:.2f},{alpha_bounds[1]:.2f})"
@@ -521,6 +516,9 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
         MissingModelError
             If no previous model can be found.
         """
+        from quasar_models.modeling import Fitter, PrepareModel
+        from quasar_models.utils.astropy import get_free_params
+
         logger.debug("Performing fine-tuning:")
 
         original = self._update_original_flag(
@@ -580,10 +578,10 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
                     where=where,
                     get_model=True,
                     inplace=False,
-                    **fitter_kwargs,
+                    **(fitter_kwargs or {}),
                 )
                 fit_info = fitter.fit_info
-        except ValidationError as e:
+        except pydantic.ValidationError as e:
             logger.critical(f">>> Validation error occured: {e}")
             self.applyFit.__wrapped__(self, self.getModel())
             return False
@@ -604,7 +602,7 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
         )
         return True
 
-    @validate_call
+    @pydantic.validate_call
     def getModel(
         self,
         suffix: Suffix | None = None,
@@ -615,12 +613,12 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
             return self.fit_sc or self.fit_raw
         return self.fit_raw
 
-    @validate_call
+    @pydantic.validate_call
     def adoptFit(
         self,
         fit: PowerLawModel,
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         update_emission: bool = False,
     ) -> Self:
         """
@@ -634,12 +632,12 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
             update_emission=update_emission,
         )
 
-    @validate_call
+    @pydantic.validate_call
     def applyFit(
         self,
-        fit: PowerLawModel,
+        fit: Optional[PowerLawModel],
         *,
-        fit_info: FitInfo | None = None,
+        fit_info: OptimizeResultType | None = None,
         suffix: Suffix | None = None,
         update_emission: bool = False,
     ) -> Self:
@@ -671,23 +669,28 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
     def windowsplot(
         self,
         mode: Literal["residual", "difference"],
+        model: Optional[PowerLawModel] = None,
         lazy: bool = False,
         **plotter_kwargs,
-    ) -> ContinuumWindowsPlotWithResiduals | ContinuumWindowsPlotWithDifferences:
+    ):
         """
         ...
         """
-        args = (self.getModel(), self.window_bounds, self)
+        from quasar_decrypt.plotting.windows_plots import (
+            ContinuumWindowsPlotWithDifferences,
+            ContinuumWindowsPlotWithResiduals,
+        )
+        if model is None:
+            model = self.getModel()
+
+        args = (model, self.window_bounds, self)
         cls = ContinuumWindowsPlotWithResiduals \
             if mode == "residual" \
             else ContinuumWindowsPlotWithDifferences
 
-        if 'title_prefix' not in plotter_kwargs:
-            plotter_kwargs['title_prefix'] = "ContinuumWindows of: "
-        if 'title' not in plotter_kwargs:
-            plotter_kwargs['title'] = self.spectrum.title
-        if 'xlim' not in plotter_kwargs:
-            plotter_kwargs['xlim'] = self.spectrum.x_bounds
-
-        plotter = cls(*args, **plotter_kwargs)
-        return plotter if lazy else plotter.plot() 
+        return self._plot_helper(
+            plotter_cls=cls,
+            lazy=lazy,
+            args=args,
+            plotter_kwargs=plotter_kwargs,
+        )

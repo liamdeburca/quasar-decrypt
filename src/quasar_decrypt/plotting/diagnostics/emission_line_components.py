@@ -8,7 +8,7 @@ from astropy.units.quantity import Quantity
 from matplotlib.container import ErrorbarContainer
 from matplotlib.lines import Line2D
 from quasar_models.line import GaussianModel, _VProfileCopy
-from quasar_typing.misc import FWHMStrategy
+from quasar_typing.literals import FWHMStrategy
 
 from ..annotation import _SimpleAnnotater
 from ..layers import (
