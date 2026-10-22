@@ -843,7 +843,7 @@ class Spectrum(_Spec):
         template_model: Optional[
             Union[GaussianModel, CompoundModelType[GaussianModel]]
         ] = None,
-        original: bool | None = None,
+        original: bool = False,
         without_rejections: bool = False,
         without_absorption: bool = False,
         with_neighbours: bool = False,

@@ -149,8 +149,7 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         ### 'applyLineList'
         msg = "Applying line list: "
-        success = self.applyLineList.__wrapped__(
-            self,
+        success = self.applyLineList(
             linelist,
             sigma_res=sigma_res,
             v_sep=v_sep,
@@ -166,14 +165,12 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         if template_model is not None:
             logger.debug("Applying template model.")
-            self.applyFit.__wrapped__(
-                self,
+            self.applyFit(
                 template_model,
                 update_emission=True,
             )
             for lwindow in self:
-                lwindow.fitModel.__wrapped__(
-                    lwindow,
+                lwindow.fitModel(
                     update_flux=True,
                     bg_flux=bg_flux,
                     without_rejections=without_rejections,
@@ -185,8 +182,7 @@ class LineWindows(_SpecWindowList[LWindow]):
             ### 'instantiateModels'
             msg = "Instantiating models: "
             for i, lwindow in enumerate(self):
-                success = lwindow.instantiateModels.__wrapped__(
-                    lwindow,
+                success = lwindow.instantiateModels(
                     bg_flux=bg_flux,
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
@@ -214,8 +210,7 @@ class LineWindows(_SpecWindowList[LWindow]):
             for idx in fitting_sequence:
                 lwindow = self[idx]
 
-                success = lwindow.makeInitialFit.__wrapped__(
-                    lwindow,
+                success = lwindow.makeInitialFit(
                     bg_flux=bg_flux,
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
@@ -229,8 +224,7 @@ class LineWindows(_SpecWindowList[LWindow]):
                     logger.info(msg)
                     return False
 
-                success = lwindow.makeFinalFit.__wrapped__(
-                    lwindow,
+                success = lwindow.makeFinalFit(
                     bg_flux=bg_flux,
                     without_rejections=without_rejections,
                     without_absorption=without_absorption,
@@ -252,10 +246,9 @@ class LineWindows(_SpecWindowList[LWindow]):
                     logger.info(msg)
                     return False
 
-                lwindow.applyMyself.__wrapped__(lwindow)
+                lwindow.applyMyself()
 
-            self.makeCombinedFit.__wrapped__(
-                self,
+            self.makeCombinedFit(
                 original=original,
                 covered=True,
                 without_rejections=without_rejections,
@@ -395,40 +388,37 @@ class LineWindows(_SpecWindowList[LWindow]):
         !!! Ensuring Lyman-alpha?
         """
         if isinstance(linelist, Path):
-            linelist = LineList.read_csv.__wrapped__(
-                LineList,
+            linelist = LineList.read_csv(
                 path=linelist,
                 info=self.info,
             )
+        df = linelist.toDataFrame()
 
-        df = linelist.sort_values("wave", inplace=False)
+        df = df.sort_values("wave")
         if self.x_bounds[0] is not None:
-            df.drop(df[df["wave"] < self.x_bounds[0]].index, inplace=True)
+            df = df[df["wave"] >= self.x_bounds[0]]
+
         if self.x_bounds[1] is not None:
-            df.drop(df[df["wave"] >= self.x_bounds[1]].index, inplace=True)
-        df = df.reset_index(drop=True)
+            df = df[df["wave"] <= self.x_bounds[1]]
 
         prev_wave: float = None
         for idx, row in df.iterrows():
             wave = row["wave"]
 
-            cond = idx == 0
+            cond = (idx == 0)
             if not cond:
                 _wave = prev_wave
                 cond = ((_wave < forced_splits) & (forced_splits < wave)).any()
                 cond |= (wave - _wave) > (_wave + wave) * v_sep
 
             if cond:
-                lwindow = LWindow.create.__wrapped__(
-                    LWindow,
+                lwindow = LWindow._create(
                     spectrum=self.spectrum,
                     x_bounds=self.x_bounds,
-                    get_mask=None,
                 )
                 self.append(lwindow)
 
-            _ = self[-1].add.__wrapped__(
-                self[-1],
+            _ = self[-1].add(
                 name=row["name"],
                 complex_name=row["complex"],
                 wave=row["wave"],
@@ -443,16 +433,14 @@ class LineWindows(_SpecWindowList[LWindow]):
                 scale_bounds=(row["scale_lower"], row["scale_upper"]),
                 scale_fixed=row["scale_fixed"],
             )
-
             prev_wave = wave
 
         # Check for line dependencies!
-        self.checkLineDependencies.__wrapped__(self, linelist)
+        self.checkLineDependencies(linelist)
         self.checkVelocityProfileCopies()
 
         for lwindow in self:
-            lwindow.prepareLines.__wrapped__(
-                lwindow,
+            lwindow.prepareLines(
                 v_sep=v_sep,
                 min_fittable_total=min_fittable_total,
                 min_fittable_ratio=min_fittable_ratio,
@@ -460,10 +448,7 @@ class LineWindows(_SpecWindowList[LWindow]):
 
         if self.spectrum is not None and self.spectrum.pl is not None:
             for lwindow in self:
-                lwindow.prepareNeighbours.__wrapped__(
-                    lwindow,
-                    sigma_res=sigma_res,
-                )
+                lwindow.prepareNeighbours(sigma_res=sigma_res)
 
         return True
 
@@ -476,8 +461,7 @@ class LineWindows(_SpecWindowList[LWindow]):
         ...
         """
         if isinstance(linelist, Path):
-            linelist = LineList.read_csv.__wrapped__(
-                LineList,
+            linelist = LineList.read_csv(
                 path=linelist,
                 info=self.info,
             )
@@ -506,23 +490,27 @@ class LineWindows(_SpecWindowList[LWindow]):
                     )
                     return False
 
-                ser = linelist[linelist["name"] == needed_line]
-                if len(ser) == 0:
+                
+                indices = [
+                    i 
+                    for i, name in enumerate(linelist.name) 
+                    if name == needed_line
+                ]
+                if len(indices) == 0:
                     logger.info(
                         f"Needed line '{needed_line}' could not be found in "
                         "line list -> skipping!"
                     )
                     continue
 
-                if len(ser) > 1:
+                if len(indices) > 1:
                     logger.info(
                         f"Found duplicates for '{needed_line}' in line list "
                         "-> skipping!"
                     )
                     continue
 
-                row = next(ser.iterrows())[1]
-
+                row = linelist[indices[0]]
                 def get_bounds(s: str, row=row) -> tuple[float, float]:
                     return (row[f"{s}_lower"], row[f"{s}_upper"])
 
@@ -547,7 +535,7 @@ class LineWindows(_SpecWindowList[LWindow]):
                 repeat_call |= bool(row["needs_line"])
 
         if repeat_call:
-            return self.checkLineDependencies.__wrapped__(self, linelist)
+            return self.checkLineDependencies(linelist)
         return True
 
     def checkVelocityProfileCopies(self) -> bool:

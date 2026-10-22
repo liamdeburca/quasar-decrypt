@@ -1,6 +1,7 @@
 __all__ = ["LWindow"]
 
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import field
 from itertools import pairwise
 from logging import getLogger
@@ -28,7 +29,7 @@ from quasar_models.line import (
 )
 from quasar_models.modeling import Fitter, PrepareModel
 from quasar_models.utils.astropy import (
-    apply_bounds,
+    _apply_bounds,
     get_largest_possible_bounds,
 )
 from quasar_typing.astropy import CompoundModelType
@@ -956,7 +957,7 @@ class LWindow(_SpecWindow):
                         strength_scale_fixed=self.scale_fixed[name],
                     )
                     model.v_off_1.bounds = self.v_off_bounds[name]
-                    model.v_off_1.value = apply_bounds.__wrapped__(
+                    model.v_off_1.value = _apply_bounds(
                         model.v_off_1.value, 
                         model.v_off_1.bounds,
                     )
@@ -1715,14 +1716,12 @@ class LWindow(_SpecWindow):
                     lwindow.cropped.add(mimic)
                     continue
 
-                vprofilecopy = self.createVelocityProfileCopy.__wrapped__(
-                    self,
+                vprofilecopy = self.createVelocityProfileCopy(
                     master,
                     lwindow.waves[mimic],
                     mimic,
                 )
-                lwindow.applyVelocityProfileCopy.__wrapped__(
-                    lwindow,
+                lwindow.applyVelocityProfileCopy(
                     vprofilecopy,
                     adapt_scale=adapt_scale,
                 )
@@ -1743,8 +1742,7 @@ class LWindow(_SpecWindow):
                         strength_scale_bounds=lwindow.scale_bounds[submimic],
                         strength_scale_fixed=lwindow.scale_fixed[submimic],
                     )
-                    lwindow.applyVelocityProfileCopy.__wrapped__(
-                        lwindow,
+                    lwindow.applyVelocityProfileCopy(
                         subcopy,
                         adapt_scale=adapt_scale,
                     )
@@ -1773,12 +1771,16 @@ class LWindow(_SpecWindow):
         assert mimic in self.names
         assert self.model is not None
 
-        ms = self.model if (self.model.n_submodels > 1) else [self.model]
+        ms: Iterable[LineModel] = (
+            self.model 
+            if (self.model.n_submodels > 1) 
+            else [self.model]
+        )
         replaced_ms = [m for m in ms if m.pure_name == model.pure_name]
         other_ms = [m for m in ms if m.pure_name != model.pure_name]
 
         scale = model.strength_scale
-        scale.value = apply_bounds.__wrapped__(
+        scale.value = _apply_bounds(
             self.scale_init[model.pure_name],
             self.scale_bounds[model.pure_name],
         )
