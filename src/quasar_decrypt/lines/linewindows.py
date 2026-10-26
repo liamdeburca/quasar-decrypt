@@ -392,16 +392,17 @@ class LineWindows(_SpecWindowList[LWindow]):
                 path=linelist,
                 info=self.info,
             )
+        
         df = linelist.toDataFrame()
-
-        df = df.sort_values("wave")
+        
         if self.x_bounds[0] is not None:
-            df = df[df["wave"] >= self.x_bounds[0]]
+            df = df[self.x_bounds[0] <= df["wave"]]
 
         if self.x_bounds[1] is not None:
             df = df[df["wave"] <= self.x_bounds[1]]
 
         prev_wave: float = None
+        df = df.sort_values("wave", ignore_index=True)
         for idx, row in df.iterrows():
             wave = row["wave"]
 

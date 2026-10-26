@@ -411,15 +411,19 @@ class IronWindows(_SpecWindowList[IWindow]):
         ):
             # Only fit models whose FWHM is not tied, as would be the case if 
             # `tieSimilarModels` had been called
-            model.rasterFit.__wrapped__(
-                model,
-                masked_coords.x,
-                masked_coords.y,
-                masked_coords.dy,
-                inplace=True,
-            )
+
+            try:
+                model.rasterFit(
+                    masked_coords.x,
+                    masked_coords.y,
+                    masked_coords.dy,
+                    inplace=True,
+                )
+            except ValueError as exc:
+                logger.info(f"Raster fit failed due to ValueError: {exc}")
+                return self
                 
-        self.updateIronEmission.__wrapped__(self, self.getModel())
+        self.updateIronEmission(self.getModel())
         return self
 
     def getModel(

@@ -425,8 +425,7 @@ class BalmerWindows(_SpecWindowList[BWindow]):
             logger.info(msg)
             covered = False
 
-        masked_coords = self.getMaskedCoords.__wrapped__(
-            self,
+        masked_coords = self.getMaskedCoords(
             original=False,
             mode="c",  # c: contiguous
             covered=covered,
@@ -437,13 +436,13 @@ class BalmerWindows(_SpecWindowList[BWindow]):
             bg_flux=bg_flux,
             shrink=None,
         )
-        self.model.rasterFit.__wrapped__(
-            self.model,
-            masked_coords.x,
-            masked_coords.y,
-            masked_coords.dy,
-            inplace=True,
-        )
+        if masked_coords.x.size != 0:
+            self.model.rasterFit(
+                masked_coords.x,
+                masked_coords.y,
+                masked_coords.dy,
+                inplace=True,
+            )
         return self
 
     @validated_apply_info_to_method(subjects=("nonlinear",))

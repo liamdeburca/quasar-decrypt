@@ -293,8 +293,7 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
             log = logger.debug
             covered = True
 
-        masked_coords = self.getMaskedCoords.__wrapped__(
-            self,
+        masked_coords = self.getMaskedCoords(
             original=False,
             mode="c",
             covered=covered,
@@ -315,11 +314,10 @@ class ContinuumWindows(_SpecWindowList[CWindow]):
         else:
             msg += "sufficient: proceeding. "
 
-        prev_model = self.getModel.__wrapped__(self, suffix=None)
+        prev_model = self.getModel(suffix=None)
         if prev_model is None:
             msg += "[NOTE: could not find any model, instantiating one] "
-            self.instantiateModel.__wrapped__(
-                self,
+            self.instantiateModel(
                 update_flux=False,
                 without_rejections=without_rejections,
                 without_absorption=without_absorption,
