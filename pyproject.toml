@@ -1,21 +1,40 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = [
+    "wheel", 
+    "setuptools==72.1.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quasar-decrypt"
+authors = [{name = "Liam", email = "liam_deburca@me.com"}]
 version = "0.1.0"
-requires-python= ">=3.12"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
-    "quasar-typing",
-    "quasar-utils",
-    "quasar-models",
-    "quasar-errors",
-    "astropy>=7.0",
-    "pydantic>=2.12",
-    "numpy>=1.26",
-    "scipy>=1.16",
+    "quasar-typing==0.1.0",
+    "quasar-utils==0.1.0",
+    "quasar-models==0.1.0",
+    "quasar-errors==0.1.0",
+    
+    "pydantic==2.12",
+    "astropy==7.0",
+    "numpy==1.26",
+    "scipy==1.16",
     "scikit-learn==1.6.1",
+    "lazy-imports==1.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "black==26.10.1",
+    "isort==9.0.2",
 ]
 
 [project.urls]
